@@ -61,8 +61,12 @@
                                          * EnableDMA sets bit (1 << (dsp_index+1))
                                          * bit 0 reserved (global master?)
                                          * Uses software shadow, never read from HW */
-#define DMA_CTRL_SINGLE_ENGINE 0x1e00 /* bits[12:9] */
-#define DMA_CTRL_DUAL_ENGINE 0x1fe00 /* bits[16:9] */
+#define DMA_CTRL_MASTER_ENABLE 0x0001 /* bit 0: global master enable */
+#define DMA_RESET_SINGLE 0x1e00 /* bits[12:9]: single engine reset */
+#define DMA_RESET_DUAL 0x1fe00 /* bits[16:9]: dual engine reset */
+/* Masks to clear DMA channel enable bits (preserving bit 0): */
+#define DMA_SHADOW_MASK_SINGLE 0xffffffe1 /* clears bits[4:1] */
+#define DMA_SHADOW_MASK_DUAL 0xfffffe01 /* clears bits[8:1] */
 
 /* --- DMA engine 0 (CPcieIntrManager::ProgramRegisters) --- */
 #define REG_DMA0_INTR_CTRL 0x2204 /* WRITE 0x0 to disable/clear */
@@ -70,8 +74,11 @@
 
 /* --- Device identification (CPcieDevice::ProgramRegisters) --- */
 #define REG_DEVICE_ID \
-	0x2218 /* READ to verify; WRITE back as echo handshake
+	0x2218 /* READ to verify device identity
                                          * Also polled after clock change (2s timeout) */
+#define REG_DEVICE_HANDSHAKE \
+	0x2220 /* WRITE 0x0 after reading device ID
+                                         * CPcieDevice::WriteRegEjj always writes 0 here */
 
 /* --- Audio transport registers (CPcieAudioExtension) --- */
 #define REG_BUFFER_FRAME_SIZE 0x2240 /* W: bufferFrameSize - 1 */
@@ -97,9 +104,13 @@
 	0x2260 /* W: 0x1 = start stream, 0x10 = stop stream
                                          * Also: 0x4 = clock change trigger */
 
-/* --- DMA engine 1 (dual-engine devices only) --- */
-#define REG_DMA1_INTR_CTRL 0x2264
-#define REG_DMA1_STATUS 0x2268
+/* --- DMA engine 1 (dual-engine devices only) ---
+ * Note: relative to DMA0, the roles of +0 and +4 are swapped:
+ *   0x2264 = arm/status (like DMA0's 0x2208)
+ *   0x2268 = enable ctrl (like DMA0's 0x2204)
+ */
+#define REG_DMA1_STATUS 0x2264 /* WRITE bitmask to arm; read pending */
+#define REG_DMA1_INTR_CTRL 0x2268 /* WRITE enable shadow */
 
 /* --- Buffer and timer configuration --- */
 #define REG_BUFFER_SIZE_KB 0x226C /* W: (totalPlayChans * (bufSz-1)) >> 10 */
@@ -310,7 +321,7 @@ struct uad2_dev {
 	                                         * (mirrors kext spinlock at this+0x2890) */
 
 	u32 expected_device_id;
-	bool dual_dma;
+	bool has_extended_irq; /* uses DMA1 regs for upper 32 slots */
 	bool disconnecting; /* set during remove, guards MMIO access */
 	unsigned int dsp_count;
 	u32 channel_base_index; /* 10 for Apollo Solo */
@@ -353,8 +364,18 @@ struct uad2_dev {
 	/* Notification interrupt handling */
 	struct completion notify_event; /* signals Connect() on bit 21 */
 	struct completion connect_event; /* signals on bit 5 (connect ack) */
+	struct completion rate_event; /* signals _setSampleClock on bit 5 */
 	u32 notify_status; /* last notification bitmask */
 	bool connected;
+
+	/* IO descriptor copies from firmware (72 DWORDs each).
+	 * Kext copies the full block on NOTIFY_PLAYBACK_IO / NOTIFY_RECORD_IO.
+	 * Channel count is at DWORD[4] (offset +0x10 from desc base). */
+	u32 play_io_desc[IO_DESC_DWORDS];
+	u32 rec_io_desc[IO_DESC_DWORDS];
+
+	/* Channel config area copy (10 DWORDs from BAR+0xC000) */
+	u32 chan_config[CHAN_CONFIG_DWORDS];
 
 	/* PCM substream pointers for IRQ handler (accessed under lock) */
 	struct snd_pcm_substream *playback_ss;
@@ -414,55 +435,84 @@ static u8 uad2_rate_to_enum(unsigned int rate)
 }
 
 /*
- * CPcieAudioExtension::_setSampleClock @ line 72712
+ * CPcieAudioExtension::_setSampleClock @ line 72712 (arm64 0x4DE70)
  *
- * Writes combined clock_source | (rate_enum << 8) to REG_SAMPLE_CLOCK,
- * then triggers with REG_STREAM_ENABLE = 0x4,
- * then polls REG_DEVICE_ID for ack (2s timeout).
+ * Kext flow (confirmed in both arm64 and x86_64):
+ *   1. Compute clock_val = clock_source | (rate_enum << 8)
+ *   2. Write clock_val to BAR + (fpga_index * 4) + 0xC04C
+ *   3. Reset rate_event (CUAOS::Event at this+0x2838)
+ *   4. Write 0x4 to REG_STREAM_ENABLE (trigger clock change)
+ *   5. WaitWithTimeout(2000ms) on rate_event
+ *   6. On signal: read REG_DEVICE_ID as sanity check
+ *   7. On timeout: return 0 (kext treats timeout as success)
  *
- * clock_source: 0 = internal
+ * The rate_event is signaled by bit 5 in the notification ISR
+ * (_handleNotificationInterrupt → rate_event->Signal()).
+ *
+ * The caller (SetSampleClock @ 0x4DD08) retries once if _setSampleClock
+ * returns -38 (signaled + device ID valid).  We simplify: wait for
+ * completion, return 0 on success or timeout (matching kext behavior).
  */
 static int uad2_set_sample_rate(struct uad2_dev *dev, unsigned int rate)
 {
 	u32 clock_val;
 	u8 rate_enum;
 	u32 reg_offset;
-	int i;
-	u32 val;
+	unsigned long ret;
 
 	rate_enum = uad2_rate_to_enum(rate);
 	clock_val = dev->clock_source | ((u32)rate_enum << 8);
 
-	/* Write to sample clock register: BAR + (channel_base_index << 2) + 0xC04C */
+	/* Cache clock value (kext stores at this+0x98) */
 	reg_offset = uad2_fw_reg(dev, REG_SAMPLE_CLOCK);
+
+	/* Write to sample clock register: BAR + (channel_base_index << 2) + 0xC04C */
 	uad2_write32(dev, reg_offset, clock_val);
+
+	/* Reset completion before triggering (kext: rate_event->Reset()) */
+	reinit_completion(&dev->rate_event);
 
 	/* Trigger clock change */
 	uad2_write32(dev, REG_STREAM_ENABLE, 0x4);
 
-	/* Poll REG_DEVICE_ID for acknowledgment (2s timeout, per kext 0x7D0 = 2000ms) */
-	for (i = 0; i < 200; i++) {
-		msleep(10);
-		val = uad2_read32(dev, REG_DEVICE_ID);
-		if (val == dev->expected_device_id) {
-			dev->current_rate = rate;
-			return 0;
-		}
+	/* Wait for firmware ack via bit 5 notification interrupt.
+	 * Kext uses WaitWithTimeout(2000) = 2 seconds. */
+	ret = wait_for_completion_timeout(&dev->rate_event,
+					  msecs_to_jiffies(2000));
+
+	if (ret > 0) {
+		/* Completion signaled — read device ID as sanity check
+		 * (kext does this but doesn't use the result to block) */
+		u32 dev_id = uad2_read32(dev, REG_DEVICE_ID);
+
+		if (dev_id != dev->expected_device_id)
+			dev_warn(&dev->pci->dev,
+				 "Post-clock device ID mismatch: 0x%08x\n",
+				 dev_id);
+
+		dev->current_rate = rate;
+		dev_dbg(&dev->pci->dev, "Sample rate changed to %u Hz\n", rate);
+		return 0;
 	}
 
-	dev_warn(&dev->pci->dev, "Sample rate change timeout (rate=%u)\n",
-		 rate);
-	return -ETIMEDOUT;
+	/* Timeout — kext returns 0 (success) on timeout, so we do too.
+	 * The hardware may still complete the change asynchronously. */
+	dev_warn(&dev->pci->dev,
+		 "Sample rate change timeout (rate=%u), continuing\n", rate);
+	dev->current_rate = rate;
+	return 0;
 }
 
 /* ============================================================
  * _recomputeBufferFrameSize equivalent @ 0x4d9e0 (line 72414)
  *
- * Formula: floor_pow2(0x400000 / (max(play_ch, rec_ch) * 4))
+ * Formula: floor_pow2(0x400000 / (max(play_ch, rec_ch) * 4) / 2)
  * Capped at 0x2000 (8192 frames).
  *
+ * Kext at 0x4DA1C: ubfx x8, x8, #1, #31 — divides by 2 BEFORE CLZ.
+ *
  * For Apollo Solo with 42 play / 32 rec:
- *   0x400000 / (42 * 4) = 24966 → floor_pow2 = 16384 → capped to 8192
+ *   0x400000 / (42 * 4) = 24966, /2 = 12483 → floor_pow2 = 8192
  * ============================================================ */
 static unsigned int uad2_compute_buffer_frames(unsigned int play_ch,
 					       unsigned int rec_ch)
@@ -475,7 +525,12 @@ static unsigned int uad2_compute_buffer_frames(unsigned int play_ch,
 
 	raw_frames = SG_BUFFER_SIZE / (max_ch * UAD2_BYTES_PER_SAMPLE);
 
+	/* Kext divides by 2 here (ubfx x8, x8, #1, #31 at 0x4DA1C) */
+	raw_frames /= 2;
+
 	/* Round down to power of 2 */
+	if (raw_frames == 0)
+		return UAD2_MAX_BUFFER_FRAMES; /* fallback */
 	raw_frames = rounddown_pow_of_two(raw_frames);
 
 	/* Cap at 8192 */
@@ -488,25 +543,34 @@ static unsigned int uad2_compute_buffer_frames(unsigned int play_ch,
 /* ============================================================
  * Interrupt vector enable/disable
  *
- * The kext maintains a lookup table at IntrManager+0x4D0 that maps
- * logical vector IDs to bit slot indices.  We don't replicate that
- * table; instead, we assume the slot index equals the vector ID
- * (which holds for the vectors we use: 0x28, 0x46, 0x47).
+ * The kext maintains a vector_to_slot[72] lookup table at
+ * IntrManager+0x4D0 that maps logical vector IDs to bit slot indices
+ * within the u64 intr_enable_shadow:
  *
- * EnableVector(vec, arm):
- *   shadow |= (1 << vec)
- *   if arm: write (1 << vec) to BAR+0x2208
- *   write shadow to BAR+0x2204
+ *   vector 0x28 (notify)   → slot 32   (bit 0 of DMA1)
+ *   vector 0x46 (periodic) → slot 62   (bit 30 of DMA1)
+ *   vector 0x47 (endbuf)   → slot 63   (bit 31 of DMA1)
  *
- * DisableVector(vec):
- *   shadow &= ~(1 << vec)
- *   write shadow to BAR+0x2204
+ * Shadow bits  0-31 → DMA0 registers (0x2204 ctrl, 0x2208 status)
+ * Shadow bits 32-63 → DMA1 registers (0x2268 ctrl, 0x2264 status)
+ *
+ * For Apollo Solo all three vectors map to slots > 31, so
+ * has_extended_irq must be true and DMA1 registers must be accessed.
+ *
+ * EnableVector(slot, arm):
+ *   shadow |= (1 << slot)
+ *   if arm: write (1 << slot) to status register (re-arm)
+ *   write shadow to ctrl register (enable mask)
+ *
+ * DisableVector(slot):
+ *   shadow &= ~(1 << slot)
+ *   write shadow to ctrl register
  * ============================================================ */
 /* Internal: caller must hold dev->lock */
-static void __uad2_enable_vector_locked(struct uad2_dev *dev, unsigned int vec,
+static void __uad2_enable_vector_locked(struct uad2_dev *dev, unsigned int slot,
 					bool arm)
 {
-	u64 bit = 1ULL << vec;
+	u64 bit = 1ULL << slot;
 
 	dev->intr_enable_shadow |= bit;
 
@@ -515,50 +579,53 @@ static void __uad2_enable_vector_locked(struct uad2_dev *dev, unsigned int vec,
 
 	uad2_write32(dev, REG_DMA0_INTR_CTRL, (u32)dev->intr_enable_shadow);
 
-	if (dev->dual_dma) {
+	if (dev->has_extended_irq) {
 		if (arm)
-			uad2_write32(dev, REG_DMA1_INTR_CTRL, (u32)(bit >> 32));
-		uad2_write32(dev, REG_DMA1_STATUS,
+			uad2_write32(dev, REG_DMA1_STATUS, (u32)(bit >> 32));
+		uad2_write32(dev, REG_DMA1_INTR_CTRL,
 			     (u32)(dev->intr_enable_shadow >> 32));
 	}
 }
 
 /* Internal: caller must hold dev->lock */
-static void __uad2_disable_vector_locked(struct uad2_dev *dev, unsigned int vec)
+static void __uad2_disable_vector_locked(struct uad2_dev *dev,
+					 unsigned int slot)
 {
-	u64 bit = 1ULL << vec;
+	u64 bit = 1ULL << slot;
 
 	dev->intr_enable_shadow &= ~bit;
 
 	uad2_write32(dev, REG_DMA0_INTR_CTRL, (u32)dev->intr_enable_shadow);
 
-	if (dev->dual_dma)
-		uad2_write32(dev, REG_DMA1_STATUS,
+	if (dev->has_extended_irq)
+		uad2_write32(dev, REG_DMA1_INTR_CTRL,
 			     (u32)(dev->intr_enable_shadow >> 32));
 }
 
-static void uad2_enable_vector(struct uad2_dev *dev, unsigned int vec, bool arm)
+static void uad2_enable_vector(struct uad2_dev *dev, unsigned int slot,
+			       bool arm)
 {
 	unsigned long flags;
 
 	spin_lock_irqsave(&dev->lock, flags);
-	__uad2_enable_vector_locked(dev, vec, arm);
+	__uad2_enable_vector_locked(dev, slot, arm);
 	spin_unlock_irqrestore(&dev->lock, flags);
 }
 
-static void uad2_disable_vector(struct uad2_dev *dev, unsigned int vec)
+static void uad2_disable_vector(struct uad2_dev *dev, unsigned int slot)
 {
 	unsigned long flags;
 
 	spin_lock_irqsave(&dev->lock, flags);
-	__uad2_disable_vector_locked(dev, vec);
+	__uad2_disable_vector_locked(dev, slot);
 	spin_unlock_irqrestore(&dev->lock, flags);
 }
 
-/* Interrupt vector IDs (from CPcieAudioExtension Initialize + kext analysis) */
-#define INTR_VEC_NOTIFY 0x28 /* notification interrupt */
-#define INTR_VEC_PERIODIC 0x46 /* periodic timer interrupt */
-#define INTR_VEC_ENDBUF 0x47 /* end-of-buffer interrupt */
+/* Interrupt slot indices — mapped from kext vector_to_slot[] table:
+ *   vector 0x28 → slot 32,  vector 0x46 → slot 62,  vector 0x47 → slot 63 */
+#define INTR_SLOT_NOTIFY 32 /* notification interrupt (vector 0x28) */
+#define INTR_SLOT_PERIODIC 62 /* periodic timer interrupt (vector 0x46) */
+#define INTR_SLOT_ENDBUF 63 /* end-of-buffer interrupt (vector 0x47) */
 
 /* ============================================================
  * CPcieIntrManager::ProgramRegisters equivalent
@@ -570,33 +637,51 @@ static void uad2_intr_program(struct uad2_dev *dev)
 	uad2_write32(dev, REG_DMA0_INTR_CTRL, 0x0);
 	uad2_write32(dev, REG_DMA0_STATUS, 0x0);
 
-	if (dev->dual_dma) {
-		uad2_write32(dev, REG_DMA1_INTR_CTRL, 0x0);
+	if (dev->has_extended_irq) {
 		uad2_write32(dev, REG_DMA1_STATUS, 0x0);
+		uad2_write32(dev, REG_DMA1_INTR_CTRL, 0x0);
 	}
 
 	dev->intr_enable_shadow = 0;
 }
 
 /* ============================================================
- * CPcieIntrManager::ResetDMAEngines equivalent
- * Computes channel enable bitmask and programs DMA master control
+ * CPcieIntrManager::ResetDMAEngines equivalent @ 0x134b8
+ *
+ * Reset pulse sequence from kext:
+ *   1. AND shadow with mask to clear DMA channel enable bits
+ *      (preserving bit 0 = global master enable)
+ *   2. Write shadow | reset_bits  — asserts reset
+ *   3. Write shadow alone        — deasserts reset
+ *   4. Read-back flush
+ *
+ * Shadow is initialized to DMA_CTRL_MASTER_ENABLE (0x1) by
+ * CPcieIntrManager::Initialize (dump line 11571: str w8,[x19,#0x4bc])
  * ============================================================ */
 static void uad2_dma_reset(struct uad2_dev *dev)
 {
-	u32 ctrl;
+	u32 reset_bits, mask;
 
-	if (dev->dual_dma)
-		ctrl = DMA_CTRL_DUAL_ENGINE;
-	else
-		ctrl = DMA_CTRL_SINGLE_ENGINE;
+	if (dev->has_extended_irq) {
+		reset_bits = DMA_RESET_DUAL;
+		mask = DMA_SHADOW_MASK_DUAL;
+	} else {
+		reset_bits = DMA_RESET_SINGLE;
+		mask = DMA_SHADOW_MASK_SINGLE;
+	}
 
-	uad2_write32(dev, REG_DMA_MASTER_CTRL, ctrl);
+	/* Clear channel enable bits in shadow, keep bit 0 (master enable) */
+	dev->dma_ctrl_shadow &= mask;
+
+	/* Assert reset: shadow | reset_bits */
 	uad2_write32(dev, REG_DMA_MASTER_CTRL,
-		     ctrl); /* written twice per kext */
-	uad2_read32(dev, REG_DMA_MASTER_CTRL); /* read-back flush */
+		     dev->dma_ctrl_shadow | reset_bits);
 
-	dev->dma_ctrl_shadow = ctrl;
+	/* Deassert reset: shadow alone */
+	uad2_write32(dev, REG_DMA_MASTER_CTRL, dev->dma_ctrl_shadow);
+
+	/* Read-back flush */
+	uad2_read32(dev, REG_DMA_MASTER_CTRL);
 }
 
 /* ============================================================
@@ -620,36 +705,62 @@ static void uad2_enable_dma(struct uad2_dev *dev, unsigned int dsp_index)
 
 /* ============================================================
  * CPcieDSP::_waitFor469ToStart equivalent @ 0x1152c
- * Polls DSP ring+0x1a4 until DSP_READY_SIG appears
+ *
+ * Polls dsp_poll_base+0x1A4 waiting for DSP firmware to boot.
+ * dsp_poll_base is a SEPARATE address from ring_base:
+ *   ring_base     = BAR + {0x2000|0x5e00} + dsp_index*0x80  (DMA rings)
+ *   dsp_poll_base = BAR + (dsp_index > 3 ? 0x2000 : 0) + dsp_index*0x800
+ *
+ * For DSP 0: poll_base = BAR+0x000, polls BAR+0x1A4
+ * For DSP 1: poll_base = BAR+0x800, polls BAR+0x9A4
+ *
+ * Condition: called when dsp_type == 1 (from GetCapabilities)
+ *   and this+0x18 == 0 (first-time init flag).
+ *   dsp_index == 0 gets 100 attempts, others get 10.
+ *
+ * CORRECTED LOGIC (from careful arm64+x86_64 trace):
+ * The kext loop treats BOTH 0 AND DSP_READY_SIG as "not ready yet" —
+ * it keeps polling on either.  The loop only exits early when the value
+ * is non-zero AND not equal to DSP_READY_SIG.  After the loop ends
+ * (either by early exit or counter exhaustion), the final success check
+ * is `val & 1` — bit 0 must be set for success.
+ *
+ * This suggests the DSP boot sequence is:
+ *   0x00000000 (not started) → 0xa8caed0f (booting) → final_val (ready)
+ * where final_val has bit 0 set.
  * ============================================================ */
-static int uad2_dsp_wait_ready(struct uad2_dev *dev, void __iomem *ring_base,
-			       int dsp_type)
+static int uad2_dsp_wait_ready(struct uad2_dev *dev,
+			       void __iomem *dsp_poll_base, int dsp_index)
 {
-	int max_attempts = (dsp_type == 0) ? DSP_POLL_MAX_PRIMARY :
-					     DSP_POLL_MAX_SECONDARY;
+	int max_attempts = (dsp_index == 0) ? DSP_POLL_MAX_PRIMARY :
+					      DSP_POLL_MAX_SECONDARY;
 	int i;
-	u32 val;
+	u32 val = 0;
 
 	for (i = 0; i < max_attempts; i++) {
-		val = ioread32(ring_base + DSP_READY_POLL_OFF);
-		msleep(DSP_POLL_INTERVAL_MS);
+		val = ioread32(dsp_poll_base + DSP_READY_POLL_OFF);
 
-		if (val == DSP_READY_SIG) {
-			dev_info(&dev->pci->dev,
-				 "DSP %d ready after %d polls (val=0x%08x)\n",
-				 dsp_type, i + 1, val);
-			return 0;
-		}
-		if (val != 0) {
-			dev_warn(&dev->pci->dev,
-				 "DSP %d unexpected ready value 0x%08x\n",
-				 dsp_type, val);
-			return 0;
-		}
+		/* Kext exits loop immediately on non-zero, non-DSP_READY_SIG.
+		 * Both 0 and DSP_READY_SIG mean "still booting". */
+		if (val != 0 && val != DSP_READY_SIG)
+			break;
+
+		msleep(DSP_POLL_INTERVAL_MS);
 	}
 
-	dev_err(&dev->pci->dev, "DSP %d failed to start (timeout after %dms)\n",
-		dsp_type, max_attempts * DSP_POLL_INTERVAL_MS);
+	/* Kext final success check: bit 0 of last read value must be set.
+	 * arm64: tbnz w20, #0x0, <success>
+	 * x86_64: testb $0x1, %r13b; jne <success> */
+	if (val & 1) {
+		dev_info(&dev->pci->dev,
+			 "DSP %d ready after %d polls (val=0x%08x)\n",
+			 dsp_index, i + 1, val);
+		return 0;
+	}
+
+	dev_err(&dev->pci->dev,
+		"DSP %d failed to start (timeout after %dms, val=0x%08x)\n",
+		dsp_index, max_attempts * DSP_POLL_INTERVAL_MS, val);
 	return -ETIMEDOUT;
 }
 
@@ -672,14 +783,15 @@ static int uad2_ring_program(struct uad2_dev *dev, void __iomem *ring_base,
 	u32 ring_size;
 	int i;
 
-	/* Read hardware ring capacity, capped at 0x400 */
+	/* Read hardware ring capacity.
+	 * Kext zeros ring_size when >= 0x400 (likely error detection). */
 	ring_size = ioread32(ring_base + DSP_RING_CAPACITY);
-	if (ring_size > 0x400) {
+	if (ring_size >= 0x400) {
 		dev_warn(
 			&dev->pci->dev,
-			"Ring %d capacity 0x%x out of range, capping to 0x400\n",
+			"Ring %d capacity 0x%x >= 0x400, zeroing (kext behavior)\n",
 			ring_idx, ring_size);
-		ring_size = 0x400;
+		ring_size = 0;
 	}
 
 	dev_info(&dev->pci->dev, "Ring %d capacity=0x%x\n", ring_idx,
@@ -728,11 +840,11 @@ static int uad2_dsp_program(struct uad2_dev *dev, int dsp_index)
 {
 	void __iomem *ring_base;
 	void __iomem *ring2_base;
+	void __iomem *dsp_poll_base;
 	dma_addr_t ring_dma;
-	int dsp_type = dsp_index;
 	int err;
 
-	/* Compute ring base within BAR */
+	/* Compute ring base within BAR (for DMA ring buffer programming) */
 	if (dsp_index < 4)
 		ring_base = dev->bar + DSP_RING_BASE_LOW +
 			    (dsp_index * DSP_RING_STRIDE);
@@ -742,17 +854,28 @@ static int uad2_dsp_program(struct uad2_dev *dev, int dsp_index)
 
 	ring2_base = ring_base + DSP_RING2_OFFSET;
 
-	dev_info(&dev->pci->dev,
-		 "DSP %d ring_base=BAR+0x%04lx ring2=BAR+0x%04lx\n", dsp_index,
-		 (unsigned long)(ring_base - dev->bar),
-		 (unsigned long)(ring2_base - dev->bar));
+	/* Compute DSP poll base (SEPARATE from ring_base):
+	 *   For dsp_index < 4:  BAR + dsp_index * 0x800
+	 *   For dsp_index >= 4: BAR + 0x2000 + dsp_index * 0x800 */
+	if (dsp_index < 4)
+		dsp_poll_base = dev->bar + (dsp_index * 0x800);
+	else
+		dsp_poll_base = dev->bar + 0x2000 + (dsp_index * 0x800);
 
-	/* Wait for DSP firmware (type 0 only) */
-	if (dsp_type == 0) {
-		err = uad2_dsp_wait_ready(dev, ring_base, dsp_type);
-		if (err)
-			return err;
-	}
+	dev_info(
+		&dev->pci->dev,
+		"DSP %d ring_base=BAR+0x%04lx ring2=BAR+0x%04lx poll=BAR+0x%04lx\n",
+		dsp_index, (unsigned long)(ring_base - dev->bar),
+		(unsigned long)(ring2_base - dev->bar),
+		(unsigned long)(dsp_poll_base - dev->bar));
+
+	/* Wait for DSP firmware.
+	 * Kext condition: dsp_type == 1 && this+0x18 == 0.
+	 * For Apollo Solo (1 DSP, dsp_index=0), dsp_type from GetCapabilities
+	 * is expected to be 1.  We always wait on first init. */
+	err = uad2_dsp_wait_ready(dev, dsp_poll_base, dsp_index);
+	if (err)
+		return err;
 
 	/*
 	 * Allocate DMA pages for ring descriptors (4 x 4KB = 16KB per ring).
@@ -781,6 +904,14 @@ static int uad2_dsp_program(struct uad2_dev *dev, int dsp_index)
 
 	/* Enable DMA for this DSP (CPcieIntrManager::EnableDMA) */
 	uad2_enable_dma(dev, dsp_index);
+
+	/* Enable DSP interrupt vectors (CPcieDSP::Initialize @ 0x10CC0).
+	 * For dsp_index N, the kext enables vectors N*5+2, N*5+3, N*5+4
+	 * which handle message FIFO service and error callbacks.
+	 * Vectors 0-39 use identity mapping (slot = vector ID). */
+	uad2_enable_vector(dev, dsp_index * 5 + 2, true);
+	uad2_enable_vector(dev, dsp_index * 5 + 3, true);
+	uad2_enable_vector(dev, dsp_index * 5 + 4, true);
 
 	return 0;
 }
@@ -912,7 +1043,7 @@ static int uad2_audio_ext_program(struct uad2_dev *dev)
 	 * This arms the vector in the DMA interrupt controller and updates
 	 * the enable shadow bitmask. */
 	uad2_write32(dev, REG_INTR_ENABLE, 0xFFFFFFFF);
-	uad2_enable_vector(dev, INTR_VEC_NOTIFY, true);
+	uad2_enable_vector(dev, INTR_SLOT_NOTIFY, true);
 
 	return 0;
 }
@@ -960,34 +1091,49 @@ static void uad2_handle_notification(struct uad2_dev *dev)
 
 	dev_info(&dev->pci->dev, "Notification: 0x%08x\n", status);
 
-	/* Bit 5: Connect ack */
+	/* Bit 5: Connect/rate-change ack.
+	 * The kext has two separate CUAOS::Event objects both signaled
+	 * by bit 5: connect_event (this+0x2830) used during Connect(),
+	 * and rate_event (this+0x2838) used during _setSampleClock().
+	 * We signal both completions here — only the one being waited
+	 * on will actually wake a thread. */
 	if (status & NOTIFY_CONNECT_ACK) {
-		dev_info(&dev->pci->dev, "Connect ack received\n");
+		dev_info(&dev->pci->dev, "Connect/rate ack received\n");
 		complete(&dev->connect_event);
+		complete(&dev->rate_event);
 	}
 
-	/* Bit 21: Channel config — in kext this copies 10 DWORDs from
-	 * BAR+0xC000 and forces bits 0+1 on.  For the Linux driver we
-	 * mostly care about the channel counts being set and the
-	 * notify_event signal at the end. */
+	/* Bit 21: Channel config — kext copies 10 DWORDs from BAR+0xC000,
+	 * then forces bits 0, 1, AND 22 on (ORs 0x400003) to trigger
+	 * IO descriptor re-reads and rate change handling. */
 	if (status & NOTIFY_CHAN_CONFIG) {
+		int i;
+
 		dev_info(&dev->pci->dev, "Channel config update\n");
-		/* Force playback + record IO ready processing */
-		status |= NOTIFY_PLAYBACK_IO | NOTIFY_RECORD_IO;
+
+		/* Copy 10 DWORDs of channel config from BAR+0xC000 */
+		for (i = 0; i < CHAN_CONFIG_DWORDS; i++)
+			dev->chan_config[i] = uad2_read32(
+				dev, REG_CHAN_CONFIG_BASE + (i * 4));
+
+		/* Force playback + record IO ready + rate change processing */
+		status |= NOTIFY_PLAYBACK_IO | NOTIFY_RECORD_IO |
+			  NOTIFY_RATE_CHANGE;
 	}
 
 	/* Bit 0: Playback IO ready — kext copies 72 DWORDs from BAR+0xC2C4 */
 	if (status & NOTIFY_PLAYBACK_IO) {
 		u32 play_ch;
+		int i;
 
-		/* Read playback channel count from the IO descriptor area.
-		 * In kext: this+0x2F8 = playbackChannelCount, read from
-		 * the 5th DWORD of the playback IO descriptor block
-		 * (BAR+0xC2C4 + 0x10 = BAR+0xC2D4 is offset for count field,
-		 *  but the count is stored at this+0x2F8 after copy).
-		 * We read it from the known offset: descriptor[4]. */
-		play_ch = uad2_read32(
-			dev, uad2_fw_reg(dev, REG_PLAYBACK_IO_DESC + 0x10));
+		/* Full IO descriptor copy (72 DWORDs = 288 bytes).
+		 * Matches kext behavior of copying the entire block. */
+		for (i = 0; i < IO_DESC_DWORDS; i++)
+			dev->play_io_desc[i] = uad2_read32(
+				dev, REG_PLAYBACK_IO_DESC + (i * 4));
+
+		/* Channel count is at DWORD[4] (offset +0x10) */
+		play_ch = dev->play_io_desc[4];
 		if (play_ch > 0 && play_ch <= 128) {
 			WRITE_ONCE(dev->play_channels, play_ch);
 			dev_info(&dev->pci->dev, "Playback channels: %u\n",
@@ -998,9 +1144,15 @@ static void uad2_handle_notification(struct uad2_dev *dev)
 	/* Bit 1: Record IO ready — kext copies 72 DWORDs from BAR+0xC1A4 */
 	if (status & NOTIFY_RECORD_IO) {
 		u32 rec_ch;
+		int i;
 
-		rec_ch = uad2_read32(
-			dev, uad2_fw_reg(dev, REG_RECORD_IO_DESC + 0x10));
+		/* Full IO descriptor copy */
+		for (i = 0; i < IO_DESC_DWORDS; i++)
+			dev->rec_io_desc[i] =
+				uad2_read32(dev, REG_RECORD_IO_DESC + (i * 4));
+
+		/* Channel count is at DWORD[4] */
+		rec_ch = dev->rec_io_desc[4];
 		if (rec_ch > 0 && rec_ch <= 128) {
 			WRITE_ONCE(dev->rec_channels, rec_ch);
 			dev_info(&dev->pci->dev, "Record channels: %u\n",
@@ -1051,9 +1203,9 @@ static void uad2_handle_notification(struct uad2_dev *dev)
  *   - Stereo types (MON, S/PDIF, AES/EBU, AUX, CUE): pair via (sub+1)/2
  *   - L/R suffix for types with bit pattern: even=L, odd=R
  *
- * Descriptor locations (with channel_base_index offset):
- *   Playback: BAR + (idx<<2) + 0xC2C4 + 0x18
- *   Record:   BAR + (idx<<2) + 0xC1A4 + 0x18
+ * Descriptor locations (NO channel_base_index offset — flat BAR):
+ *   Playback: BAR + 0xC2C4 + 0x18
+ *   Record:   BAR + 0xC1A4 + 0x18
  * ============================================================ */
 static void uad2_log_channel_map(struct uad2_dev *dev, const char *dir,
 				 u32 io_desc_base, unsigned int num_channels)
@@ -1064,7 +1216,7 @@ static void uad2_log_channel_map(struct uad2_dev *dev, const char *dir,
 	if (num_channels == 0 || num_channels > 128)
 		return;
 
-	desc_reg = uad2_fw_reg(dev, io_desc_base + IO_DESC_CHAN_OFFSET);
+	desc_reg = io_desc_base + IO_DESC_CHAN_OFFSET;
 
 	dev_info(&dev->pci->dev, "%s channel map (%u channels):\n", dir,
 		 num_channels);
@@ -1122,19 +1274,31 @@ static int uad2_audio_connect(struct uad2_dev *dev)
 	u32 doorbell_reg = uad2_fw_reg(dev, REG_FW_DOORBELL);
 	int chan, retry;
 	unsigned long timeout_jiffies;
+	unsigned long flags;
 	long ret;
 
-	WRITE_ONCE(dev->connected, false);
+	/* Set connected = true BEFORE the doorbell loop.
+	 * The kext sets this+0x2898 (is_connected) = 1 at this point.
+	 * The notification handler checks this flag and returns early
+	 * if false, so it MUST be true for the connect handshake to
+	 * receive firmware responses via the IRQ-driven path. */
+	WRITE_ONCE(dev->connected, true);
 
 	for (chan = 0; chan < UAD2_CONNECT_CHANNELS; chan++) {
 		/* Reset completion before each doorbell */
 		reinit_completion(&dev->notify_event);
+
+		/* Kext holds hw_lock (this+0x10) around doorbell + stream
+		 * enable writes to prevent concurrent register access */
+		spin_lock_irqsave(&dev->lock, flags);
 
 		/* Write DMA descriptor magic (doorbell command) */
 		uad2_write32(dev, doorbell_reg, DMA_DESC_MAGIC);
 
 		/* Write stream enable (doorbell to firmware) */
 		uad2_write32(dev, REG_STREAM_ENABLE, 0x1);
+
+		spin_unlock_irqrestore(&dev->lock, flags);
 
 		/* Wait for firmware response via notification interrupt.
 		 * Kext uses intr_timer->wait(100) with up to 10 retries.
@@ -1179,8 +1343,6 @@ static int uad2_audio_connect(struct uad2_dev *dev)
 	dev->buffer_frames = uad2_compute_buffer_frames(dev->play_channels,
 							dev->rec_channels);
 
-	WRITE_ONCE(dev->connected, true);
-
 	/* Log the channel mapping from firmware IO descriptors */
 	uad2_log_channel_map(dev, "Playback", REG_PLAYBACK_IO_DESC,
 			     dev->play_channels);
@@ -1212,8 +1374,8 @@ static int uad2_hw_program(struct uad2_dev *dev)
 		return -ENODEV;
 	}
 
-	/* 2. Echo device ID back (handshake) */
-	uad2_write32(dev, REG_DEVICE_ID, device_id);
+	/* 2. Acknowledge device ID (kext WriteRegEjj: always writes 0 to 0x2220) */
+	uad2_write32(dev, REG_DEVICE_HANDSHAKE, 0);
 
 	/* 3. Program interrupt controller registers */
 	uad2_intr_program(dev);
@@ -1326,7 +1488,7 @@ static int uad2_prepare_transport(struct uad2_dev *dev,
 	if (dev->periodic_timer_interval) {
 		uad2_write32(dev, REG_PERIODIC_TIMER,
 			     dev->periodic_timer_interval);
-		__uad2_enable_vector_locked(dev, INTR_VEC_PERIODIC, true);
+		__uad2_enable_vector_locked(dev, INTR_SLOT_PERIODIC, true);
 	}
 
 	/* 9-10. Clear position again + read-back flush */
@@ -1373,7 +1535,7 @@ static int uad2_prepare_transport(struct uad2_dev *dev,
 	}
 
 	/* 21. Enable end-of-buffer interrupt vector */
-	uad2_enable_vector(dev, INTR_VEC_ENDBUF, true);
+	uad2_enable_vector(dev, INTR_SLOT_ENDBUF, true);
 
 	dev_info(&dev->pci->dev,
 		 "Transport prepared: buf=%u irq=%u play=%u rec=%u\n",
@@ -1439,7 +1601,7 @@ static void uad2_stop_transport(struct uad2_dev *dev)
 	unsigned long flags;
 
 	/* Disable end-of-buffer interrupt before stopping */
-	uad2_disable_vector(dev, INTR_VEC_ENDBUF);
+	uad2_disable_vector(dev, INTR_SLOT_ENDBUF);
 
 	spin_lock_irqsave(&dev->lock, flags);
 	uad2_write32(dev, REG_TRANSPORT_CTL, 0x0);
@@ -1477,7 +1639,7 @@ static void uad2_shutdown(struct uad2_dev *dev)
 	spin_unlock_irqrestore(&dev->lock, flags);
 
 	/* 7: Disable notification interrupt */
-	uad2_disable_vector(dev, INTR_VEC_NOTIFY);
+	uad2_disable_vector(dev, INTR_SLOT_NOTIFY);
 
 	/* 8: Disconnect */
 	uad2_write32(dev, REG_STREAM_ENABLE, 0x10);
@@ -1702,7 +1864,8 @@ static snd_pcm_uframes_t uad2_pcm_pointer(struct snd_pcm_substream *ss)
 
 	pos = uad2_read32(dev, REG_DMA_POSITION);
 
-	/* Safety clamp (matches kext TransportPosition behavior) */
+	/* Safety clamp — kext uses strictly-greater-than but ALSA expects
+	 * pointer in [0, buffer_size), so we use >= as a tighter guard */
 	if (pos >= ss->runtime->buffer_size)
 		pos = 0;
 
@@ -1738,50 +1901,75 @@ static const struct snd_pcm_ops uad2_pcm_ops = {
 /* ============================================================
  * Interrupt handler
  *
- * The hardware has three MSI vectors (registered in kext Initialize):
- *   0x28 = notification interrupt → _notifyIntrCallback
- *   0x46 = periodic timer interrupt
- *   0x47 = end-of-buffer interrupt → _endBufferCallback
+ * Mirrors CPcieIntrManager::ServiceInterrupt @ 0x14330.
+ *
+ * Kext flow:
+ *   1. Read pending_lo from REG_DMA0_STATUS (0x2208)
+ *   2. If has_extended_irq: read pending_hi from REG_DMA1_STATUS (0x2264)
+ *   3. Combine into u64 pending, AND with intr_enable_shadow → active
+ *   4. Re-arm: write active bits back to 0x2208 (and 0x2264 if extended)
+ *   5. Dispatch callbacks per active bit
+ *
+ * Slot-to-vector mapping (from kext vector_to_slot[] table):
+ *   slot 32 (bit 0 of DMA1) = vector 0x28 → notification
+ *   slot 62 (bit 30 of DMA1) = vector 0x46 → periodic timer
+ *   slot 63 (bit 31 of DMA1) = vector 0x47 → end-of-buffer
  *
  * With Linux MSI (single vector mode), all interrupts arrive on
- * vector 0.  We handle:
- *   1. Transport status (BAR+0x2248) for overflow/underflow
- *   2. Firmware notifications (BAR+(idx<<2)+0xC008) for connect/IO
- *   3. Period elapsed for ALSA
+ * vector 0, so we dispatch based on the pending bitmask.
  * ============================================================ */
 static irqreturn_t uad2_irq_handler(int irq, void *data)
 {
 	struct uad2_dev *dev = data;
-	u32 transport_status;
-	u32 notify_status;
-	bool handled = false;
+	u32 pending_lo, pending_hi = 0;
+	u64 pending, active;
+	struct snd_pcm_substream *play_ss, *cap_ss;
+	bool period_elapsed = false;
 
-	/* Check transport status register */
-	transport_status = uad2_read32(dev, REG_TRANSPORT_CTL);
+	/* Step 1: Read pending interrupt bitmask from DMA status registers */
+	pending_lo = uad2_read32(dev, REG_DMA0_STATUS);
 
-	/* Hot-unplug detection: MMIO reads to a disappeared PCIe device
-	 * return all-ones.  Bail out early to avoid spurious processing. */
-	if (transport_status == 0xFFFFFFFF)
+	/* Hot-unplug detection: MMIO reads return all-ones */
+	if (pending_lo == 0xFFFFFFFF)
 		return IRQ_NONE;
 
-	/* Check notification status register */
-	notify_status =
-		uad2_read32(dev, uad2_fw_reg(dev, REG_FW_NOTIFY_STATUS));
-
-	if (!transport_status && !notify_status)
-		return IRQ_NONE;
-
-	/* Handle firmware notifications (connect ack, channel config, etc.) */
-	if (notify_status) {
-		uad2_handle_notification(dev);
-		handled = true;
+	if (dev->has_extended_irq) {
+		pending_hi = uad2_read32(dev, REG_DMA1_STATUS);
+		if (pending_hi == 0xFFFFFFFF)
+			pending_hi = 0; /* treat hot-unplug as no pending */
 	}
 
-	/* Handle transport status */
-	if (transport_status & BIT(5)) {
-		struct snd_pcm_substream *play_ss, *cap_ss;
+	pending = (u64)pending_hi << 32 | pending_lo;
 
-		/* Transport is running — check for errors */
+	/* Step 2: AND with enable shadow to get active slots */
+	spin_lock(&dev->lock);
+	active = pending & dev->intr_enable_shadow;
+	spin_unlock(&dev->lock);
+
+	if (!active)
+		return IRQ_NONE;
+
+	/* Step 3: Re-arm active vectors by writing back to status registers.
+	 * This must happen BEFORE dispatching to avoid missing interrupts
+	 * that fire during handler execution. */
+	uad2_write32(dev, REG_DMA0_STATUS, (u32)active);
+	if (dev->has_extended_irq && (u32)(active >> 32))
+		uad2_write32(dev, REG_DMA1_STATUS, (u32)(active >> 32));
+
+	/* Step 4: Dispatch based on active slot bits */
+
+	/* Notification interrupt (slot 32 = vector 0x28) */
+	if (active & BIT_ULL(INTR_SLOT_NOTIFY))
+		uad2_handle_notification(dev);
+
+	/* Period-elapsed interrupts (slot 62/63 = vectors 0x46/0x47) */
+	if (active & (BIT_ULL(INTR_SLOT_PERIODIC) | BIT_ULL(INTR_SLOT_ENDBUF)))
+		period_elapsed = true;
+
+	if (period_elapsed) {
+		u32 transport_status = uad2_read32(dev, REG_TRANSPORT_CTL);
+
+		/* Check for DMA errors */
 		if (transport_status & BIT(7))
 			dev_warn_ratelimited(&dev->pci->dev, "DMA overflow\n");
 		if (transport_status & BIT(8))
@@ -1800,11 +1988,9 @@ static irqreturn_t uad2_irq_handler(int irq, void *data)
 			snd_pcm_period_elapsed(play_ss);
 		if (cap_ss)
 			snd_pcm_period_elapsed(cap_ss);
-
-		handled = true;
 	}
 
-	return handled ? IRQ_HANDLED : IRQ_NONE;
+	return IRQ_HANDLED;
 }
 
 /* ============================================================
@@ -1941,6 +2127,7 @@ static int uad2_probe(struct pci_dev *pci, const struct pci_device_id *id)
 	spin_lock_init(&dev->notify_lock);
 	init_completion(&dev->notify_event);
 	init_completion(&dev->connect_event);
+	init_completion(&dev->rate_event);
 	dev->transport_state = 0;
 	dev->periodic_timer_interval = 0;
 	dev->intr_enable_shadow = 0;
@@ -1987,9 +2174,9 @@ static int uad2_probe(struct pci_dev *pci, const struct pci_device_id *id)
 	/* Apollo Solo: 1 DSP, single DMA engine
 	 * channel_base_index = 10 (from data segment @ 0x6018 in kext binary) */
 	dev->dsp_count = 1;
-	dev->dual_dma = false;
+	dev->has_extended_irq = true; /* all 3 vectors map to slots > 31 */
 	dev->channel_base_index = UAD2_CHANNEL_BASE_IDX;
-	dev->dma_ctrl_shadow = 0;
+	dev->dma_ctrl_shadow = DMA_CTRL_MASTER_ENABLE;
 	dev->play_channels = UAD2_OUT_CHANNELS;
 	dev->rec_channels = UAD2_IN_CHANNELS;
 	dev->buffer_frames = UAD2_MAX_BUFFER_FRAMES;
@@ -2085,18 +2272,20 @@ static void uad2_remove(struct pci_dev *pci)
 	 * the device open while we tear down hardware state. */
 	snd_card_disconnect(dev->card);
 
-	/* Set disconnecting flag to guard MMIO access — after this point,
-	 * uad2_read32/uad2_write32 become no-ops so the IRQ handler and
-	 * any remaining ALSA callbacks won't touch disappeared hardware. */
-	WRITE_ONCE(dev->disconnecting, true);
-
 	/* Full shutdown sequence (mirrors kext CPcieAudioExtension::Shutdown):
 	 * stops transport, clears doorbell, disables notification vector,
-	 * sends disconnect command to firmware */
+	 * sends disconnect command to firmware.
+	 * Must happen BEFORE setting disconnecting flag so MMIO writes
+	 * actually reach the hardware. */
 	uad2_shutdown(dev);
 
 	/* Disable global interrupt enable */
 	uad2_write32(dev, REG_INTR_ENABLE, 0x0);
+
+	/* Set disconnecting flag to guard MMIO access — after this point,
+	 * uad2_read32/uad2_write32 become no-ops so the IRQ handler and
+	 * any remaining ALSA callbacks won't touch disappeared hardware. */
+	WRITE_ONCE(dev->disconnecting, true);
 
 	/* Free IRQ before snd_card_free() — the card free will release
 	 * dev (it's card->private_data), so we must stop the IRQ handler

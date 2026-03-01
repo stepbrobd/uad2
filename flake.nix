@@ -14,6 +14,7 @@
         packages = with pkgs; [
           bear
           gnumake
+          llvmPackages.bintools
           llvmPackages.clang-tools
           meson
           ninja
