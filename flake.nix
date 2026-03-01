@@ -7,20 +7,12 @@
   outputs = inputs: inputs.parts.lib.mkFlake { inherit inputs; } {
     systems = import inputs.systems;
 
+    flake.nixosModules.default = ./module.nix;
+
     perSystem = { lib, pkgs, ... }: {
-      devShells.default = pkgs.mkShell {
-        hardeningDisable = [ "all" ];
-        env.KDIR = with pkgs.linuxPackages_latest.kernel; "${dev}/lib/modules/${modDirVersion}/build";
-        packages = with pkgs; [
-          bear
-          gnumake
-          llvmPackages.bintools
-          llvmPackages.clang-tools
-          meson
-          ninja
-          pkg-config
-        ];
-      };
+      packages.default = pkgs.callPackage ./default.nix { };
+
+      devShells.default = pkgs.callPackage ./shell.nix { };
 
       formatter = pkgs.writeShellScriptBin "formatter" ''
         set -eoux pipefail
