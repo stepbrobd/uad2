@@ -1,0 +1,665 @@
+APOLLO SOLO LINUX DRIVER — REVERSE ENGINEERING SESSION CONTEXT
+==============================================================
+
+OBJECTIVE
+---------
+Write a Linux kernel ALSA/PCIe driver for Universal Audio Apollo Solo Thunderbolt.
+Source: reverse engineering of macOS kext com.uaudio.driver.UAD2System (arm64e, v11.7.0 build 2)
+Binary: ./uad2_aarch64-darwin
+Disassembly: ./uad2_dis_aarch64-darwin  (otool -v -s __TEXT_EXEC __text)
+
+Also available (fully stripped, not used for RE):
+Binary: ./uad2_x86_64-darwin
+Disassembly: ./uad2_dis_x86_64-darwin
+
+
+HARDWARE IDENTITY (confirmed via ioreg on live hardware)
+--------------------------------------------------------
+PCI vendor-id:    0x1a00
+PCI device-id:    0x0002
+PCI subsystem-id: 0x000f
+PCI class-code:   0x048000 (Multimedia > Other)
+BAR 0: 64KB MMIO window (phys addr 0x1203000000, length=65536)
+PCIe link: Gen1 x1, MSI capable
+Thunderbolt-tunnelled: yes (Intel JHL8440 controller)
+Thunderbolt vendor: Universal Audio, Inc. (TB vendor ID 0x1176)
+TB device model: "Apollo Solo" (model ID 0x0B, revision 1, ROM v32)
+ioreg IOName: "pci1a00,2"
+PCI BDF: 45:0:0
+
+Driver stack on macOS:
+  IOPCIDevice → com_uaudio_driver_UAD2Pcie2 → com_uaudio_driver_UAD2System
+    → com_uaudio_driver_UAD2AudioEngine → com_uaudio_driver_UAD2AudioStream
+
+
+AUDIO ENGINE SPECS (confirmed from ioreg IOAudioEngine + IOAudioStream)
+-----------------------------------------------------------------------
+Sample rates: 44100, 48000, 88200, 96000, 176400, 192000 Hz
+Buffer: 8192 frames (IOAudioEngineNumSampleFramesPerBuffer), 16 frame offset
+Format: 32-bit container, 24-bit depth, signed integer, LITTLE-ENDIAN
+         (IOAudioStreamByteOrder=1, alignment=1 = MSB-justified LPCM)
+         NumericRepresentation = "sint" (0x73696E74)
+         SampleFormat = "lpcm" (0x6C70636D)
+Input channels: 32 (from device: MIC/LINE/HIZ, ADAT, S/PDIF, VIRTUAL, MON, AUX)
+Output channels: 42 (to device: MON, LINE, ADAT, S/PDIF, VIRTUAL, CUE, RESERVED)
+Current sample rate at probe: 48000 Hz
+DMA layout: interleaved
+
+
+CONFIRMED REGISTER MAP (BAR-relative offsets, all 32-bit MMIO)
+--------------------------------------------------------------
+
+=== Global / Device ===
+BAR + 0x0014  = interrupt enable              WRITE 0xFFFFFFFF to unmask
+BAR + 0x0030  = firmware base address (low)   READ after SG table programming
+BAR + 0x0034  = firmware base address (high)  READ (combined: 64-bit fw base)
+
+=== DMA Master Control (CPcieIntrManager) ===
+BAR + 0x2200  = DMA master control            R/W bitmask, shadow register pattern
+                  ResetDMAEngines writes: single=0x1e00, dual=0x1fe00 (written twice+readback)
+                  EnableDMA: sets bit (1 << (dsp_index + 1)); bit 0 reserved
+                  Software shadow at IntrManager+0x4BC, never read from HW
+BAR + 0x2204  = DMA0 interrupt control        WRITE 0x0 (clear/disable)
+BAR + 0x2208  = DMA0 status / IRQ arm         WRITE 0xFFFFFFFF to arm; WRITE 0x0 to clear
+
+=== Device Identification ===
+BAR + 0x2218  = device ID / handshake         READ to verify; WRITE back (echo handshake)
+                  Also polled after clock change (2s timeout)
+
+=== Audio Transport Registers (CPcieAudioExtension) ===
+BAR + 0x2240  = buffer frame size register    WRITE bufferFrameSize - 1 (hardware mask)
+BAR + 0x2244  = DMA position counter          READ: current frame position (wrapping counter)
+                                              WRITE 0 to clear
+                  Not a byte offset — returns frame count directly
+                  Bounds check: if pos > bufferFrameSize, clamp to 0
+BAR + 0x2248  = transport control             R/W state machine:
+                  0x000 = stop/reset
+                  0x001 = armed/prepared
+                  0x00F = running (normal start)
+                  0x20F = running (extended, device variants 0xA/0x9)
+                  Read status bits: bit5=running, bit7=overflow, bit8=underflow
+BAR + 0x224C  = playback monitor config       WRITE (totalPlayChans-1) | 0x100
+BAR + 0x2250  = playback channel count        WRITE total playback channels
+BAR + 0x2254  = poll status register          READ: poll for DMA ready (compare vs irq_period)
+BAR + 0x2258  = interrupt period              WRITE: IRQ period in frames
+BAR + 0x225C  = record channel count          WRITE: record channels (+1 if monitor bit set)
+BAR + 0x2260  = stream enable / clock trigger WRITE 0x1=start, 0x10=stop/disconnect, 0x4=clock change
+
+=== DMA Engine 1 (dual-engine devices only) ===
+BAR + 0x2264  = DMA1 interrupt control        WRITE 0x0
+BAR + 0x2268  = DMA1 status                   WRITE 0x0
+
+=== Buffer / Timer ===
+BAR + 0x226C  = buffer size in KB             WRITE (totalPlayChans * (bufSz-1)) >> 10
+BAR + 0x2270  = periodic timer interval       WRITE: timer interval in frames
+
+=== Monitor ===
+BAR + 0x22C0  = playback monitor status       READ (flush/status in PrepareTransport + TransportPosition)
+BAR + 0x22C4  = secondary counter control     WRITE 0 on Shutdown
+
+=== Scatter-Gather DMA Tables (CPcieAudioExtension::ProgramRegisters @ 0x4bac0) ===
+BAR + 0x8000..0x9FFF = Buffer A (playback) SG table
+                  1024 entries × 8 bytes = 8192 bytes
+                  Entry format: [low32 phys_addr][high32 phys_addr] per 4KB page
+                  Covers 1024 × 4KB = 4MB playback DMA buffer
+BAR + 0xA000..0xBFFF = Buffer B (capture) SG table
+                  Same layout as Buffer A, offset = BufferA + 0x2000
+                  Covers 1024 × 4KB = 4MB capture DMA buffer
+
+SG Programming Loop (confirmed from disasm lines 70514-70569):
+  sg_offset = 0x8000; dma_offset = 0
+  do {
+      WriteReg(BAR+sg_offset,     physA_lo)   // playback page low
+      WriteReg(BAR+sg_offset+4,   physA_hi)   // playback page high
+      WriteReg(BAR+sg_offset+0x2000, physB_lo)  // capture page low
+      WriteReg(BAR+sg_offset+0x2004, physB_hi)  // capture page high
+      dma_offset += 0x1000; sg_offset += 8
+  } while (sg_offset != 0xA000)
+
+=== Sample Clock (CPcieAudioExtension::_setSampleClock) ===
+BAR + (channel_base_index*4) + 0xC04C = sample clock register
+                  WRITE: clock_source | (rate_enum << 8)
+                  clock_source 0 = internal
+                  rate_enum: 1=44100, 2=48000, 3=88200, 4=96000, 5=176400, 6=192000
+                  After write: WRITE 0x4 to BAR+0x2260 (trigger), poll BAR+0x2218 (2s timeout)
+
+=== Firmware Mailbox (0xC000 range, per-channel via channel_base_index) ===
+BAR + 0xC000  = channel config area           READ: 10 DWORDs of channel config
+BAR + (channel_base_index << 2) + 0xC004 = doorbell register
+                  WRITE 0x0ACEFACE as connect command
+                  channel_base_index = 10 for Apollo Solo (from data segment @ 0x6018)
+BAR + (channel_base_index << 2) + 0xC008 = notification status register
+                  READ: 32-bit bitmask of pending events
+                  WRITE 0: clear/acknowledge all events
+                  Bit 0:  playback IO ready
+                  Bit 1:  record IO ready
+                  Bit 4:  DMA ready
+                  Bit 5:  connect ack
+                  Bit 6:  error
+                  Bit 7:  end buffer
+                  Bit 21: channel config (also forces bits 0+1 in handler)
+                  Bit 22: rate change
+
+=== Playback/Record IO Descriptor Areas ===
+BAR + (channel_base_index << 2) + 0xC1A4 = record IO descriptors
+                  READ: 72 DWORDs (0x120 bytes) of record channel config
+BAR + (channel_base_index << 2) + 0xC2C4 = playback IO descriptors
+                  READ: 72 DWORDs (0x120 bytes) of playback channel config
+
+
+CHANNEL_BASE_INDEX
+------------------
+Constant loaded from binary data segment @ virtual address 0x6018 during Initialize.
+For Apollo Solo: channel_base_index = 10 (0x0A)
+Second field at this+0x28 = 380 (0x017C)
+Used for all firmware mailbox register address calculations:
+  actual_offset = (10 << 2) + base_offset = 0x28 + base_offset
+
+
+DSP RING BUFFER REGISTERS (CPcieRingBuffer::ProgramRegisters @ 0x14c48)
+-----------------------------------------------------------------------
+For DSP index n:
+  if n < 4:  ring_base = BAR + 0x2000 + (n * 0x80)
+  if n >= 4: ring_base = BAR + 0x5e00 + (n * 0x80)
+Second ring (ring2) at ring_base + 0x40
+
+Apollo Solo has 1 DSP (index 0):
+  ring0_base = BAR + 0x2000
+  ring1_base = BAR + 0x2040
+
+Per-ring register layout (relative to ring_base):
+  +0x00  = descriptor 0 phys addr (low 32 bits)     W/R
+  +0x04  = descriptor 0 phys addr (high 32 bits)    W/R
+  +0x08  = descriptor 1 phys addr (low 32 bits)     W/R
+  +0x0C  = descriptor 1 phys addr (high 32 bits)    W/R
+  +0x10  = descriptor 2 phys addr (low 32 bits)     W/R
+  +0x14  = descriptor 2 phys addr (high 32 bits)    W/R
+  +0x18  = descriptor 3 phys addr (low 32 bits)     W/R
+  +0x1C  = descriptor 3 phys addr (high 32 bits)    W/R
+  +0x20  = descriptor count register                 WRITE ring_size
+  +0x24  = ring size register                        WRITE ring_size
+  +0x28  = hardware ring capacity                    READ (cap value at 0x400)
+  +0x1a4 = DSP ready poll register                   READ; wait for 0xa8caed0f
+
+Programming sequence:
+  1. Read ring_base+0x28 → ring_size (if >= 0x400, set to 0)
+  2. Write ring_base+0x24 = ring_size
+  3. Write ring_base+0x20 = ring_size
+  4. For i = 0..3:
+     - phys_addr = dma_alloc->getPhysicalSegment(i * 0x1000) [4KB page aligned]
+     - Write ring_base + (i*8)     = phys_addr[31:0]
+     - Write ring_base + (i*8) + 4 = phys_addr[63:32]
+     - Read back both, verify match (return -2 on mismatch)
+
+
+DSP BOOT WAIT (_waitFor469ToStart @ 0x1152c)
+---------------------------------------------
+poll_register: ring_base + 0x1a4
+ready_value:   0xa8caed0f
+poll_interval: 300ms (0x12c)
+max_attempts:  100 for DSP type 0 (30s timeout)
+               10  for DSP type >0 (3s timeout)
+
+
+INIT SEQUENCE (CPcieDevice::ProgramRegisters @ 0xdf48, exact order)
+--------------------------------------------------------------------
+1.  Read  BAR+0x2218 (device ID)
+2.  Verify == expected_device_id (stored at CPcieDevice+0xcc8)
+3.  Write BAR+0x2218 = device_id  (echo handshake)
+4.  CPcieIntrManager::ProgramRegisters:
+      Write BAR+0x2204 = 0x0
+      Write BAR+0x2208 = 0x0
+      (if dual_dma) Write BAR+0x2264 = 0x0, BAR+0x2268 = 0x0
+5.  CPcieIntrManager::ResetDMAEngines:
+      compute ctrl = dual ? 0x1fe00 : 0x1e00
+      Write BAR+0x2200 = ctrl  (twice)
+      Read  BAR+0x2200          (readback verify)
+      save shadow register
+6.  Write BAR+0x2208 = 0xffffffff   (arm interrupt)
+7.  For each DSP (Apollo Solo: 1 DSP):
+      CPcieDSP::ProgramRegisters:
+        compute ring_base
+        call _waitFor469ToStart (DSP type 0 only)
+        CPcieRingBuffer::ProgramRegisters x2 (ring0, ring1):
+          Read  ring_base+0x28 → ring_size (cap at 0x400)
+          Write ring_base+0x24 = ring_size
+          Write ring_base+0x20 = ring_size
+          4-iteration loop: write 64-bit DMA phys addrs to ring_base+0x00..0x1C
+        CPcieIntrManager::EnableDMA(dsp_index):
+          bit = 1 << (dsp_index + 1)
+          shadow |= bit
+          Write BAR+0x2200 = shadow
+8.  CPcieAudioExtension::ProgramRegisters (@ 0x4bac0, lines 70401-70631):
+      Read  BAR+0x2248, if bit5: Read BAR+0x2244 (ack)
+      Write BAR+0x2248 = 0x0 (clear)
+      Program SG tables: 1024-entry loop writing BAR+0x8000..0xBFFF
+      Read  BAR+0x30/0x34 → firmware base (64-bit, stored at this+0x28c8)
+      EnableVector(0x28, 1) → enable notification interrupt
+9.  CPcieAudioExtension::Connect (@ 0x4be58, lines 70632-70823):
+      Reset notifyEvent
+      20-channel doorbell loop: write 0x0ACEFACE, write 0x1 to BAR+0x2260
+      Wait on notifyEvent (100ms × 10 retries per channel)
+      Firmware responds: bit 5 (connect ack), bit 21 (channel config)
+      bit 21 forces bits 0+1 → copies IO descriptors, recomputes buffer size
+      notifyEvent signaled by second bit 21 check → wakes Connect()
+
+
+NOTIFICATION INTERRUPT HANDLER (_handleNotificationInterrupt @ 0x4c154)
+------------------------------------------------------------------------
+Full dispatch chain (decoded from lines 70824-71446):
+
+1.  Acquire lock on this+0x2890 (notification spinlock)
+2.  Check this+0x2898 (connected flag); if 0, unlock and return
+3.  Read BAR+(channel_base_index<<2)+0xC008 → notification bitmask
+
+4.  Dispatch:
+    bit 5:  Connect ack → Signal connectEvent (this+0x2838)
+    bit 21: Channel config (first pass) →
+              Lock this+0x10, copy 10 DWORDs from BAR+0xC000 to this+0x24
+              Copy up to 0x5F DWORDs from BAR+(idx<<2)+0xC000 to this+0x4C
+              Unlock, parse channel names
+              FORCE bits 0+1 on (orr w20, w20, #0x00400003)
+    bit 0:  Playback IO ready →
+              Lock, copy 72 DWORDs from BAR+0xC2C4 to this+0x2E8
+              Unlock, parse IO names, call _recomputeBufferFrameSize()
+              Callback(this, 0x66, 0, context)
+    bit 1:  Record IO ready →
+              Lock, copy 72 DWORDs from BAR+0xC1A4 to this+0x1C8
+              Unlock, parse IO names, call _recomputeBufferFrameSize()
+              Callback(this, 0x65, 0, context)
+    bit 22: Rate change → read BAR+0xC05C and BAR+0xC054, callback(0x67)
+    bit 4:  DMA ready → read BAR+0xC054/0xC058/0xC05C, callback(0x64)
+    bit 6:  Error → log only
+    bit 21: (second pass) → Signal notifyEvent (this+0x2830) ** wakes Connect() **
+    bit 7:  End buffer → Signal endBufferEvent (this+0x2840)
+    bit 0|1: Combined IO ready → callback(0x6E)
+
+5.  Write 0 to BAR+(channel_base_index<<2)+0xC008 (clear/ack)
+6.  Unlock notification spinlock
+
+
+EVENT OBJECTS (CPcieAudioExtension)
+------------------------------------
+this+0x2830 = notifyEvent     Created with CUAOS::CreateEvent(name, 1)
+                              Signaled by: bit 21 second pass
+                              Waited on by: Connect() with 100ms timeout
+this+0x2838 = connectEvent    Created with CUAOS::CreateEvent(name, 1)
+                              Signaled by: bit 5 (connect ack)
+this+0x2840 = endBufferEvent  Created with CUAOS::CreateEvent(name, 1)
+                              Signaled by: bit 7 (end buffer)
+
+Event vtable: +0x08=Destroy, +0x10=Signal, +0x18=Wait(timeout), +0x28=Reset
+
+
+CONNECT SEQUENCE (CPcieAudioExtension::Connect @ 0x4be58, detailed)
+--------------------------------------------------------------------
+1.  Acquire mutex at this+0x2828
+2.  Reset notifyEvent (this+0x2830) via vtable+0x28
+3.  For chan = 0..19:
+      Lock HW spinlock (this+0x2888)
+      Write BAR + (10 << 2) + 0xC004 = 0x0ACEFACE  (doorbell)
+      Write BAR + 0x2260 = 0x1  (stream enable)
+      Unlock HW spinlock
+      notifyEvent->Wait(100ms), up to 10 retries
+      On timeout: call _handleNotificationInterrupt() manually
+4.  After loop: check this+0x20 (connected flag), validate sample_rate_code
+5.  On success: set is_connected=1, buffer_count=12
+6.  On failure: return -92 (kIOReturnNotReady)
+7.  Disconnect: Write BAR+0x2260 = 0x10
+
+
+BUFFER FRAME SIZE COMPUTATION (_recomputeBufferFrameSize @ 0x4d9e0)
+--------------------------------------------------------------------
+Formula: floor_pow2(0x400000 / (max(play_ch, rec_ch) * 4)), capped at 0x2000
+Fields read: this+0x1D4 (record channels), this+0x2F8 (playback channels)
+Field written: this+0x287C (bufferFrameSize)
+
+For Apollo Solo (42 play, 32 rec):
+  0x400000 / (42 * 4) = 24966 → floor_pow2 = 16384 → capped to 8192
+
+
+TRANSPORT SEQUENCE (PrepareTransport + StartTransport + StopTransport)
+----------------------------------------------------------------------
+PrepareTransport (from pcm_prepare, refined with new analysis):
+  1.  Check transport_state != 2 (not already running)
+  2.  Check is_connected == 1
+  3.  Validate bufferFrameSize < 0x10000
+  4.  Lock hw_lock (this+0x10)
+  5.  Write BAR+0x2240 = bufferFrameSize - 1
+  6.  Write BAR+0x226C = (totalPlayChans * (bufSz-1)) >> 10
+  7.  Write BAR+0x2244 = 0  (clear position)
+  8.  If periodic_timer_interval != 0:
+        Write BAR+0x2270 = periodic_timer_interval
+        EnableVector(0x46, 1)  (enable periodic timer interrupt)
+  9.  Write BAR+0x2244 = 0  (clear again)
+  10. Read  BAR+0x2244       (flush)
+  11. Write BAR+0x2248 = 0   (stop/reset)
+  12. Write BAR+0x2258 = irqPeriod
+  13. Write BAR+0x2250 = totalPlayChans
+  14. Write BAR+0x225C = recChans
+  15. Write BAR+0x2248 = 1   (arm)
+  16. Read  BAR+0x22C0       (monitor flush)
+  17. If diagnostic_flags bit1: Write BAR+0x224C = (totalPlayChans-1)|0x100
+  18. Unlock hw_lock
+  19. Set transport_state = 1 (prepared)
+  20. Poll BAR+0x2254 until == irqPeriod (DMA ready, max ~2 retries with 1ms sleep)
+  21. EnableVector(0x47, 1) (enable end-of-buffer interrupt)
+
+StartTransport (@ line 71904):
+  1.  Check transport_state == 1 (prepared)
+  2.  Check is_connected
+  3.  Lock hw_lock
+  4.  Write BAR+0x2248 = 0x00F (normal) or 0x20F (variant 0xA/0x9 extended)
+  5.  Unlock hw_lock
+  6.  Set transport_state = 2 (running)
+
+StopTransport (@ line 71987):
+  1.  Check is_connected
+  2.  DisableVector(0x47)  (disable end-of-buffer interrupt FIRST)
+  3.  Lock hw_lock
+  4.  Write BAR+0x2248 = 0x0
+  5.  Unlock hw_lock
+  6.  Set transport_state = 0
+
+
+SHUTDOWN SEQUENCE (CPcieAudioExtension::Shutdown @ 0x4cb0c, line 71447)
+------------------------------------------------------------------------
+Full sequence decoded from lines 71447-71537:
+  1. Lock hw_lock (this+0x10)
+  2. Write BAR+0x2248 = 0 (stop transport)
+  3. Write BAR+(channel_base_index<<2)+0xC004 = 0 (clear doorbell)
+  4. Read  BAR+0x2248       (flush / status read)
+  5. Write BAR+0x22C4 = 0   (clear secondary counter)
+  6. Unlock hw_lock
+  7. DisableVector(0x28)    (disable notification interrupt)
+  8. Tail-call _disconnect():
+     a. Write BAR+0x2260 = 0x10 (disconnect command)
+     b. Set is_connected = 0
+
+
+SAMPLE CLOCK CHANGE (_setSampleClock @ line 72712)
+---------------------------------------------------
+1. Combine: clock_val = clock_source | (rate_enum << 8)
+2. Write BAR + (channel_base_index*4) + 0xC04C = clock_val
+3. Write BAR + 0x2260 = 0x4  (trigger clock change)
+4. Poll BAR + 0x2218 for ack (timeout 2000ms)
+
+UAD2SampleRate enum (1-based):
+  1=44100, 2=48000, 3=88200, 4=96000, 5=176400, 6=192000
+
+
+CPcieDevice OBJECT LAYOUT (arm64e offsets)
+------------------------------------------
+this + 0xc50  = dsp_count (u32)
+this + 0xc70  = m_pRegisterWindowBaseAddr (BAR pointer)
+this + 0xc80  = CPcieDSP* array (8 bytes each, up to APOLLO_MAX_DSPS=8)
+this + 0xcc8  = expected_device_id (u32)
+this + 0xcd0  = CPcieIntrManager*
+this + 0xcd8  = (second intr manager / bus object)
+this + 0xce0  = zeroed at Initialize
+this + 0xcf8  = CPcieAudioExtension*
+this + 0xd58  = spinlock (CUAOS::CreateSpinLock)
+this + 0xd60  = 0x100 (lock capacity)
+this + 0xd68  = 0 (lock state)
+
+CPcieIntrManager OBJECT LAYOUT
+-------------------------------
+this + 0x00   = lock object pointer (PAC-authenticated vtable)
+this + 0x08   = BAR base pointer
+this + 0x18   = use_lock flag (bool)
+this + 0x4bc  = dma_ctrl_shadow (shadow register for BAR+0x2200)
+this + 0x4c0  = has_second_engine flag
+this + 0x4c4  = has_second_dma_engine flag
+
+CPcieRingBuffer OBJECT LAYOUT
+------------------------------
+this + 0x00   = DMA alloc object pointer (IOBufferMemoryDescriptor, vtable[6]=getPhysicalSegment)
+this + 0x10   = BAR base for this ring (reg_base)
+this + 0x34   = hw_capacity (from hardware)
+this + 0x38   = ring_size
+this + 0x3c   = ring_pos (initialized same as ring_size)
+this + 0x40   = channel_id (flag, controls log tag)
+
+CPcieAudioExtension OBJECT LAYOUT (comprehensive, from all analyses)
+---------------------------------------------------------------------
+this + 0x08   = reference count / instance ID
+this + 0x10   = hw_lock (spinlock, vtable+0x10=Lock, +0x18=Unlock)
+this + 0x18   = CPcieIntrManager* pointer
+this + 0x20   = is_connected flag (u32)
+this + 0x24   = channel_base_index (u32) = 10 for Apollo Solo
+this + 0x28   = secondary field = 380 (0x17C)
+this + 0xa1   = sample_rate_code (u8)
+this + 0xa8   = rate change value (from BAR+0xC05C)
+this + 0x01C8 = record IO descriptor copy area (72 DWORDs from BAR+0xC1A4)
+this + 0x01D4 = record_channel_count
+this + 0x02E8 = playback IO descriptor copy area (72 DWORDs from BAR+0xC2C4)
+this + 0x02F8 = playback_channel_count
+this + 0x2828 = mutex (CUAOS::CreateMutex)
+this + 0x2830 = notifyEvent (CUAOS::CreateEvent, auto-reset)
+this + 0x2838 = connectEvent (CUAOS::CreateEvent, auto-reset)
+this + 0x2840 = endBufferEvent (CUAOS::CreateEvent, auto-reset)
+this + 0x2848 = BAR base pointer (set in MapHardware)
+this + 0x2858 = notification callback function pointer
+this + 0x2860 = notification callback context
+this + 0x2868 = end-buffer callback function pointer
+this + 0x2870 = end-buffer callback context
+this + 0x2878 = transport_state (0=uninit, 1=prepared, 2=running)
+this + 0x287C = bufferFrameSize (computed by _recomputeBufferFrameSize)
+this + 0x2880 = interrupt_period (frames)
+this + 0x2888 = hw spinlock #2
+this + 0x2890 = notification spinlock (guards _handleNotificationInterrupt)
+this + 0x2898 = notification active flag (must be non-zero to process events)
+this + 0x28a0 = DMA Buffer A pointer (playback, 4MB) — set in MapHardware
+this + 0x28a8 = DMA Buffer B pointer (capture, 4MB) — set in MapHardware
+this + 0x28B0 = device_variant_id / constant 0xC (set in Connect)
+this + 0x28B4 = current_sample_rate (enum)
+this + 0x28B8 = diagnostic_flags (bit1,2 = monitor enable)
+this + 0x28BC = diagnostic_status
+this + 0x28C0 = periodic_timer_interval (frames)
+this + 0x28c8 = firmware base address (64-bit, from BAR+0x30/0x34)
+this + 0x28d0 = UAD2DeviceType
+this + 0x28d8 = task/DMA tag (from MapHardware arg)
+this + 0x28E0 = flag: enable playback monitor read
+this + 0x28e8 = DMA mapper / IOMapper object
+this + 0x2EF4 = extended mode flag (for variant 0x9)
+this + 0x22EF0 = large-offset DMA address storage
+
+
+MSI INTERRUPT VECTORS (registered in Initialize)
+-------------------------------------------------
+Vector 0x28 (40):  _notifyIntrCallback   priority=0  → reads BAR+0xC008, dispatches events
+Vector 0x46 (70):  _periodicTimerCallback priority=?  → periodic timer interrupt
+Vector 0x47 (71):  _endBufferCallback    priority=1  → end-of-buffer notification
+
+Interrupt vector management (CPcieIntrManager):
+  IntrManager+0x4D0: lookup table mapping vector_id → bit slot index
+  IntrManager+0x20: 64-bit enable shadow bitmask
+
+  EnableVector(vec, arm) @ 0x13cd4 (line 12349):
+    1. slot = IntrManager[(vec << 2) + 0x4D0]
+    2. bit_mask = 1 << slot
+    3. IntrManager+0x20 |= bit_mask
+    4. If arm: write bit_mask to BAR+0x2208 (arm DMA0)
+    5. Write full shadow to BAR+0x2204
+    6. If dual-DMA: write high bits to BAR+0x2264/0x2268
+
+  DisableVector(vec) @ 0x13f34 (line 12502):
+    1. slot = IntrManager[(vec << 2) + 0x4D0]
+    2. bit_mask = 1 << slot
+    3. IntrManager+0x20 &= ~bit_mask
+    4. Write shadow to BAR+0x2204
+    5. If dual-DMA: write to BAR+0x2268
+
+Vector lifecycle:
+  0x28: enabled in ProgramRegisters, disabled in Shutdown
+  0x46: enabled in PrepareTransport (only if periodic_timer_interval != 0)
+  0x47: enabled at end of PrepareTransport (after DMA ready poll),
+        disabled at start of StopTransport
+
+Callback routing:
+  _notifyIntrCallback does NOT call handler directly — schedules via
+  CUAOS::ScheduleRequest (workqueue/deferred context).
+  _requestCallback @ 0x4d6f8 is the deferred entry point that calls
+  _handleNotificationInterrupt.
+  Handler uses spinlock at this+0x2890, checks connected flag at this+0x2898.
+
+
+CURRENT DRIVER FILES
+--------------------
+uad2.c         — v0.5.0, comprehensive driver with full audio playback/capture support
+Makefile       — standard kernel module Kbuild
+
+New in v0.5.0:
+- Renamed from apollo_solo → uad2 throughout (generic for all UA Thunderbolt devices)
+- PCI ID table extensible for multiple devices (Apollo Twin, x4, x6, etc.)
+
+New in v0.4.0:
+- Proper interrupt vector management: uad2_enable_vector() / uad2_disable_vector()
+  with 64-bit enable shadow bitmask (mirrors IntrManager+0x20)
+- Vector lifecycle: 0x28 enabled in ProgramRegisters/disabled in Shutdown,
+  0x46 enabled in PrepareTransport if periodic timer configured,
+  0x47 enabled after DMA ready poll/disabled at start of StopTransport
+- Full Shutdown sequence (uad2_shutdown): stops transport, clears doorbell,
+  disables notification vector, disconnects — replaces ad-hoc teardown in remove()
+- Transport state tracking (0=uninit, 1=prepared, 2=running)
+- notify_lock spinlock protecting notification handler (mirrors kext this+0x2890)
+- Locking in PrepareTransport/StartTransport/StopTransport (hw_lock under spinlock)
+- ALSA mixer controls: Clock Source (Internal/S/PDIF) and Current Sample Rate (read-only)
+- Clock source now configurable via mixer; applied in _setSampleClock register
+
+Implemented in v0.3.0 (all items, carried forward):
+- Full register map including SG tables (0x8000-0xBFFF), firmware base (0x30/0x34),
+  notification status (0xC008), and all firmware mailbox registers
+- Two 4MB DMA buffer allocation (scatter-gather source for playback + capture)
+- SG table programming: 1024-entry loop writing 64-bit phys addrs to BAR+0x8000/0xA000
+- Firmware base address read from BAR+0x30/0x34
+- Global interrupt enable (BAR+0x0014 = 0xFFFFFFFF)
+- Full Connect handshake with:
+  - Proper doorbell address: BAR + (10 << 2) + 0xC004
+  - notifyEvent via Linux completion (wait_for_completion_timeout)
+  - Manual notification polling on timeout (mirrors kext behavior)
+  - Channel count discovery from IO descriptors
+- Notification interrupt handler (_handleNotificationInterrupt):
+  - Reads BAR+(10<<2)+0xC008 for event bitmask
+  - Dispatches: connect ack (bit5), channel config (bit21), playback IO (bit0),
+    record IO (bit1), rate change (bit22), DMA ready (bit4), error (bit6)
+  - Write-to-clear acknowledgment
+  - Signals completion events for Connect() handshake
+- Dynamic buffer frame size computation: floor_pow2(4MB / (max_ch * 4)), cap 8192
+- ALSA PCM buffer mapped directly to 4MB HW DMA buffer (zero-copy)
+- PrepareTransport with DMA ready poll (BAR+0x2254)
+- Playback monitor config (BAR+0x224C)
+- channel_base_index = 10 (confirmed from binary data segment @ 0x6018)
+- Transport start/stop (0xF / 0x0 to BAR+0x2248)
+- Proper remove() with disconnect (0x10), secondary counter clear, interrupt disable
+- Corrected format: S32_LE, 42 output / 32 input channels
+
+Remaining known limitations:
+- Single MSI vector mode (hardware has 3 vectors; we handle all on vector 0)
+- Channel count readback from IO descriptors uses fixed offsets (may need tuning)
+- No ALSA mixer controls for monitor routing (clock source selection IS implemented)
+- No firmware version verification
+- No power management / suspend-resume support
+- Cannot test on macOS host — needs Linux + Thunderbolt + kernel headers
+
+
+DISASSEMBLY COMMANDS
+--------------------
+# All analysis uses: ./uad2_dis_aarch64-darwin
+# Generated with: otool -v -s __TEXT_EXEC __text uad2_aarch64-darwin > uad2_dis_aarch64-darwin
+
+# Key functions analyzed:
+# CPcieRingBuffer::ProgramRegisters       @ 0x14c48 (line 13354)    — DONE
+# CPcieIntrManager::EnableDMA             @ 0x13a4c                  — DONE
+# CPcieIntrManager::EnableVector          @ 0x13cd4 (line 12349)    — DONE (v0.4.0)
+# CPcieIntrManager::DisableVector         @ 0x13f34 (line 12502)    — DONE (v0.4.0)
+# CPcieAudioExtension::MapHardware        @ 0x4ba0c (line 70355)    — DONE (v0.3.0)
+# CPcieAudioExtension::ProgramRegisters   @ 0x4bac0 (line 70401)    — DONE (v0.3.0)
+# CPcieAudioExtension::Connect            @ 0x4be58 (line 70632)    — DONE
+# CPcieAudioExtension::_handleNotificationInterrupt @ 0x4c154 (line 70824) — DONE (v0.3.0)
+# CPcieAudioExtension::Shutdown           @ 0x4cb0c (line 71447)    — DONE (v0.4.0)
+# CPcieAudioExtension::_disconnect        @ (tail-called from Shutdown)  — DONE (v0.4.0)
+# CPcieAudioExtension::PrepareTransport   @ line 71623              — DONE (refined v0.4.0)
+# CPcieAudioExtension::StartTransport     @ line 71904              — DONE (refined v0.4.0)
+# CPcieAudioExtension::StopTransport      @ line 71987              — DONE (refined v0.4.0)
+# CPcieAudioExtension::TransportPosition  @ line 72057              — DONE
+# CPcieAudioExtension::_recomputeBufferFrameSize @ 0x4d9e0 (line 72414) — DONE (v0.3.0)
+# CPcieAudioExtension::_setSampleClock    @ line 72712              — DONE
+# _notifyIntrCallback                     @ (schedules deferred)    — DONE (v0.4.0)
+# _endBufferCallback                      @                         — DONE (v0.4.0)
+# _periodicTimerCallback                  @                         — DONE (v0.4.0)
+# _requestCallback                        @ 0x4d6f8                 — DONE (v0.4.0)
+
+# Potential future analysis:
+# CDeviceManager::_setSampleClock @ line 40218 (higher-level clock orchestration)
+# Multi-vector MSI setup (register multiple MSI vectors for 0x28, 0x46, 0x47)
+# Monitor mixer routing (BAR+0x224C and related registers)
+# Power management / Thunderbolt hot-plug handling
+
+
+NEXT TODO: BUILD, FIX, AND TEST ON LINUX
+==========================================
+
+The driver is being moved to a Linux machine with:
+- Kernel headers and a functional build environment
+- LSP that can properly resolve Linux kernel types
+- The Apollo Solo physically connected via Thunderbolt
+
+Priority order:
+
+1. BUILD AND FIX COMPILATION ERRORS
+   - Run `make` against the running kernel
+   - Fix any real compilation errors (not the macOS LSP false positives)
+   - The driver uses snd_pcm_lib_ioctl which was removed in kernel 5.18+;
+     if building against >= 5.18, remove the .ioctl line from snd_pcm_ops
+   - Verify all includes resolve and types are correct
+
+2. CHANNEL MAPPING — CRITICAL FOR AUDIO OUTPUT
+   The driver programs REG_PLAYBACK_CHAN_CNT with dev->play_channels (42)
+   and REG_RECORD_CHAN_CNT with dev->rec_channels (32), meaning the DMA
+   buffer is always 42-channel interleaved for playback.
+
+   Problems:
+   a) Most apps want stereo. Writing 2ch to a 42ch interleaved buffer means
+      audio lands in channels 0-1, but we don't know if those map to the
+      monitor outputs (headphone/line out).
+   b) The kext's IOAudioStream definitions (from ioreg) would tell us which
+      channels map to which physical outputs. This was captured on macOS but
+      not fully decoded.
+   c) The driver currently does NOT adjust channel counts based on ALSA
+      runtime->channels — it always uses the full 42/32.
+
+   Fix options:
+   a) Decode the channel-to-output mapping from the kext/ioreg data
+      (the macOS IOAudioStream objects have StartingChannelID fields)
+   b) As a first test, try writing a 42ch S32_LE buffer with audio in
+      different channel pairs to discover which pair produces output
+   c) Consider whether the hardware can operate with fewer channels
+      (write a smaller count to REG_PLAYBACK_CHAN_CNT) — needs testing
+
+3. INTERRUPT DELIVERY VERIFICATION
+   - Load the module and check /proc/interrupts for the MSI vector
+   - Verify that the notification handler fires during Connect
+   - If Connect times out on all 20 channels, the interrupt path is broken
+   - Fallback: the manual polling in the Connect loop should still work
+
+4. DMA BUFFER SANITY
+   - After probe, read back a few SG table entries from BAR+0x8000 to
+     verify they match the allocated DMA addresses
+   - Read BAR+0x2244 (position counter) — should be 0 before transport starts
+   - After starting playback, verify position counter advances
+
+5. RUNTIME TESTING SEQUENCE
+    a) insmod uad2.ko → check dmesg for probe success
+   b) cat /proc/asound/cards → verify card appears
+   c) aplay -l → verify PCM device appears with correct channel counts
+   d) aplay -D hw:X,0 -f S32_LE -c 42 -r 48000 /dev/zero → test DMA runs
+      (should produce silence but verify no kernel panics/errors)
+   e) Generate a test tone on specific channel pairs to find monitor outputs
+   f) If basic DMA works, test with real audio files via plughw
+
+6. HARDENING (after basic audio works)
+   - Add error recovery in Connect (currently continues on timeout)
+   - Add PCIe error handling (pci_error_handlers)
+   - Consider Thunderbolt hot-unplug safety (device may disappear mid-DMA)
+   - Test suspend/resume if relevant
