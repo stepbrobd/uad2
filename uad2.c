@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * UAD2 - Universal Audio Thunderbolt PCIe Audio Driver
  *
@@ -41,67 +40,74 @@
  * PCI identity (confirmed via ioreg on live hardware)
  * Bus 45:0:0, Thunderbolt-tunnelled PCIe Gen1 x1
  * ============================================================ */
-#define UA_VENDOR_ID            0x1a00
-#define UAD2_DEVICE_ID_SOLO   0x0002
-#define UAD2_SUBSYS_ID_SOLO   0x000f
+#define UA_VENDOR_ID 0x1a00
+#define UAD2_DEVICE_ID_SOLO 0x0002
+#define UAD2_SUBSYS_ID_SOLO 0x000f
 
 /* ============================================================
  * BAR register offsets  (all 32-bit MMIO, BAR 0 = 64 KB window)
  * ============================================================ */
 
 /* --- Global interrupt control --- */
-#define REG_INTR_ENABLE         0x0014  /* WRITE 0xFFFFFFFF to unmask */
+#define REG_INTR_ENABLE 0x0014 /* WRITE 0xFFFFFFFF to unmask */
 
 /* --- Firmware base address (read after SG table programming) --- */
-#define REG_FW_BASE_LO          0x0030  /* R: firmware base low 32 bits */
-#define REG_FW_BASE_HI          0x0034  /* R: firmware base high 32 bits */
+#define REG_FW_BASE_LO 0x0030 /* R: firmware base low 32 bits */
+#define REG_FW_BASE_HI 0x0034 /* R: firmware base high 32 bits */
 
 /* --- DMA master control (CPcieIntrManager) --- */
-#define REG_DMA_MASTER_CTRL     0x2200  /* R/W bitmask: per-DSP channel enable
+#define REG_DMA_MASTER_CTRL \
+	0x2200 /* R/W bitmask: per-DSP channel enable
                                          * EnableDMA sets bit (1 << (dsp_index+1))
                                          * bit 0 reserved (global master?)
                                          * Uses software shadow, never read from HW */
-#define DMA_CTRL_SINGLE_ENGINE  0x1e00  /* bits[12:9] */
-#define DMA_CTRL_DUAL_ENGINE    0x1fe00 /* bits[16:9] */
+#define DMA_CTRL_SINGLE_ENGINE 0x1e00 /* bits[12:9] */
+#define DMA_CTRL_DUAL_ENGINE 0x1fe00 /* bits[16:9] */
 
 /* --- DMA engine 0 (CPcieIntrManager::ProgramRegisters) --- */
-#define REG_DMA0_INTR_CTRL     0x2204   /* WRITE 0x0 to disable/clear */
-#define REG_DMA0_STATUS        0x2208   /* WRITE 0xFFFFFFFF to arm; WRITE 0x0 to clear */
+#define REG_DMA0_INTR_CTRL 0x2204 /* WRITE 0x0 to disable/clear */
+#define REG_DMA0_STATUS 0x2208 /* WRITE 0xFFFFFFFF to arm; WRITE 0x0 to clear */
 
 /* --- Device identification (CPcieDevice::ProgramRegisters) --- */
-#define REG_DEVICE_ID          0x2218   /* READ to verify; WRITE back as echo handshake
+#define REG_DEVICE_ID \
+	0x2218 /* READ to verify; WRITE back as echo handshake
                                          * Also polled after clock change (2s timeout) */
 
 /* --- Audio transport registers (CPcieAudioExtension) --- */
-#define REG_BUFFER_FRAME_SIZE  0x2240   /* W: bufferFrameSize - 1 */
-#define REG_DMA_POSITION       0x2244   /* R: current frame position (wrapping counter)
+#define REG_BUFFER_FRAME_SIZE 0x2240 /* W: bufferFrameSize - 1 */
+#define REG_DMA_POSITION \
+	0x2244 /* R: current frame position (wrapping counter)
                                          * W: 0 to clear */
-#define REG_TRANSPORT_CTL      0x2248   /* R/W: transport state machine
+#define REG_TRANSPORT_CTL \
+	0x2248 /* R/W: transport state machine
                                          * 0x000 = stop
                                          * 0x001 = armed/prepared
                                          * 0x00F = running (normal)
                                          * 0x20F = running (extended, variant 0xA/0x9)
                                          * Read status: bit5=running, bit7=overflow,
                                          *              bit8=underflow */
-#define REG_PLAYBACK_MON_CFG   0x224C   /* W: (totalPlayChans-1) | 0x100 (enable+mask) */
-#define REG_PLAYBACK_CHAN_CNT  0x2250   /* W: total playback channels */
-#define REG_POLL_STATUS        0x2254   /* R: poll for DMA ready (compare vs irq_period) */
-#define REG_IRQ_PERIOD         0x2258   /* W: interrupt period in frames */
-#define REG_RECORD_CHAN_CNT    0x225C   /* W: record channel count */
-#define REG_STREAM_ENABLE      0x2260   /* W: 0x1 = start stream, 0x10 = stop stream
+#define REG_PLAYBACK_MON_CFG \
+	0x224C /* W: (totalPlayChans-1) | 0x100 (enable+mask) */
+#define REG_PLAYBACK_CHAN_CNT 0x2250 /* W: total playback channels */
+#define REG_POLL_STATUS \
+	0x2254 /* R: poll for DMA ready (compare vs irq_period) */
+#define REG_IRQ_PERIOD 0x2258 /* W: interrupt period in frames */
+#define REG_RECORD_CHAN_CNT 0x225C /* W: record channel count */
+#define REG_STREAM_ENABLE \
+	0x2260 /* W: 0x1 = start stream, 0x10 = stop stream
                                          * Also: 0x4 = clock change trigger */
 
 /* --- DMA engine 1 (dual-engine devices only) --- */
-#define REG_DMA1_INTR_CTRL    0x2264
-#define REG_DMA1_STATUS       0x2268
+#define REG_DMA1_INTR_CTRL 0x2264
+#define REG_DMA1_STATUS 0x2268
 
 /* --- Buffer and timer configuration --- */
-#define REG_BUFFER_SIZE_KB     0x226C   /* W: (totalPlayChans * (bufSz-1)) >> 10 */
-#define REG_PERIODIC_TIMER     0x2270   /* W: periodic timer interval in frames */
+#define REG_BUFFER_SIZE_KB 0x226C /* W: (totalPlayChans * (bufSz-1)) >> 10 */
+#define REG_PERIODIC_TIMER 0x2270 /* W: periodic timer interval in frames */
 
 /* --- Playback monitor status --- */
-#define REG_PLAYBACK_MON_STAT  0x22C0   /* R: playback monitor status */
-#define REG_SECONDARY_CTL      0x22C4   /* W: 0 on Shutdown */
+#define REG_PLAYBACK_MON_STAT 0x22C0 /* R: playback monitor status */
+#define REG_SECONDARY_CTL 0x22C4 /* W: 0 on Shutdown */
 
 /* --- Scatter-Gather DMA tables (ProgramRegisters @ 0x4bac0) ---
  *
@@ -114,45 +120,48 @@
  * Loop: sg_offset = 0x8000; sg_offset += 8; until sg_offset == 0xA000
  *       dma_offset = 0; dma_offset += 0x1000
  * ============================================================ */
-#define REG_SG_TABLE_A_BASE    0x8000   /* Playback SG table start */
-#define REG_SG_TABLE_A_END     0xA000   /* Playback SG table end (exclusive) */
-#define REG_SG_TABLE_B_OFFSET  0x2000   /* Capture SG table = A + 0x2000 */
-#define SG_ENTRY_SIZE          8        /* bytes per SG entry */
-#define SG_NUM_ENTRIES         1024     /* entries per table */
-#define SG_PAGE_SIZE           0x1000   /* 4KB per page */
-#define SG_BUFFER_SIZE         0x400000 /* 4MB total DMA buffer */
+#define REG_SG_TABLE_A_BASE 0x8000 /* Playback SG table start */
+#define REG_SG_TABLE_A_END 0xA000 /* Playback SG table end (exclusive) */
+#define REG_SG_TABLE_B_OFFSET 0x2000 /* Capture SG table = A + 0x2000 */
+#define SG_ENTRY_SIZE 8 /* bytes per SG entry */
+#define SG_NUM_ENTRIES 1024 /* entries per table */
+#define SG_PAGE_SIZE 0x1000 /* 4KB per page */
+#define SG_BUFFER_SIZE 0x400000 /* 4MB total DMA buffer */
 
 /* --- Sample clock (CPcieAudioExtension::_setSampleClock) --- */
-#define REG_SAMPLE_CLOCK       0xC04C   /* W: clock_source | (rate_enum << 8)
+#define REG_SAMPLE_CLOCK \
+	0xC04C /* W: clock_source | (rate_enum << 8)
                                          * Actual offset: BAR + (dev_idx*4) + 0xC04C
                                          * For Apollo Solo (dev_idx from this+0x24) */
 
 /* --- Firmware mailbox (notification/doorbell) --- */
-#define REG_FW_DOORBELL        0xC004   /* W: 0x0ACEFACE as connect command
+#define REG_FW_DOORBELL \
+	0xC004 /* W: 0x0ACEFACE as connect command
                                          * Addr: BAR + (channel_base_index << 2) + 0xC004 */
-#define REG_FW_NOTIFY_STATUS   0xC008   /* R/W: notification bitmask register
+#define REG_FW_NOTIFY_STATUS \
+	0xC008 /* R/W: notification bitmask register
                                          * Addr: BAR + (channel_base_index << 2) + 0xC008
                                          * Write 0 to acknowledge/clear */
-#define DMA_DESC_MAGIC         0x0aceface
+#define DMA_DESC_MAGIC 0x0aceface
 
 /* --- Firmware notification status bits (BAR+0xC008 bitmask) --- */
-#define NOTIFY_PLAYBACK_IO     BIT(0)   /* Playback IO descriptors ready */
-#define NOTIFY_RECORD_IO       BIT(1)   /* Record IO descriptors ready */
-#define NOTIFY_DMA_READY       BIT(4)   /* DMA engine ready */
-#define NOTIFY_CONNECT_ACK     BIT(5)   /* Connect handshake acknowledged */
-#define NOTIFY_ERROR           BIT(6)   /* Firmware error */
-#define NOTIFY_END_BUFFER      BIT(7)   /* End of buffer */
-#define NOTIFY_CHAN_CONFIG      BIT(21)  /* Channel configuration update */
-#define NOTIFY_RATE_CHANGE     BIT(22)  /* Sample rate change ack */
+#define NOTIFY_PLAYBACK_IO BIT(0) /* Playback IO descriptors ready */
+#define NOTIFY_RECORD_IO BIT(1) /* Record IO descriptors ready */
+#define NOTIFY_DMA_READY BIT(4) /* DMA engine ready */
+#define NOTIFY_CONNECT_ACK BIT(5) /* Connect handshake acknowledged */
+#define NOTIFY_ERROR BIT(6) /* Firmware error */
+#define NOTIFY_END_BUFFER BIT(7) /* End of buffer */
+#define NOTIFY_CHAN_CONFIG BIT(21) /* Channel configuration update */
+#define NOTIFY_RATE_CHANGE BIT(22) /* Sample rate change ack */
 
 /* --- Playback/Record IO descriptor areas --- */
-#define REG_RECORD_IO_DESC     0xC1A4   /* R: record IO descriptors (72 DWORDs) */
-#define REG_PLAYBACK_IO_DESC   0xC2C4   /* R: playback IO descriptors (72 DWORDs) */
-#define IO_DESC_DWORDS         72       /* 0x120 bytes = 288 bytes */
+#define REG_RECORD_IO_DESC 0xC1A4 /* R: record IO descriptors (72 DWORDs) */
+#define REG_PLAYBACK_IO_DESC 0xC2C4 /* R: playback IO descriptors (72 DWORDs) */
+#define IO_DESC_DWORDS 72 /* 0x120 bytes = 288 bytes */
 
 /* --- Channel config area --- */
-#define REG_CHAN_CONFIG_BASE   0xC000    /* R: 10 DWORDs of channel config */
-#define CHAN_CONFIG_DWORDS     10
+#define REG_CHAN_CONFIG_BASE 0xC000 /* R: 10 DWORDs of channel config */
+#define CHAN_CONFIG_DWORDS 10
 
 /* ============================================================
  * DSP ring buffer registers (relative to ring_base)
@@ -168,41 +177,41 @@
  *   Pages: 0x0000, 0x1000, 0x2000, 0x3000 (4 x 4KB pages)
  *   All written and verified via read-back
  * ============================================================ */
-#define DSP_RING_BASE_LOW      0x2000
-#define DSP_RING_BASE_HIGH     0x5e00
-#define DSP_RING_STRIDE        0x80
-#define DSP_RING2_OFFSET       0x40
+#define DSP_RING_BASE_LOW 0x2000
+#define DSP_RING_BASE_HIGH 0x5e00
+#define DSP_RING_STRIDE 0x80
+#define DSP_RING2_OFFSET 0x40
 
 /* Ring buffer register offsets (relative to ring_base) */
-#define DSP_RING_DESC0_LO      0x00    /* W/R: descriptor 0 phys addr low 32 */
-#define DSP_RING_DESC0_HI      0x04    /* W/R: descriptor 0 phys addr high 32 */
-#define DSP_RING_DESC1_LO      0x08    /* descriptor 1 */
-#define DSP_RING_DESC1_HI      0x0C
-#define DSP_RING_DESC2_LO      0x10    /* descriptor 2 */
-#define DSP_RING_DESC2_HI      0x14
-#define DSP_RING_DESC3_LO      0x18    /* descriptor 3 */
-#define DSP_RING_DESC3_HI      0x1C
-#define DSP_RING_DESC_COUNT    0x20    /* W: ring descriptor count = ring_size */
-#define DSP_RING_SIZE_REG      0x24    /* W: ring size register = ring_size */
-#define DSP_RING_CAPACITY      0x28    /* R: hardware ring capacity (cap at 0x400) */
-#define DSP_READY_POLL_OFF     0x1a4   /* R: DSP ready poll; wait for DSP_READY_SIG */
+#define DSP_RING_DESC0_LO 0x00 /* W/R: descriptor 0 phys addr low 32 */
+#define DSP_RING_DESC0_HI 0x04 /* W/R: descriptor 0 phys addr high 32 */
+#define DSP_RING_DESC1_LO 0x08 /* descriptor 1 */
+#define DSP_RING_DESC1_HI 0x0C
+#define DSP_RING_DESC2_LO 0x10 /* descriptor 2 */
+#define DSP_RING_DESC2_HI 0x14
+#define DSP_RING_DESC3_LO 0x18 /* descriptor 3 */
+#define DSP_RING_DESC3_HI 0x1C
+#define DSP_RING_DESC_COUNT 0x20 /* W: ring descriptor count = ring_size */
+#define DSP_RING_SIZE_REG 0x24 /* W: ring size register = ring_size */
+#define DSP_RING_CAPACITY 0x28 /* R: hardware ring capacity (cap at 0x400) */
+#define DSP_READY_POLL_OFF 0x1a4 /* R: DSP ready poll; wait for DSP_READY_SIG */
 
-#define DSP_RING_DESC_SLOTS    4       /* 4 descriptor slots per ring */
-#define DSP_RING_PAGE_SIZE     0x1000  /* 4 KB per descriptor page */
-#define DSP_READY_SIG          0xa8caed0f
-#define DSP_POLL_INTERVAL_MS   300
-#define DSP_POLL_MAX_PRIMARY   100     /* DSP type 0: 30s timeout */
-#define DSP_POLL_MAX_SECONDARY 10      /* others: 3s timeout */
+#define DSP_RING_DESC_SLOTS 4 /* 4 descriptor slots per ring */
+#define DSP_RING_PAGE_SIZE 0x1000 /* 4 KB per descriptor page */
+#define DSP_READY_SIG 0xa8caed0f
+#define DSP_POLL_INTERVAL_MS 300
+#define DSP_POLL_MAX_PRIMARY 100 /* DSP type 0: 30s timeout */
+#define DSP_POLL_MAX_SECONDARY 10 /* others: 3s timeout */
 
 /* ============================================================
  * UAD2SampleRate enum (1-based, from _setSampleClock analysis)
  * ============================================================ */
-#define UA_RATE_44100          1
-#define UA_RATE_48000          2
-#define UA_RATE_88200          3
-#define UA_RATE_96000          4
-#define UA_RATE_176400         5
-#define UA_RATE_192000         6
+#define UA_RATE_44100 1
+#define UA_RATE_48000 2
+#define UA_RATE_88200 3
+#define UA_RATE_96000 4
+#define UA_RATE_176400 5
+#define UA_RATE_192000 6
 
 /* ============================================================
  * Audio engine parameters (from ioreg IOAudioEngine, confirmed live)
@@ -214,12 +223,12 @@
  *         (IOAudioStreamByteOrder=1, alignment=1 = MSB-justified)
  * Input: 32 channels, Output: 42 channels
  * ============================================================ */
-#define UAD2_MAX_BUFFER_FRAMES 8192   /* max from _recomputeBufferFrameSize cap */
-#define UAD2_SAMPLE_OFFSET   16
-#define UAD2_OUT_CHANNELS    42      /* output channels (to device) */
-#define UAD2_IN_CHANNELS     32      /* input channels (from device) */
-#define UAD2_BYTES_PER_SAMPLE 4      /* 24-bit in 32-bit container */
-#define UAD2_MAX_DSPS        8
+#define UAD2_MAX_BUFFER_FRAMES 8192 /* max from _recomputeBufferFrameSize cap */
+#define UAD2_SAMPLE_OFFSET 16
+#define UAD2_OUT_CHANNELS 42 /* output channels (to device) */
+#define UAD2_IN_CHANNELS 32 /* input channels (from device) */
+#define UAD2_BYTES_PER_SAMPLE 4 /* 24-bit in 32-bit container */
+#define UAD2_MAX_DSPS 8
 
 /* channel_base_index: constant loaded from data segment @ 0x6018 in kext
  * Confirmed value = 10 (0x0A) for Apollo Solo */
@@ -227,8 +236,8 @@
 
 /* Connect loop: 20 channels with 10 retries each */
 #define UAD2_CONNECT_CHANNELS 20
-#define UAD2_CONNECT_RETRIES  10
-#define UAD2_CONNECT_WAIT_MS  100
+#define UAD2_CONNECT_RETRIES 10
+#define UAD2_CONNECT_WAIT_MS 100
 
 /* ============================================================
  * Interrupt vector enable bitmask management
@@ -272,63 +281,63 @@
  * Driver private state
  * ============================================================ */
 struct uad2_dev {
-	struct pci_dev          *pci;
-	struct snd_card         *card;
-	struct snd_pcm          *pcm;
+	struct pci_dev *pci;
+	struct snd_card *card;
+	struct snd_pcm *pcm;
 
-	void __iomem            *bar;           /* 64 KB MMIO window */
-	resource_size_t          bar_len;
+	void __iomem *bar; /* 64 KB MMIO window */
+	resource_size_t bar_len;
 
-	spinlock_t               lock;          /* protects HW register access
+	spinlock_t lock; /* protects HW register access
 	                                         * (mirrors kext hw_lock at this+0x10) */
-	spinlock_t               notify_lock;   /* protects notification handler
+	spinlock_t notify_lock; /* protects notification handler
 	                                         * (mirrors kext spinlock at this+0x2890) */
 
-	u32                      expected_device_id;
-	bool                     dual_dma;
-	unsigned int             dsp_count;
-	u32                      channel_base_index;  /* 10 for Apollo Solo */
+	u32 expected_device_id;
+	bool dual_dma;
+	unsigned int dsp_count;
+	u32 channel_base_index; /* 10 for Apollo Solo */
 
 	/* Shadow register for DMA master control (never read from HW) */
-	u32                      dma_ctrl_shadow;
+	u32 dma_ctrl_shadow;
 
 	/* Shadow register for interrupt enable bitmask
 	 * (mirrors IntrManager+0x20 in kext) */
-	u64                      intr_enable_shadow;
+	u64 intr_enable_shadow;
 
 	/* Ring buffer DMA allocations (4 x 4KB pages per ring) */
-	dma_addr_t               ring_dma_addr[DSP_RING_DESC_SLOTS];
-	void                    *ring_dma_buf[DSP_RING_DESC_SLOTS];
+	dma_addr_t ring_dma_addr[DSP_RING_DESC_SLOTS];
+	void *ring_dma_buf[DSP_RING_DESC_SLOTS];
 
 	/* Two 4MB DMA buffers (playback + capture scatter-gather source)
 	 * Allocated as contiguous DMA memory, page addresses written to
 	 * BAR+0x8000-0x9FFF (playback) and BAR+0xA000-0xBFFF (capture).
 	 * ALSA PCM buffers are mapped directly into these. */
-	dma_addr_t               sg_dma_addr[2];      /* [0]=playback, [1]=capture */
-	void                    *sg_dma_buf[2];
-	size_t                   sg_buf_size;          /* 0x400000 = 4MB */
+	dma_addr_t sg_dma_addr[2]; /* [0]=playback, [1]=capture */
+	void *sg_dma_buf[2];
+	size_t sg_buf_size; /* 0x400000 = 4MB */
 
 	/* Firmware base address (read from BAR+0x30/0x34 after SG programming) */
-	u64                      fw_base_addr;
+	u64 fw_base_addr;
 
 	/* Audio parameters (computed from channel config or defaults) */
-	unsigned int             buffer_frames;        /* from _recomputeBufferFrameSize */
-	unsigned int             irq_period_frames;
-	unsigned int             periodic_timer_interval; /* from kext this+0x28C0 */
-	unsigned int             play_channels;
-	unsigned int             rec_channels;
-	unsigned int             clock_source;         /* 0=internal, 1=SPDIF */
-	unsigned int             current_rate;          /* current sample rate in Hz */
+	unsigned int buffer_frames; /* from _recomputeBufferFrameSize */
+	unsigned int irq_period_frames;
+	unsigned int periodic_timer_interval; /* from kext this+0x28C0 */
+	unsigned int play_channels;
+	unsigned int rec_channels;
+	unsigned int clock_source; /* 0=internal, 1=SPDIF */
+	unsigned int current_rate; /* current sample rate in Hz */
 
 	/* Transport state (mirrors kext this+0x2878):
 	 * 0=uninit, 1=prepared, 2=running */
-	int                      transport_state;
+	int transport_state;
 
 	/* Notification interrupt handling */
-	struct completion        notify_event;  /* signals Connect() on bit 21 */
-	struct completion        connect_event; /* signals on bit 5 (connect ack) */
-	u32                      notify_status; /* last notification bitmask */
-	bool                     connected;
+	struct completion notify_event; /* signals Connect() on bit 21 */
+	struct completion connect_event; /* signals on bit 5 (connect ack) */
+	u32 notify_status; /* last notification bitmask */
+	bool connected;
 
 	/* PCM substream pointers for IRQ handler (accessed under lock) */
 	struct snd_pcm_substream *playback_ss;
@@ -361,13 +370,20 @@ static inline u32 uad2_fw_reg(struct uad2_dev *dev, u32 base_offset)
 static u8 uad2_rate_to_enum(unsigned int rate)
 {
 	switch (rate) {
-	case 44100:  return UA_RATE_44100;
-	case 48000:  return UA_RATE_48000;
-	case 88200:  return UA_RATE_88200;
-	case 96000:  return UA_RATE_96000;
-	case 176400: return UA_RATE_176400;
-	case 192000: return UA_RATE_192000;
-	default:     return UA_RATE_48000;
+	case 44100:
+		return UA_RATE_44100;
+	case 48000:
+		return UA_RATE_48000;
+	case 88200:
+		return UA_RATE_88200;
+	case 96000:
+		return UA_RATE_96000;
+	case 176400:
+		return UA_RATE_176400;
+	case 192000:
+		return UA_RATE_192000;
+	default:
+		return UA_RATE_48000;
 	}
 }
 
@@ -408,7 +424,8 @@ static int uad2_set_sample_rate(struct uad2_dev *dev, unsigned int rate)
 		}
 	}
 
-	dev_warn(&dev->pci->dev, "Sample rate change timeout (rate=%u)\n", rate);
+	dev_warn(&dev->pci->dev, "Sample rate change timeout (rate=%u)\n",
+		 rate);
 	return -ETIMEDOUT;
 }
 
@@ -422,7 +439,7 @@ static int uad2_set_sample_rate(struct uad2_dev *dev, unsigned int rate)
  *   0x400000 / (42 * 4) = 24966 → floor_pow2 = 16384 → capped to 8192
  * ============================================================ */
 static unsigned int uad2_compute_buffer_frames(unsigned int play_ch,
-						 unsigned int rec_ch)
+					       unsigned int rec_ch)
 {
 	unsigned int max_ch = max(play_ch, rec_ch);
 	unsigned int raw_frames;
@@ -459,8 +476,7 @@ static unsigned int uad2_compute_buffer_frames(unsigned int play_ch,
  *   shadow &= ~(1 << vec)
  *   write shadow to BAR+0x2204
  * ============================================================ */
-static void uad2_enable_vector(struct uad2_dev *dev, unsigned int vec,
-				 bool arm)
+static void uad2_enable_vector(struct uad2_dev *dev, unsigned int vec, bool arm)
 {
 	u64 bit = 1ULL << vec;
 
@@ -473,10 +489,9 @@ static void uad2_enable_vector(struct uad2_dev *dev, unsigned int vec,
 
 	if (dev->dual_dma) {
 		if (arm)
-			uad2_write32(dev, REG_DMA1_INTR_CTRL,
-				       (u32)(bit >> 32));
+			uad2_write32(dev, REG_DMA1_INTR_CTRL, (u32)(bit >> 32));
 		uad2_write32(dev, REG_DMA1_STATUS,
-			       (u32)(dev->intr_enable_shadow >> 32));
+			     (u32)(dev->intr_enable_shadow >> 32));
 	}
 }
 
@@ -486,18 +501,17 @@ static void uad2_disable_vector(struct uad2_dev *dev, unsigned int vec)
 
 	dev->intr_enable_shadow &= ~bit;
 
-	uad2_write32(dev, REG_DMA0_INTR_CTRL,
-		       (u32)dev->intr_enable_shadow);
+	uad2_write32(dev, REG_DMA0_INTR_CTRL, (u32)dev->intr_enable_shadow);
 
 	if (dev->dual_dma)
 		uad2_write32(dev, REG_DMA1_STATUS,
-			       (u32)(dev->intr_enable_shadow >> 32));
+			     (u32)(dev->intr_enable_shadow >> 32));
 }
 
 /* Interrupt vector IDs (from CPcieAudioExtension Initialize + kext analysis) */
-#define INTR_VEC_NOTIFY     0x28   /* notification interrupt */
-#define INTR_VEC_PERIODIC   0x46   /* periodic timer interrupt */
-#define INTR_VEC_ENDBUF     0x47   /* end-of-buffer interrupt */
+#define INTR_VEC_NOTIFY 0x28 /* notification interrupt */
+#define INTR_VEC_PERIODIC 0x46 /* periodic timer interrupt */
+#define INTR_VEC_ENDBUF 0x47 /* end-of-buffer interrupt */
 
 /* ============================================================
  * CPcieIntrManager::ProgramRegisters equivalent
@@ -506,11 +520,11 @@ static void uad2_disable_vector(struct uad2_dev *dev, unsigned int vec)
 static void uad2_intr_program(struct uad2_dev *dev)
 {
 	uad2_write32(dev, REG_DMA0_INTR_CTRL, 0x0);
-	uad2_write32(dev, REG_DMA0_STATUS,    0x0);
+	uad2_write32(dev, REG_DMA0_STATUS, 0x0);
 
 	if (dev->dual_dma) {
 		uad2_write32(dev, REG_DMA1_INTR_CTRL, 0x0);
-		uad2_write32(dev, REG_DMA1_STATUS,    0x0);
+		uad2_write32(dev, REG_DMA1_STATUS, 0x0);
 	}
 
 	dev->intr_enable_shadow = 0;
@@ -530,8 +544,9 @@ static void uad2_dma_reset(struct uad2_dev *dev)
 		ctrl = DMA_CTRL_SINGLE_ENGINE;
 
 	uad2_write32(dev, REG_DMA_MASTER_CTRL, ctrl);
-	uad2_write32(dev, REG_DMA_MASTER_CTRL, ctrl); /* written twice per kext */
-	uad2_read32(dev,  REG_DMA_MASTER_CTRL);       /* read-back flush */
+	uad2_write32(dev, REG_DMA_MASTER_CTRL,
+		     ctrl); /* written twice per kext */
+	uad2_read32(dev, REG_DMA_MASTER_CTRL); /* read-back flush */
 
 	dev->dma_ctrl_shadow = ctrl;
 }
@@ -560,10 +575,10 @@ static void uad2_enable_dma(struct uad2_dev *dev, unsigned int dsp_index)
  * Polls DSP ring+0x1a4 until DSP_READY_SIG appears
  * ============================================================ */
 static int uad2_dsp_wait_ready(struct uad2_dev *dev, void __iomem *ring_base,
-				  int dsp_type)
+			       int dsp_type)
 {
-	int max_attempts = (dsp_type == 0) ? DSP_POLL_MAX_PRIMARY
-					   : DSP_POLL_MAX_SECONDARY;
+	int max_attempts = (dsp_type == 0) ? DSP_POLL_MAX_PRIMARY :
+					     DSP_POLL_MAX_SECONDARY;
 	int i;
 	u32 val;
 
@@ -603,9 +618,8 @@ static int uad2_dsp_wait_ready(struct uad2_dev *dev, void __iomem *ring_base,
  *      - Write high 32 bits to ring_base + (i * 8) + 4
  *      - Read back both and verify match
  * ============================================================ */
-static int uad2_ring_program(struct uad2_dev *dev,
-			       void __iomem *ring_base,
-			       dma_addr_t dma_addr, int ring_idx)
+static int uad2_ring_program(struct uad2_dev *dev, void __iomem *ring_base,
+			     dma_addr_t dma_addr, int ring_idx)
 {
 	u32 ring_size;
 	int i;
@@ -670,14 +684,16 @@ static int uad2_dsp_program(struct uad2_dev *dev, int dsp_index)
 
 	/* Compute ring base within BAR */
 	if (dsp_index < 4)
-		ring_base = dev->bar + DSP_RING_BASE_LOW + (dsp_index * DSP_RING_STRIDE);
+		ring_base = dev->bar + DSP_RING_BASE_LOW +
+			    (dsp_index * DSP_RING_STRIDE);
 	else
-		ring_base = dev->bar + DSP_RING_BASE_HIGH + (dsp_index * DSP_RING_STRIDE);
+		ring_base = dev->bar + DSP_RING_BASE_HIGH +
+			    (dsp_index * DSP_RING_STRIDE);
 
 	ring2_base = ring_base + DSP_RING2_OFFSET;
 
-	dev_dbg(&dev->pci->dev, "DSP %d ring_base=%px ring2=%px\n",
-		dsp_index, ring_base, ring2_base);
+	dev_dbg(&dev->pci->dev, "DSP %d ring_base=%px ring2=%px\n", dsp_index,
+		ring_base, ring2_base);
 
 	/* Wait for DSP firmware (type 0 only) */
 	if (dsp_type == 0) {
@@ -731,9 +747,9 @@ static int uad2_alloc_sg_buffers(struct uad2_dev *dev)
 	dev->sg_buf_size = SG_BUFFER_SIZE;
 
 	for (i = 0; i < 2; i++) {
-		dev->sg_dma_buf[i] = dma_alloc_coherent(
-			&dev->pci->dev, dev->sg_buf_size,
-			&dev->sg_dma_addr[i], GFP_KERNEL);
+		dev->sg_dma_buf[i] =
+			dma_alloc_coherent(&dev->pci->dev, dev->sg_buf_size,
+					   &dev->sg_dma_addr[i], GFP_KERNEL);
 		if (!dev->sg_dma_buf[i]) {
 			dev_err(&dev->pci->dev,
 				"Failed to allocate 4MB DMA buffer %d\n", i);
@@ -749,8 +765,8 @@ static int uad2_alloc_sg_buffers(struct uad2_dev *dev)
 		}
 		memset(dev->sg_dma_buf[i], 0, dev->sg_buf_size);
 		dev_info(&dev->pci->dev,
-			 "SG buffer %d: virt=%px dma=%pad size=0x%zx\n",
-			 i, dev->sg_dma_buf[i], &dev->sg_dma_addr[i],
+			 "SG buffer %d: virt=%px dma=%pad size=0x%zx\n", i,
+			 dev->sg_dma_buf[i], &dev->sg_dma_addr[i],
 			 dev->sg_buf_size);
 	}
 
@@ -815,23 +831,24 @@ static int uad2_audio_ext_program(struct uad2_dev *dev)
 	while (sg_offset != REG_SG_TABLE_A_END) {
 		/* Buffer A (playback): write to BAR + sg_offset */
 		play_page = dev->sg_dma_addr[0] + dma_offset;
-		uad2_write32(dev, sg_offset,     lower_32_bits(play_page));
+		uad2_write32(dev, sg_offset, lower_32_bits(play_page));
 		uad2_write32(dev, sg_offset + 4, upper_32_bits(play_page));
 
 		/* Buffer B (capture): write to BAR + sg_offset + 0x2000 */
 		cap_page = dev->sg_dma_addr[1] + dma_offset;
 		uad2_write32(dev, sg_offset + REG_SG_TABLE_B_OFFSET,
-			       lower_32_bits(cap_page));
+			     lower_32_bits(cap_page));
 		uad2_write32(dev, sg_offset + REG_SG_TABLE_B_OFFSET + 4,
-			       upper_32_bits(cap_page));
+			     upper_32_bits(cap_page));
 
 		dma_offset += SG_PAGE_SIZE;
 		sg_offset += SG_ENTRY_SIZE;
 	}
 
-	dev_info(&dev->pci->dev,
-		 "Scatter-gather tables programmed: %u entries, play_dma=%pad cap_dma=%pad\n",
-		 SG_NUM_ENTRIES, &dev->sg_dma_addr[0], &dev->sg_dma_addr[1]);
+	dev_info(
+		&dev->pci->dev,
+		"Scatter-gather tables programmed: %u entries, play_dma=%pad cap_dma=%pad\n",
+		SG_NUM_ENTRIES, &dev->sg_dma_addr[0], &dev->sg_dma_addr[1]);
 
 	/* Phase 3: Read firmware base address (BAR+0x30 lo, BAR+0x34 hi) */
 	{
@@ -923,12 +940,12 @@ static void uad2_handle_notification(struct uad2_dev *dev)
 		 * (BAR+0xC2C4 + 0x10 = BAR+0xC2D4 is offset for count field,
 		 *  but the count is stored at this+0x2F8 after copy).
 		 * We read it from the known offset: descriptor[4]. */
-		play_ch = uad2_read32(dev,
-			uad2_fw_reg(dev, REG_PLAYBACK_IO_DESC + 0x10));
+		play_ch = uad2_read32(
+			dev, uad2_fw_reg(dev, REG_PLAYBACK_IO_DESC + 0x10));
 		if (play_ch > 0 && play_ch <= 128) {
 			dev->play_channels = play_ch;
-			dev_dbg(&dev->pci->dev,
-				"Playback channels: %u\n", play_ch);
+			dev_dbg(&dev->pci->dev, "Playback channels: %u\n",
+				play_ch);
 		}
 	}
 
@@ -936,12 +953,12 @@ static void uad2_handle_notification(struct uad2_dev *dev)
 	if (status & NOTIFY_RECORD_IO) {
 		u32 rec_ch;
 
-		rec_ch = uad2_read32(dev,
-			uad2_fw_reg(dev, REG_RECORD_IO_DESC + 0x10));
+		rec_ch = uad2_read32(
+			dev, uad2_fw_reg(dev, REG_RECORD_IO_DESC + 0x10));
 		if (rec_ch > 0 && rec_ch <= 128) {
 			dev->rec_channels = rec_ch;
-			dev_dbg(&dev->pci->dev,
-				"Record channels: %u\n", rec_ch);
+			dev_dbg(&dev->pci->dev, "Record channels: %u\n",
+				rec_ch);
 		}
 	}
 
@@ -1024,7 +1041,7 @@ static int uad2_audio_connect(struct uad2_dev *dev)
 			ret = wait_for_completion_timeout(&dev->notify_event,
 							  timeout_jiffies);
 			if (ret > 0)
-				break;  /* Got a response */
+				break; /* Got a response */
 
 			/* Timeout: manually poll notification register
 			 * (mirrors kext behavior of calling
@@ -1037,9 +1054,10 @@ static int uad2_audio_connect(struct uad2_dev *dev)
 		}
 
 		if (retry >= UAD2_CONNECT_RETRIES) {
-			dev_warn(&dev->pci->dev,
-				 "Connect channel %d: no response after %d retries\n",
-				 chan, UAD2_CONNECT_RETRIES);
+			dev_warn(
+				&dev->pci->dev,
+				"Connect channel %d: no response after %d retries\n",
+				chan, UAD2_CONNECT_RETRIES);
 		}
 	}
 
@@ -1050,7 +1068,7 @@ static int uad2_audio_connect(struct uad2_dev *dev)
 		dev->rec_channels = UAD2_IN_CHANNELS;
 
 	dev->buffer_frames = uad2_compute_buffer_frames(dev->play_channels,
-							  dev->rec_channels);
+							dev->rec_channels);
 
 	dev->connected = true;
 
@@ -1095,7 +1113,8 @@ static int uad2_hw_program(struct uad2_dev *dev)
 	for (i = 0; i < dev->dsp_count; i++) {
 		err = uad2_dsp_program(dev, i);
 		if (err) {
-			dev_err(&dev->pci->dev, "DSP %d init failed: %d\n", i, err);
+			dev_err(&dev->pci->dev, "DSP %d init failed: %d\n", i,
+				err);
 			return err;
 		}
 	}
@@ -1103,7 +1122,8 @@ static int uad2_hw_program(struct uad2_dev *dev)
 	/* 7. Program audio extension: SG tables + firmware base + interrupts */
 	err = uad2_audio_ext_program(dev);
 	if (err) {
-		dev_err(&dev->pci->dev, "Audio extension init failed: %d\n", err);
+		dev_err(&dev->pci->dev, "Audio extension init failed: %d\n",
+			err);
 		return err;
 	}
 
@@ -1149,10 +1169,10 @@ static int uad2_hw_program(struct uad2_dev *dev)
  *   21. EnableVector(0x47, 1)  — enable end-of-buffer interrupt
  * ============================================================ */
 static int uad2_prepare_transport(struct uad2_dev *dev,
-				    unsigned int buffer_frames,
-				    unsigned int irq_period_frames,
-				    unsigned int play_channels,
-				    unsigned int rec_channels)
+				  unsigned int buffer_frames,
+				  unsigned int irq_period_frames,
+				  unsigned int play_channels,
+				  unsigned int rec_channels)
 {
 	u32 buf_size_kb;
 	unsigned long flags;
@@ -1190,7 +1210,7 @@ static int uad2_prepare_transport(struct uad2_dev *dev,
 	/* 8. Periodic timer (if configured) */
 	if (dev->periodic_timer_interval) {
 		uad2_write32(dev, REG_PERIODIC_TIMER,
-			       dev->periodic_timer_interval);
+			     dev->periodic_timer_interval);
 		uad2_enable_vector(dev, INTR_VEC_PERIODIC, true);
 	}
 
@@ -1217,8 +1237,7 @@ static int uad2_prepare_transport(struct uad2_dev *dev,
 	uad2_read32(dev, REG_PLAYBACK_MON_STAT);
 
 	/* 17. Playback monitor config (always enable for now) */
-	uad2_write32(dev, REG_PLAYBACK_MON_CFG,
-		       (play_channels - 1) | 0x100);
+	uad2_write32(dev, REG_PLAYBACK_MON_CFG, (play_channels - 1) | 0x100);
 
 	spin_unlock_irqrestore(&dev->lock, flags);
 
@@ -1231,8 +1250,8 @@ static int uad2_prepare_transport(struct uad2_dev *dev,
 		u32 poll_val = uad2_read32(dev, REG_POLL_STATUS);
 
 		if (poll_val == irq_period_frames) {
-			dev_dbg(&dev->pci->dev,
-				"DMA ready after %d polls\n", i + 1);
+			dev_dbg(&dev->pci->dev, "DMA ready after %d polls\n",
+				i + 1);
 			break;
 		}
 		usleep_range(1000, 2000);
@@ -1325,7 +1344,7 @@ static void uad2_shutdown(struct uad2_dev *dev)
 
 	uad2_write32(dev, REG_TRANSPORT_CTL, 0x0);
 	uad2_write32(dev, uad2_fw_reg(dev, REG_FW_DOORBELL), 0x0);
-	uad2_read32(dev, REG_TRANSPORT_CTL);  /* flush */
+	uad2_read32(dev, REG_TRANSPORT_CTL); /* flush */
 	uad2_write32(dev, REG_SECONDARY_CTL, 0x0);
 
 	spin_unlock_irqrestore(&dev->lock, flags);
@@ -1358,49 +1377,39 @@ static void uad2_shutdown(struct uad2_dev *dev)
  * 4MB hardware DMA buffer.
  * ============================================================ */
 static const struct snd_pcm_hardware uad2_pcm_hw_playback = {
-	.info            = SNDRV_PCM_INFO_MMAP
-			 | SNDRV_PCM_INFO_INTERLEAVED
-			 | SNDRV_PCM_INFO_MMAP_VALID
-			 | SNDRV_PCM_INFO_BLOCK_TRANSFER,
-	.formats         = SNDRV_PCM_FMTBIT_S32_LE,  /* 24-in-32 LE, MSB-justified */
-	.rates           = SNDRV_PCM_RATE_44100
-			 | SNDRV_PCM_RATE_48000
-			 | SNDRV_PCM_RATE_88200
-			 | SNDRV_PCM_RATE_96000
-			 | SNDRV_PCM_RATE_176400
-			 | SNDRV_PCM_RATE_192000,
-	.rate_min        = 44100,
-	.rate_max        = 192000,
-	.channels_min    = 2,
-	.channels_max    = UAD2_OUT_CHANNELS,
-	.buffer_bytes_max = SG_BUFFER_SIZE,  /* 4MB max (entire HW buffer) */
+	.info = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
+		SNDRV_PCM_INFO_MMAP_VALID | SNDRV_PCM_INFO_BLOCK_TRANSFER,
+	.formats = SNDRV_PCM_FMTBIT_S32_LE, /* 24-in-32 LE, MSB-justified */
+	.rates = SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000 |
+		 SNDRV_PCM_RATE_88200 | SNDRV_PCM_RATE_96000 |
+		 SNDRV_PCM_RATE_176400 | SNDRV_PCM_RATE_192000,
+	.rate_min = 44100,
+	.rate_max = 192000,
+	.channels_min = 2,
+	.channels_max = UAD2_OUT_CHANNELS,
+	.buffer_bytes_max = SG_BUFFER_SIZE, /* 4MB max (entire HW buffer) */
 	.period_bytes_min = 256,
 	.period_bytes_max = SG_BUFFER_SIZE / 2,
-	.periods_min     = 2,
-	.periods_max     = 32,
+	.periods_min = 2,
+	.periods_max = 32,
 };
 
 static const struct snd_pcm_hardware uad2_pcm_hw_capture = {
-	.info            = SNDRV_PCM_INFO_MMAP
-			 | SNDRV_PCM_INFO_INTERLEAVED
-			 | SNDRV_PCM_INFO_MMAP_VALID
-			 | SNDRV_PCM_INFO_BLOCK_TRANSFER,
-	.formats         = SNDRV_PCM_FMTBIT_S32_LE,
-	.rates           = SNDRV_PCM_RATE_44100
-			 | SNDRV_PCM_RATE_48000
-			 | SNDRV_PCM_RATE_88200
-			 | SNDRV_PCM_RATE_96000
-			 | SNDRV_PCM_RATE_176400
-			 | SNDRV_PCM_RATE_192000,
-	.rate_min        = 44100,
-	.rate_max        = 192000,
-	.channels_min    = 2,
-	.channels_max    = UAD2_IN_CHANNELS,
+	.info = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
+		SNDRV_PCM_INFO_MMAP_VALID | SNDRV_PCM_INFO_BLOCK_TRANSFER,
+	.formats = SNDRV_PCM_FMTBIT_S32_LE,
+	.rates = SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000 |
+		 SNDRV_PCM_RATE_88200 | SNDRV_PCM_RATE_96000 |
+		 SNDRV_PCM_RATE_176400 | SNDRV_PCM_RATE_192000,
+	.rate_min = 44100,
+	.rate_max = 192000,
+	.channels_min = 2,
+	.channels_max = UAD2_IN_CHANNELS,
 	.buffer_bytes_max = SG_BUFFER_SIZE,
 	.period_bytes_min = 256,
 	.period_bytes_max = SG_BUFFER_SIZE / 2,
-	.periods_min     = 2,
-	.periods_max     = 32,
+	.periods_min = 2,
+	.periods_max = 32,
 };
 
 /* ============================================================
@@ -1445,7 +1454,7 @@ static int uad2_pcm_close(struct snd_pcm_substream *ss)
  * scatter-gather tables already point to this memory.
  */
 static int uad2_pcm_hw_params(struct snd_pcm_substream *ss,
-				 struct snd_pcm_hw_params *params)
+			      struct snd_pcm_hw_params *params)
 {
 	struct uad2_dev *dev = snd_pcm_substream_chip(ss);
 	struct snd_pcm_runtime *runtime = ss->runtime;
@@ -1465,8 +1474,7 @@ static int uad2_pcm_hw_params(struct snd_pcm_substream *ss,
 	runtime->dma_addr = dev->sg_dma_addr[buf_idx];
 	runtime->dma_bytes = buf_bytes;
 
-	dev_dbg(&dev->pci->dev,
-		"hw_params: stream=%d buf_bytes=%zu dma=%pad\n",
+	dev_dbg(&dev->pci->dev, "hw_params: stream=%d buf_bytes=%zu dma=%pad\n",
 		ss->stream, buf_bytes, &runtime->dma_addr);
 
 	return 0;
@@ -1507,16 +1515,14 @@ static int uad2_pcm_prepare(struct snd_pcm_substream *ss)
 
 	/* Use the hardware's computed buffer frame size,
 	 * but also respect ALSA's requested buffer size */
-	dev->buffer_frames = min((unsigned int)rt->buffer_size,
-				 dev->buffer_frames);
+	dev->buffer_frames =
+		min((unsigned int)rt->buffer_size, dev->buffer_frames);
 	dev->irq_period_frames = rt->period_size;
 
 	/* Prepare transport with ALSA runtime parameters */
-	err = uad2_prepare_transport(dev,
-				       dev->buffer_frames,
-				       dev->irq_period_frames,
-				       dev->play_channels,
-				       dev->rec_channels);
+	err = uad2_prepare_transport(dev, dev->buffer_frames,
+				     dev->irq_period_frames, dev->play_channels,
+				     dev->rec_channels);
 
 	return err;
 }
@@ -1562,14 +1568,14 @@ static snd_pcm_uframes_t uad2_pcm_pointer(struct snd_pcm_substream *ss)
 }
 
 static const struct snd_pcm_ops uad2_pcm_ops = {
-	.open      = uad2_pcm_open,
-	.close     = uad2_pcm_close,
-	.ioctl     = snd_pcm_lib_ioctl,
+	.open = uad2_pcm_open,
+	.close = uad2_pcm_close,
+	.ioctl = snd_pcm_lib_ioctl,
 	.hw_params = uad2_pcm_hw_params,
-	.hw_free   = uad2_pcm_hw_free,
-	.prepare   = uad2_pcm_prepare,
-	.trigger   = uad2_pcm_trigger,
-	.pointer   = uad2_pcm_pointer,
+	.hw_free = uad2_pcm_hw_free,
+	.prepare = uad2_pcm_prepare,
+	.trigger = uad2_pcm_trigger,
+	.pointer = uad2_pcm_pointer,
 };
 
 /* ============================================================
@@ -1597,8 +1603,8 @@ static irqreturn_t uad2_irq_handler(int irq, void *data)
 	transport_status = uad2_read32(dev, REG_TRANSPORT_CTL);
 
 	/* Check notification status register */
-	notify_status = uad2_read32(dev,
-		uad2_fw_reg(dev, REG_FW_NOTIFY_STATUS));
+	notify_status =
+		uad2_read32(dev, uad2_fw_reg(dev, REG_FW_NOTIFY_STATUS));
 
 	if (!transport_status && !notify_status)
 		return IRQ_NONE;
@@ -1644,20 +1650,18 @@ static irqreturn_t uad2_irq_handler(int irq, void *data)
  * ============================================================ */
 
 /* Clock source enumeration */
-static const char * const uad2_clock_source_names[] = {
-	"Internal", "S/PDIF"
-};
+static const char *const uad2_clock_source_names[] = { "Internal", "S/PDIF" };
 #define UAD2_NUM_CLOCK_SOURCES ARRAY_SIZE(uad2_clock_source_names)
 
 static int uad2_clock_source_info(struct snd_kcontrol *kctl,
-				    struct snd_ctl_elem_info *info)
+				  struct snd_ctl_elem_info *info)
 {
 	return snd_ctl_enum_info(info, 1, UAD2_NUM_CLOCK_SOURCES,
 				 uad2_clock_source_names);
 }
 
 static int uad2_clock_source_get(struct snd_kcontrol *kctl,
-				   struct snd_ctl_elem_value *val)
+				 struct snd_ctl_elem_value *val)
 {
 	struct uad2_dev *dev = snd_kcontrol_chip(kctl);
 
@@ -1666,7 +1670,7 @@ static int uad2_clock_source_get(struct snd_kcontrol *kctl,
 }
 
 static int uad2_clock_source_put(struct snd_kcontrol *kctl,
-				   struct snd_ctl_elem_value *val)
+				 struct snd_ctl_elem_value *val)
 {
 	struct uad2_dev *dev = snd_kcontrol_chip(kctl);
 	unsigned int new_source = val->value.enumerated.item[0];
@@ -1682,22 +1686,22 @@ static int uad2_clock_source_put(struct snd_kcontrol *kctl,
 	if (dev->current_rate)
 		uad2_set_sample_rate(dev, dev->current_rate);
 
-	return 1;  /* value changed */
+	return 1; /* value changed */
 }
 
 static const struct snd_kcontrol_new uad2_clock_source_ctl = {
-	.iface  = SNDRV_CTL_ELEM_IFACE_MIXER,
-	.name   = "Clock Source",
-	.info   = uad2_clock_source_info,
-	.get    = uad2_clock_source_get,
-	.put    = uad2_clock_source_put,
+	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+	.name = "Clock Source",
+	.info = uad2_clock_source_info,
+	.get = uad2_clock_source_get,
+	.put = uad2_clock_source_put,
 };
 
 /* Sample rate read-only control (informational) */
 static int uad2_sample_rate_info(struct snd_kcontrol *kctl,
-				   struct snd_ctl_elem_info *info)
+				 struct snd_ctl_elem_info *info)
 {
-	info->type  = SNDRV_CTL_ELEM_TYPE_INTEGER;
+	info->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
 	info->count = 1;
 	info->value.integer.min = 44100;
 	info->value.integer.max = 192000;
@@ -1706,20 +1710,21 @@ static int uad2_sample_rate_info(struct snd_kcontrol *kctl,
 }
 
 static int uad2_sample_rate_get(struct snd_kcontrol *kctl,
-				  struct snd_ctl_elem_value *val)
+				struct snd_ctl_elem_value *val)
 {
 	struct uad2_dev *dev = snd_kcontrol_chip(kctl);
 
-	val->value.integer.value[0] = dev->current_rate ? dev->current_rate : 48000;
+	val->value.integer.value[0] = dev->current_rate ? dev->current_rate :
+							  48000;
 	return 0;
 }
 
 static const struct snd_kcontrol_new uad2_sample_rate_ctl = {
-	.iface  = SNDRV_CTL_ELEM_IFACE_CARD,
-	.name   = "Current Sample Rate",
+	.iface = SNDRV_CTL_ELEM_IFACE_CARD,
+	.name = "Current Sample Rate",
 	.access = SNDRV_CTL_ELEM_ACCESS_READ | SNDRV_CTL_ELEM_ACCESS_VOLATILE,
-	.info   = uad2_sample_rate_info,
-	.get    = uad2_sample_rate_get,
+	.info = uad2_sample_rate_info,
+	.get = uad2_sample_rate_get,
 };
 
 static int uad2_create_mixer(struct uad2_dev *dev)
@@ -1753,7 +1758,7 @@ static int uad2_probe(struct pci_dev *pci, const struct pci_device_id *id)
 		return err;
 
 	dev = card->private_data;
-	dev->pci  = pci;
+	dev->pci = pci;
 	dev->card = card;
 	spin_lock_init(&dev->lock);
 	spin_lock_init(&dev->notify_lock);
@@ -1781,7 +1786,7 @@ static int uad2_probe(struct pci_dev *pci, const struct pci_device_id *id)
 	}
 
 	/* Map 64KB BAR 0 (confirmed: phys 0x1203000000, len 65536) */
-	dev->bar     = pci_iomap(pci, 0, 0);
+	dev->bar = pci_iomap(pci, 0, 0);
 	dev->bar_len = pci_resource_len(pci, 0);
 	if (!dev->bar) {
 		dev_err(&pci->dev, "Failed to map BAR 0\n");
@@ -1798,19 +1803,20 @@ static int uad2_probe(struct pci_dev *pci, const struct pci_device_id *id)
 	 * and polled after clock changes.
 	 */
 	dev->expected_device_id = uad2_read32(dev, REG_DEVICE_ID);
-	dev_info(&pci->dev, "Device ID register: 0x%08x\n", dev->expected_device_id);
+	dev_info(&pci->dev, "Device ID register: 0x%08x\n",
+		 dev->expected_device_id);
 
 	/* Apollo Solo: 1 DSP, single DMA engine
 	 * channel_base_index = 10 (from data segment @ 0x6018 in kext binary) */
 	dev->dsp_count = 1;
-	dev->dual_dma  = false;
+	dev->dual_dma = false;
 	dev->channel_base_index = UAD2_CHANNEL_BASE_IDX;
 	dev->dma_ctrl_shadow = 0;
 	dev->play_channels = UAD2_OUT_CHANNELS;
-	dev->rec_channels  = UAD2_IN_CHANNELS;
+	dev->rec_channels = UAD2_IN_CHANNELS;
 	dev->buffer_frames = UAD2_MAX_BUFFER_FRAMES;
-	dev->clock_source  = 0;   /* internal */
-	dev->current_rate  = 48000;
+	dev->clock_source = 0; /* internal */
+	dev->current_rate = 48000;
 
 	/* Allocate the two 4MB DMA buffers for scatter-gather */
 	err = uad2_alloc_sg_buffers(dev);
@@ -1818,12 +1824,12 @@ static int uad2_probe(struct pci_dev *pci, const struct pci_device_id *id)
 		goto err_unmap_bar;
 
 	/* MSI interrupt */
-	err = pci_alloc_irq_vectors(pci, 1, 1, PCI_IRQ_MSI | PCI_IRQ_LEGACY);
+	err = pci_alloc_irq_vectors(pci, 1, 1, PCI_IRQ_MSI | PCI_IRQ_INTX);
 	if (err < 0)
 		goto err_free_sg;
 
-	err = request_irq(pci_irq_vector(pci, 0), uad2_irq_handler,
-			  IRQF_SHARED, "uad2", dev);
+	err = request_irq(pci_irq_vector(pci, 0), uad2_irq_handler, IRQF_SHARED,
+			  "uad2", dev);
 	if (err)
 		goto err_free_irq_vectors;
 
@@ -1865,9 +1871,10 @@ static int uad2_probe(struct pci_dev *pci, const struct pci_device_id *id)
 		goto err_free_irq;
 
 	pci_set_drvdata(pci, dev);
-	dev_info(&pci->dev,
-		 "UAD2 initialized (v0.5.0) — play=%uch rec=%uch buf=%u frames\n",
-		 dev->play_channels, dev->rec_channels, dev->buffer_frames);
+	dev_info(
+		&pci->dev,
+		"UAD2 initialized (v0.5.0) — play=%uch rec=%uch buf=%u frames\n",
+		dev->play_channels, dev->rec_channels, dev->buffer_frames);
 	return 0;
 
 err_free_irq:
@@ -1908,8 +1915,7 @@ static void uad2_remove(struct pci_dev *pci)
 	if (dev->ring_dma_buf[0]) {
 		dma_free_coherent(&dev->pci->dev,
 				  DSP_RING_DESC_SLOTS * DSP_RING_PAGE_SIZE,
-				  dev->ring_dma_buf[0],
-				  dev->ring_dma_addr[0]);
+				  dev->ring_dma_buf[0], dev->ring_dma_addr[0]);
 	}
 
 	pci_iounmap(pci, dev->bar);
@@ -1919,9 +1925,8 @@ static void uad2_remove(struct pci_dev *pci)
 
 static const struct pci_device_id uad2_pci_ids[] = {
 	{ /* Apollo Solo */
-		PCI_DEVICE_SUB(UA_VENDOR_ID, UAD2_DEVICE_ID_SOLO,
-			       UA_VENDOR_ID, UAD2_SUBSYS_ID_SOLO)
-	},
+	  PCI_DEVICE_SUB(UA_VENDOR_ID, UAD2_DEVICE_ID_SOLO, UA_VENDOR_ID,
+			 UAD2_SUBSYS_ID_SOLO) },
 	/* TODO: Add other UAD2 Thunderbolt devices here:
 	 * Apollo Twin, Apollo x4, Apollo x6, Apollo x8, Apollo x8p,
 	 * Apollo x16, Apollo Twin X, Apollo Solo USB, etc.
@@ -1931,10 +1936,10 @@ static const struct pci_device_id uad2_pci_ids[] = {
 MODULE_DEVICE_TABLE(pci, uad2_pci_ids);
 
 static struct pci_driver uad2_driver = {
-	.name     = "uad2",
+	.name = "uad2",
 	.id_table = uad2_pci_ids,
-	.probe    = uad2_probe,
-	.remove   = uad2_remove,
+	.probe = uad2_probe,
+	.remove = uad2_remove,
 };
 
 module_pci_driver(uad2_driver);
