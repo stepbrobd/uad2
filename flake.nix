@@ -11,9 +11,8 @@
 
     perSystem = { lib, pkgs, ... }: {
       packages.default = pkgs.callPackage ./default.nix { };
-
+      checks.default = pkgs.testers.runNixOSTest ./test.nix;
       devShells.default = pkgs.callPackage ./shell.nix { };
-
       formatter = pkgs.writeShellScriptBin "formatter" ''
         set -eoux pipefail
         shopt -s globstar
