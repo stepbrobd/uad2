@@ -163,6 +163,22 @@
 #define REG_CHAN_CONFIG_BASE 0xC000 /* R: 10 DWORDs of channel config */
 #define CHAN_CONFIG_DWORDS 10
 
+/* IO descriptor channel type offset: uint16 descriptors start at +0x18
+ * within the IO descriptor block (after header fields).
+ * Each uint16: high byte = type index, low byte = sub-index */
+#define IO_DESC_CHAN_OFFSET 0x18
+
+/* Channel type names (from kext binary string table @ 0x60368)
+ * Index into this table is the high byte of the uint16 channel descriptor */
+static const char *const uad2_channel_type_names[] = {
+	[0] = "MIC/LINE/HIZ", [1] = "MIC/LINE", [2] = "AUX",
+	[3] = "LINE",	      [4] = "ADAT",	[5] = "S/PDIF",
+	[6] = "AES/EBU",      [7] = "VIRTUAL",	[8] = "MADI",
+	[9] = "MON",	      [10] = "CUE",	[11] = "TALKBACK",
+	[12] = "RESERVED",    [13] = "DANTE",	[14] = "UNKNOWN",
+};
+#define UAD2_NUM_CHAN_TYPES ARRAY_SIZE(uad2_channel_type_names)
+
 /* ============================================================
  * DSP ring buffer registers (relative to ring_base)
  *
@@ -295,6 +311,7 @@ struct uad2_dev {
 
 	u32 expected_device_id;
 	bool dual_dma;
+	bool disconnecting; /* set during remove, guards MMIO access */
 	unsigned int dsp_count;
 	u32 channel_base_index; /* 10 for Apollo Solo */
 
@@ -347,14 +364,23 @@ struct uad2_dev {
 /* ============================================================
  * Low-level register accessors
  * Mirrors CUAOS::ReadReg / CUAOS::WriteReg
+ *
+ * When the Thunderbolt device is hot-unplugged, MMIO reads return
+ * 0xFFFFFFFF.  The disconnecting flag is set early in uad2_remove()
+ * so we can skip MMIO to a disappeared device.  In the IRQ handler
+ * path we also check for the 0xFFFFFFFF sentinel.
  * ============================================================ */
 static inline u32 uad2_read32(struct uad2_dev *dev, u32 offset)
 {
+	if (unlikely(READ_ONCE(dev->disconnecting)))
+		return 0xFFFFFFFF;
 	return ioread32(dev->bar + offset);
 }
 
 static inline void uad2_write32(struct uad2_dev *dev, u32 offset, u32 val)
 {
+	if (unlikely(READ_ONCE(dev->disconnecting)))
+		return;
 	iowrite32(val, dev->bar + offset);
 }
 
@@ -476,7 +502,9 @@ static unsigned int uad2_compute_buffer_frames(unsigned int play_ch,
  *   shadow &= ~(1 << vec)
  *   write shadow to BAR+0x2204
  * ============================================================ */
-static void uad2_enable_vector(struct uad2_dev *dev, unsigned int vec, bool arm)
+/* Internal: caller must hold dev->lock */
+static void __uad2_enable_vector_locked(struct uad2_dev *dev, unsigned int vec,
+					bool arm)
 {
 	u64 bit = 1ULL << vec;
 
@@ -495,7 +523,8 @@ static void uad2_enable_vector(struct uad2_dev *dev, unsigned int vec, bool arm)
 	}
 }
 
-static void uad2_disable_vector(struct uad2_dev *dev, unsigned int vec)
+/* Internal: caller must hold dev->lock */
+static void __uad2_disable_vector_locked(struct uad2_dev *dev, unsigned int vec)
 {
 	u64 bit = 1ULL << vec;
 
@@ -508,6 +537,24 @@ static void uad2_disable_vector(struct uad2_dev *dev, unsigned int vec)
 			     (u32)(dev->intr_enable_shadow >> 32));
 }
 
+static void uad2_enable_vector(struct uad2_dev *dev, unsigned int vec, bool arm)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&dev->lock, flags);
+	__uad2_enable_vector_locked(dev, vec, arm);
+	spin_unlock_irqrestore(&dev->lock, flags);
+}
+
+static void uad2_disable_vector(struct uad2_dev *dev, unsigned int vec)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&dev->lock, flags);
+	__uad2_disable_vector_locked(dev, vec);
+	spin_unlock_irqrestore(&dev->lock, flags);
+}
+
 /* Interrupt vector IDs (from CPcieAudioExtension Initialize + kext analysis) */
 #define INTR_VEC_NOTIFY 0x28 /* notification interrupt */
 #define INTR_VEC_PERIODIC 0x46 /* periodic timer interrupt */
@@ -515,7 +562,8 @@ static void uad2_disable_vector(struct uad2_dev *dev, unsigned int vec)
 
 /* ============================================================
  * CPcieIntrManager::ProgramRegisters equivalent
- * Clears DMA interrupt and status registers
+ * Clears DMA interrupt and status registers.
+ * Called only during probe (sequential init), no locking needed.
  * ============================================================ */
 static void uad2_intr_program(struct uad2_dev *dev)
 {
@@ -626,14 +674,16 @@ static int uad2_ring_program(struct uad2_dev *dev, void __iomem *ring_base,
 
 	/* Read hardware ring capacity, capped at 0x400 */
 	ring_size = ioread32(ring_base + DSP_RING_CAPACITY);
-	if (ring_size >= 0x400) {
-		dev_warn(&dev->pci->dev,
-			 "Ring %d capacity 0x%x out of range, clamping to 0\n",
-			 ring_idx, ring_size);
-		ring_size = 0;
+	if (ring_size > 0x400) {
+		dev_warn(
+			&dev->pci->dev,
+			"Ring %d capacity 0x%x out of range, capping to 0x400\n",
+			ring_idx, ring_size);
+		ring_size = 0x400;
 	}
 
-	dev_dbg(&dev->pci->dev, "Ring %d capacity=0x%x\n", ring_idx, ring_size);
+	dev_info(&dev->pci->dev, "Ring %d capacity=0x%x\n", ring_idx,
+		 ring_size);
 
 	/* Program ring size and descriptor count */
 	iowrite32(ring_size, ring_base + DSP_RING_SIZE_REG);
@@ -692,8 +742,10 @@ static int uad2_dsp_program(struct uad2_dev *dev, int dsp_index)
 
 	ring2_base = ring_base + DSP_RING2_OFFSET;
 
-	dev_dbg(&dev->pci->dev, "DSP %d ring_base=%px ring2=%px\n", dsp_index,
-		ring_base, ring2_base);
+	dev_info(&dev->pci->dev,
+		 "DSP %d ring_base=BAR+0x%04lx ring2=BAR+0x%04lx\n", dsp_index,
+		 (unsigned long)(ring_base - dev->bar),
+		 (unsigned long)(ring2_base - dev->bar));
 
 	/* Wait for DSP firmware (type 0 only) */
 	if (dsp_type == 0) {
@@ -763,11 +815,9 @@ static int uad2_alloc_sg_buffers(struct uad2_dev *dev)
 			}
 			return -ENOMEM;
 		}
-		memset(dev->sg_dma_buf[i], 0, dev->sg_buf_size);
-		dev_info(&dev->pci->dev,
-			 "SG buffer %d: virt=%px dma=%pad size=0x%zx\n", i,
-			 dev->sg_dma_buf[i], &dev->sg_dma_addr[i],
-			 dev->sg_buf_size);
+		/* dma_alloc_coherent returns zeroed memory */
+		dev_info(&dev->pci->dev, "SG buffer %d: dma=%pad size=0x%zx\n",
+			 i, &dev->sg_dma_addr[i], dev->sg_buf_size);
 	}
 
 	return 0;
@@ -851,14 +901,10 @@ static int uad2_audio_ext_program(struct uad2_dev *dev)
 		SG_NUM_ENTRIES, &dev->sg_dma_addr[0], &dev->sg_dma_addr[1]);
 
 	/* Phase 3: Read firmware base address (BAR+0x30 lo, BAR+0x34 hi) */
-	{
-		u32 fw_lo = uad2_read32(dev, REG_FW_BASE_LO);
-		u32 fw_hi = uad2_read32(dev, REG_FW_BASE_HI);
-
-		dev->fw_base_addr = ((u64)fw_hi << 32) | fw_lo;
-		dev_info(&dev->pci->dev, "Firmware base address: 0x%016llx\n",
-			 dev->fw_base_addr);
-	}
+	dev->fw_base_addr = ((u64)uad2_read32(dev, REG_FW_BASE_HI) << 32) |
+			    uad2_read32(dev, REG_FW_BASE_LO);
+	dev_info(&dev->pci->dev, "Firmware base address: 0x%016llx\n",
+		 dev->fw_base_addr);
 
 	/* Phase 4: Enable interrupt vector 0x28 (notification interrupt)
 	 *
@@ -899,7 +945,7 @@ static void uad2_handle_notification(struct uad2_dev *dev)
 	spin_lock_irqsave(&dev->notify_lock, flags);
 
 	/* Check connected flag (mirrors kext this+0x2898 check) */
-	if (!dev->connected) {
+	if (!READ_ONCE(dev->connected)) {
 		spin_unlock_irqrestore(&dev->notify_lock, flags);
 		return;
 	}
@@ -912,11 +958,11 @@ static void uad2_handle_notification(struct uad2_dev *dev)
 
 	dev->notify_status = status;
 
-	dev_dbg(&dev->pci->dev, "Notification status: 0x%08x\n", status);
+	dev_info(&dev->pci->dev, "Notification: 0x%08x\n", status);
 
 	/* Bit 5: Connect ack */
 	if (status & NOTIFY_CONNECT_ACK) {
-		dev_dbg(&dev->pci->dev, "Connect ack received\n");
+		dev_info(&dev->pci->dev, "Connect ack received\n");
 		complete(&dev->connect_event);
 	}
 
@@ -925,7 +971,7 @@ static void uad2_handle_notification(struct uad2_dev *dev)
 	 * mostly care about the channel counts being set and the
 	 * notify_event signal at the end. */
 	if (status & NOTIFY_CHAN_CONFIG) {
-		dev_dbg(&dev->pci->dev, "Channel config update\n");
+		dev_info(&dev->pci->dev, "Channel config update\n");
 		/* Force playback + record IO ready processing */
 		status |= NOTIFY_PLAYBACK_IO | NOTIFY_RECORD_IO;
 	}
@@ -943,9 +989,9 @@ static void uad2_handle_notification(struct uad2_dev *dev)
 		play_ch = uad2_read32(
 			dev, uad2_fw_reg(dev, REG_PLAYBACK_IO_DESC + 0x10));
 		if (play_ch > 0 && play_ch <= 128) {
-			dev->play_channels = play_ch;
-			dev_dbg(&dev->pci->dev, "Playback channels: %u\n",
-				play_ch);
+			WRITE_ONCE(dev->play_channels, play_ch);
+			dev_info(&dev->pci->dev, "Playback channels: %u\n",
+				 play_ch);
 		}
 	}
 
@@ -956,9 +1002,9 @@ static void uad2_handle_notification(struct uad2_dev *dev)
 		rec_ch = uad2_read32(
 			dev, uad2_fw_reg(dev, REG_RECORD_IO_DESC + 0x10));
 		if (rec_ch > 0 && rec_ch <= 128) {
-			dev->rec_channels = rec_ch;
-			dev_dbg(&dev->pci->dev, "Record channels: %u\n",
-				rec_ch);
+			WRITE_ONCE(dev->rec_channels, rec_ch);
+			dev_info(&dev->pci->dev, "Record channels: %u\n",
+				 rec_ch);
 		}
 	}
 
@@ -994,6 +1040,65 @@ static void uad2_handle_notification(struct uad2_dev *dev)
 }
 
 /* ============================================================
+ * Channel mapping decode and logging
+ *
+ * After firmware Connect, the IO descriptor areas contain uint16
+ * descriptors for each channel.  Each uint16 encodes:
+ *   high byte (bits 15:8) = type index into uad2_channel_type_names[]
+ *   low byte  (bits 7:0)  = sub-index within that type
+ *
+ * From kext _parseIONames @ 0x4d818 (line 72299):
+ *   - Stereo types (MON, S/PDIF, AES/EBU, AUX, CUE): pair via (sub+1)/2
+ *   - L/R suffix for types with bit pattern: even=L, odd=R
+ *
+ * Descriptor locations (with channel_base_index offset):
+ *   Playback: BAR + (idx<<2) + 0xC2C4 + 0x18
+ *   Record:   BAR + (idx<<2) + 0xC1A4 + 0x18
+ * ============================================================ */
+static void uad2_log_channel_map(struct uad2_dev *dev, const char *dir,
+				 u32 io_desc_base, unsigned int num_channels)
+{
+	u32 desc_reg;
+	unsigned int i;
+
+	if (num_channels == 0 || num_channels > 128)
+		return;
+
+	desc_reg = uad2_fw_reg(dev, io_desc_base + IO_DESC_CHAN_OFFSET);
+
+	dev_info(&dev->pci->dev, "%s channel map (%u channels):\n", dir,
+		 num_channels);
+
+	/* Read uint16 descriptors — two per 32-bit register read */
+	for (i = 0; i < num_channels; i += 2) {
+		u32 dword = uad2_read32(dev, desc_reg + (i / 2) * 4);
+		u16 desc0 = dword & 0xFFFF;
+		u16 desc1 = (dword >> 16) & 0xFFFF;
+		u8 type0 = desc0 >> 8;
+		u8 sub0 = desc0 & 0xFF;
+		const char *name0 = (type0 < UAD2_NUM_CHAN_TYPES) ?
+					    uad2_channel_type_names[type0] :
+					    "?";
+
+		dev_info(&dev->pci->dev, "  ch %2u: type=%2u sub=%u (%s)\n", i,
+			 type0, sub0, name0);
+
+		if (i + 1 < num_channels) {
+			u8 type1 = desc1 >> 8;
+			u8 sub1 = desc1 & 0xFF;
+			const char *name1 =
+				(type1 < UAD2_NUM_CHAN_TYPES) ?
+					uad2_channel_type_names[type1] :
+					"?";
+
+			dev_info(&dev->pci->dev,
+				 "  ch %2u: type=%2u sub=%u (%s)\n", i + 1,
+				 type1, sub1, name1);
+		}
+	}
+}
+
+/* ============================================================
  * CPcieAudioExtension::Connect equivalent @ 0x4be58 (line 70632)
  *
  * Full handshake sequence decoded from lines 70632-70823:
@@ -1019,7 +1124,7 @@ static int uad2_audio_connect(struct uad2_dev *dev)
 	unsigned long timeout_jiffies;
 	long ret;
 
-	dev->connected = false;
+	WRITE_ONCE(dev->connected, false);
 
 	for (chan = 0; chan < UAD2_CONNECT_CHANNELS; chan++) {
 		/* Reset completion before each doorbell */
@@ -1058,6 +1163,10 @@ static int uad2_audio_connect(struct uad2_dev *dev)
 				&dev->pci->dev,
 				"Connect channel %d: no response after %d retries\n",
 				chan, UAD2_CONNECT_RETRIES);
+		} else {
+			dev_info(&dev->pci->dev,
+				 "Connect channel %d: OK (retry %d)\n", chan,
+				 retry);
 		}
 	}
 
@@ -1070,7 +1179,13 @@ static int uad2_audio_connect(struct uad2_dev *dev)
 	dev->buffer_frames = uad2_compute_buffer_frames(dev->play_channels,
 							dev->rec_channels);
 
-	dev->connected = true;
+	WRITE_ONCE(dev->connected, true);
+
+	/* Log the channel mapping from firmware IO descriptors */
+	uad2_log_channel_map(dev, "Playback", REG_PLAYBACK_IO_DESC,
+			     dev->play_channels);
+	uad2_log_channel_map(dev, "Record", REG_RECORD_IO_DESC,
+			     dev->rec_channels);
 
 	dev_info(&dev->pci->dev,
 		 "Audio connected: play=%u rec=%u buffer_frames=%u\n",
@@ -1179,11 +1294,11 @@ static int uad2_prepare_transport(struct uad2_dev *dev,
 	int i;
 
 	/* Validate: must be connected and not already running */
-	if (!dev->connected) {
+	if (!READ_ONCE(dev->connected)) {
 		dev_err(&dev->pci->dev, "PrepareTransport: not connected\n");
 		return -ENODEV;
 	}
-	if (dev->transport_state == 2) {
+	if (READ_ONCE(dev->transport_state) == 2) {
 		dev_warn(&dev->pci->dev,
 			 "PrepareTransport: transport already running\n");
 		return -EBUSY;
@@ -1211,7 +1326,7 @@ static int uad2_prepare_transport(struct uad2_dev *dev,
 	if (dev->periodic_timer_interval) {
 		uad2_write32(dev, REG_PERIODIC_TIMER,
 			     dev->periodic_timer_interval);
-		uad2_enable_vector(dev, INTR_VEC_PERIODIC, true);
+		__uad2_enable_vector_locked(dev, INTR_VEC_PERIODIC, true);
 	}
 
 	/* 9-10. Clear position again + read-back flush */
@@ -1242,16 +1357,16 @@ static int uad2_prepare_transport(struct uad2_dev *dev,
 	spin_unlock_irqrestore(&dev->lock, flags);
 
 	/* 19. Mark transport as prepared */
-	dev->transport_state = 1;
+	WRITE_ONCE(dev->transport_state, 1);
 
 	/* 20. Poll BAR+0x2254 until DMA is ready (compare vs irq_period)
 	 * Kext does max 2 iterations with 1ms sleep between */
-	for (i = 0; i < 200; i++) {
+	for (i = 0; i < 3; i++) {
 		u32 poll_val = uad2_read32(dev, REG_POLL_STATUS);
 
 		if (poll_val == irq_period_frames) {
-			dev_dbg(&dev->pci->dev, "DMA ready after %d polls\n",
-				i + 1);
+			dev_info(&dev->pci->dev, "DMA ready after %d polls\n",
+				 i + 1);
 			break;
 		}
 		usleep_range(1000, 2000);
@@ -1260,9 +1375,9 @@ static int uad2_prepare_transport(struct uad2_dev *dev,
 	/* 21. Enable end-of-buffer interrupt vector */
 	uad2_enable_vector(dev, INTR_VEC_ENDBUF, true);
 
-	dev_dbg(&dev->pci->dev,
-		"Transport prepared: buf=%u irq=%u play=%u rec=%u\n",
-		buffer_frames, irq_period_frames, play_channels, rec_channels);
+	dev_info(&dev->pci->dev,
+		 "Transport prepared: buf=%u irq=%u play=%u rec=%u\n",
+		 buffer_frames, irq_period_frames, play_channels, rec_channels);
 
 	return 0;
 }
@@ -1288,11 +1403,24 @@ static void uad2_start_transport(struct uad2_dev *dev)
 {
 	unsigned long flags;
 
+	/* Validate preconditions (matches kext checks):
+	 * - transport must be prepared (state 1)
+	 * - device must be connected */
+	if (READ_ONCE(dev->transport_state) != 1) {
+		dev_warn(&dev->pci->dev,
+			 "StartTransport: not prepared (state=%d)\n",
+			 READ_ONCE(dev->transport_state));
+		return;
+	}
+	if (!READ_ONCE(dev->connected)) {
+		dev_warn(&dev->pci->dev, "StartTransport: not connected\n");
+		return;
+	}
+
 	spin_lock_irqsave(&dev->lock, flags);
 	uad2_write32(dev, REG_TRANSPORT_CTL, 0xF);
+	WRITE_ONCE(dev->transport_state, 2);
 	spin_unlock_irqrestore(&dev->lock, flags);
-
-	dev->transport_state = 2;
 }
 
 /* ============================================================
@@ -1315,9 +1443,8 @@ static void uad2_stop_transport(struct uad2_dev *dev)
 
 	spin_lock_irqsave(&dev->lock, flags);
 	uad2_write32(dev, REG_TRANSPORT_CTL, 0x0);
+	WRITE_ONCE(dev->transport_state, 0);
 	spin_unlock_irqrestore(&dev->lock, flags);
-
-	dev->transport_state = 0;
 }
 
 /* ============================================================
@@ -1354,8 +1481,8 @@ static void uad2_shutdown(struct uad2_dev *dev)
 
 	/* 8: Disconnect */
 	uad2_write32(dev, REG_STREAM_ENABLE, 0x10);
-	dev->connected = false;
-	dev->transport_state = 0;
+	WRITE_ONCE(dev->connected, false);
+	WRITE_ONCE(dev->transport_state, 0);
 
 	dev_dbg(&dev->pci->dev, "Shutdown complete\n");
 }
@@ -1388,7 +1515,7 @@ static const struct snd_pcm_hardware uad2_pcm_hw_playback = {
 	.channels_min = 2,
 	.channels_max = UAD2_OUT_CHANNELS,
 	.buffer_bytes_max = SG_BUFFER_SIZE, /* 4MB max (entire HW buffer) */
-	.period_bytes_min = 256,
+	.period_bytes_min = 4096,
 	.period_bytes_max = SG_BUFFER_SIZE / 2,
 	.periods_min = 2,
 	.periods_max = 32,
@@ -1406,7 +1533,7 @@ static const struct snd_pcm_hardware uad2_pcm_hw_capture = {
 	.channels_min = 2,
 	.channels_max = UAD2_IN_CHANNELS,
 	.buffer_bytes_max = SG_BUFFER_SIZE,
-	.period_bytes_min = 256,
+	.period_bytes_min = 4096,
 	.period_bytes_max = SG_BUFFER_SIZE / 2,
 	.periods_min = 2,
 	.periods_max = 32,
@@ -1424,13 +1551,18 @@ static const struct snd_pcm_hardware uad2_pcm_hw_capture = {
 static int uad2_pcm_open(struct snd_pcm_substream *ss)
 {
 	struct uad2_dev *dev = snd_pcm_substream_chip(ss);
+	unsigned long flags;
 
 	if (ss->stream == SNDRV_PCM_STREAM_PLAYBACK) {
 		ss->runtime->hw = uad2_pcm_hw_playback;
+		spin_lock_irqsave(&dev->lock, flags);
 		dev->playback_ss = ss;
+		spin_unlock_irqrestore(&dev->lock, flags);
 	} else {
 		ss->runtime->hw = uad2_pcm_hw_capture;
+		spin_lock_irqsave(&dev->lock, flags);
 		dev->capture_ss = ss;
+		spin_unlock_irqrestore(&dev->lock, flags);
 	}
 
 	return 0;
@@ -1439,11 +1571,14 @@ static int uad2_pcm_open(struct snd_pcm_substream *ss)
 static int uad2_pcm_close(struct snd_pcm_substream *ss)
 {
 	struct uad2_dev *dev = snd_pcm_substream_chip(ss);
+	unsigned long flags;
 
+	spin_lock_irqsave(&dev->lock, flags);
 	if (ss->stream == SNDRV_PCM_STREAM_PLAYBACK)
 		dev->playback_ss = NULL;
 	else
 		dev->capture_ss = NULL;
+	spin_unlock_irqrestore(&dev->lock, flags);
 
 	return 0;
 }
@@ -1504,25 +1639,32 @@ static int uad2_pcm_prepare(struct snd_pcm_substream *ss)
 {
 	struct uad2_dev *dev = snd_pcm_substream_chip(ss);
 	struct snd_pcm_runtime *rt = ss->runtime;
+	unsigned int buffer_frames, irq_period_frames;
 	int err;
 
-	/* Set sample rate on hardware */
-	err = uad2_set_sample_rate(dev, rt->rate);
-	if (err)
-		dev_warn(&dev->pci->dev,
-			 "Sample rate set to %u may not have completed\n",
-			 rt->rate);
+	/* Set sample rate on hardware (skip if rate unchanged) */
+	if (dev->current_rate != rt->rate) {
+		err = uad2_set_sample_rate(dev, rt->rate);
+		if (err)
+			dev_warn(
+				&dev->pci->dev,
+				"Sample rate set to %u may not have completed\n",
+				rt->rate);
+	}
 
 	/* Use the hardware's computed buffer frame size,
-	 * but also respect ALSA's requested buffer size */
-	dev->buffer_frames =
-		min((unsigned int)rt->buffer_size, dev->buffer_frames);
-	dev->irq_period_frames = rt->period_size;
+	 * but also respect ALSA's requested buffer size.
+	 * Use local variables to avoid clobbering the device-global
+	 * buffer_frames (which is the hardware-computed value). */
+	buffer_frames = min((unsigned int)rt->buffer_size, dev->buffer_frames);
+	irq_period_frames = rt->period_size;
 
-	/* Prepare transport with ALSA runtime parameters */
-	err = uad2_prepare_transport(dev, dev->buffer_frames,
-				     dev->irq_period_frames, dev->play_channels,
-				     dev->rec_channels);
+	/* Prepare transport with ALSA runtime parameters.
+	 * Always program the full hardware channel counts — the DMA
+	 * layout is fixed at all channels interleaved. */
+	err = uad2_prepare_transport(dev, buffer_frames, irq_period_frames,
+				     READ_ONCE(dev->play_channels),
+				     READ_ONCE(dev->rec_channels));
 
 	return err;
 }
@@ -1567,14 +1709,29 @@ static snd_pcm_uframes_t uad2_pcm_pointer(struct snd_pcm_substream *ss)
 	return pos;
 }
 
+/*
+ * sync_stop: ensure no IRQ handler is accessing this substream.
+ *
+ * Called by ALSA core between trigger(STOP) and close() to guarantee
+ * that snd_pcm_period_elapsed() won't reference a freed substream.
+ * We synchronize against our MSI IRQ to drain any in-flight handler.
+ */
+static int uad2_pcm_sync_stop(struct snd_pcm_substream *ss)
+{
+	struct uad2_dev *dev = snd_pcm_substream_chip(ss);
+
+	synchronize_irq(pci_irq_vector(dev->pci, 0));
+	return 0;
+}
+
 static const struct snd_pcm_ops uad2_pcm_ops = {
 	.open = uad2_pcm_open,
 	.close = uad2_pcm_close,
-	.ioctl = snd_pcm_lib_ioctl,
 	.hw_params = uad2_pcm_hw_params,
 	.hw_free = uad2_pcm_hw_free,
 	.prepare = uad2_pcm_prepare,
 	.trigger = uad2_pcm_trigger,
+	.sync_stop = uad2_pcm_sync_stop,
 	.pointer = uad2_pcm_pointer,
 };
 
@@ -1602,6 +1759,11 @@ static irqreturn_t uad2_irq_handler(int irq, void *data)
 	/* Check transport status register */
 	transport_status = uad2_read32(dev, REG_TRANSPORT_CTL);
 
+	/* Hot-unplug detection: MMIO reads to a disappeared PCIe device
+	 * return all-ones.  Bail out early to avoid spurious processing. */
+	if (transport_status == 0xFFFFFFFF)
+		return IRQ_NONE;
+
 	/* Check notification status register */
 	notify_status =
 		uad2_read32(dev, uad2_fw_reg(dev, REG_FW_NOTIFY_STATUS));
@@ -1617,17 +1779,27 @@ static irqreturn_t uad2_irq_handler(int irq, void *data)
 
 	/* Handle transport status */
 	if (transport_status & BIT(5)) {
+		struct snd_pcm_substream *play_ss, *cap_ss;
+
 		/* Transport is running — check for errors */
 		if (transport_status & BIT(7))
 			dev_warn_ratelimited(&dev->pci->dev, "DMA overflow\n");
 		if (transport_status & BIT(8))
 			dev_warn_ratelimited(&dev->pci->dev, "DMA underflow\n");
 
-		/* Notify ALSA of period elapsed */
-		if (dev->playback_ss)
-			snd_pcm_period_elapsed(dev->playback_ss);
-		if (dev->capture_ss)
-			snd_pcm_period_elapsed(dev->capture_ss);
+		/* Snapshot substream pointers under lock to avoid race
+		 * with uad2_pcm_open/close setting them to NULL */
+		spin_lock(&dev->lock);
+		play_ss = dev->playback_ss;
+		cap_ss = dev->capture_ss;
+		spin_unlock(&dev->lock);
+
+		/* Notify ALSA of period elapsed (outside lock —
+		 * snd_pcm_period_elapsed takes its own lock) */
+		if (play_ss)
+			snd_pcm_period_elapsed(play_ss);
+		if (cap_ss)
+			snd_pcm_period_elapsed(cap_ss);
 
 		handled = true;
 	}
@@ -1679,6 +1851,11 @@ static int uad2_clock_source_put(struct snd_kcontrol *kctl,
 		return -EINVAL;
 	if (new_source == dev->clock_source)
 		return 0;
+
+	/* Reject clock source changes while transport is running —
+	 * changing the clock mid-stream could corrupt DMA state. */
+	if (READ_ONCE(dev->transport_state) == 2)
+		return -EBUSY;
 
 	dev->clock_source = new_source;
 
@@ -1777,13 +1954,14 @@ static int uad2_probe(struct pci_dev *pci, const struct pci_device_id *id)
 	if (err)
 		goto err_disable_pci;
 
-	pci_set_master(pci);
 	err = dma_set_mask_and_coherent(&pci->dev, DMA_BIT_MASK(64));
 	if (err) {
 		err = dma_set_mask_and_coherent(&pci->dev, DMA_BIT_MASK(32));
 		if (err)
 			goto err_release_regions;
 	}
+
+	pci_set_master(pci);
 
 	/* Map 64KB BAR 0 (confirmed: phys 0x1203000000, len 65536) */
 	dev->bar = pci_iomap(pci, 0, 0);
@@ -1841,6 +2019,9 @@ static int uad2_probe(struct pci_dev *pci, const struct pci_device_id *id)
 	err = uad2_hw_program(dev);
 	if (err) {
 		dev_err(&pci->dev, "Hardware init failed: %d\n", err);
+		/* Shutdown any partially-initialized hardware state
+		 * (SG tables, interrupt vectors, DMA may be active) */
+		uad2_shutdown(dev);
 		goto err_free_irq;
 	}
 
@@ -1873,7 +2054,7 @@ static int uad2_probe(struct pci_dev *pci, const struct pci_device_id *id)
 	pci_set_drvdata(pci, dev);
 	dev_info(
 		&pci->dev,
-		"UAD2 initialized (v0.5.0) — play=%uch rec=%uch buf=%u frames\n",
+		"UAD2 initialized (v2026.301.0) — play=%uch rec=%uch buf=%u frames\n",
 		dev->play_channels, dev->rec_channels, dev->buffer_frames);
 	return 0;
 
@@ -1898,6 +2079,17 @@ static void uad2_remove(struct pci_dev *pci)
 {
 	struct uad2_dev *dev = pci_get_drvdata(pci);
 
+	/* Mark card as disconnected first — this causes all subsequent
+	 * ALSA operations (PCM open/prepare/trigger/pointer) to return
+	 * errors immediately, preventing races where userspace still has
+	 * the device open while we tear down hardware state. */
+	snd_card_disconnect(dev->card);
+
+	/* Set disconnecting flag to guard MMIO access — after this point,
+	 * uad2_read32/uad2_write32 become no-ops so the IRQ handler and
+	 * any remaining ALSA callbacks won't touch disappeared hardware. */
+	WRITE_ONCE(dev->disconnecting, true);
+
 	/* Full shutdown sequence (mirrors kext CPcieAudioExtension::Shutdown):
 	 * stops transport, clears doorbell, disables notification vector,
 	 * sends disconnect command to firmware */
@@ -1906,19 +2098,26 @@ static void uad2_remove(struct pci_dev *pci)
 	/* Disable global interrupt enable */
 	uad2_write32(dev, REG_INTR_ENABLE, 0x0);
 
-	snd_card_free(dev->card);
+	/* Free IRQ before snd_card_free() — the card free will release
+	 * dev (it's card->private_data), so we must stop the IRQ handler
+	 * first to prevent use-after-free. */
 	free_irq(pci_irq_vector(pci, 0), dev);
 	pci_free_irq_vectors(pci);
 
-	/* Free DMA buffers */
+	/* Free DMA buffers while dev is still alive */
 	uad2_free_sg_buffers(dev);
 	if (dev->ring_dma_buf[0]) {
-		dma_free_coherent(&dev->pci->dev,
+		dma_free_coherent(&pci->dev,
 				  DSP_RING_DESC_SLOTS * DSP_RING_PAGE_SIZE,
 				  dev->ring_dma_buf[0], dev->ring_dma_addr[0]);
 	}
 
 	pci_iounmap(pci, dev->bar);
+
+	/* snd_card_free() frees dev (card->private_data) — must be last
+	 * operation that references dev */
+	snd_card_free(dev->card);
+
 	pci_release_regions(pci);
 	pci_disable_device(pci);
 }
@@ -1931,7 +2130,7 @@ static const struct pci_device_id uad2_pci_ids[] = {
 	 * Apollo Twin, Apollo x4, Apollo x6, Apollo x8, Apollo x8p,
 	 * Apollo x16, Apollo Twin X, Apollo Solo USB, etc.
 	 * All share vendor 0x1a00, device 0x0002; differ by subsystem ID. */
-	{ 0 }
+	{}
 };
 MODULE_DEVICE_TABLE(pci, uad2_pci_ids);
 
@@ -1944,7 +2143,7 @@ static struct pci_driver uad2_driver = {
 
 module_pci_driver(uad2_driver);
 
-MODULE_AUTHOR("Yifei Sun");
+MODULE_AUTHOR("Claude Opus 4.6 (Anthropic)");
 MODULE_DESCRIPTION("Universal Audio UAD2 Thunderbolt audio driver");
-MODULE_LICENSE("GPL v2");
-MODULE_VERSION("0.5.0");
+MODULE_LICENSE("GPL");
+MODULE_VERSION("2026.301.0");

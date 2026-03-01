@@ -32,6 +32,7 @@
           root="$(dirname "$root")"
         done
         pushd "$root" > /dev/null
+        ${lib.getExe pkgs.deno} fmt readme.md
         ${lib.getExe pkgs.findutils} . -regex '.*\.\(c\|h\)' -exec ${lib.getExe' pkgs.clang-tools "clang-format"} -i {} \;
         ${lib.getExe pkgs.nixpkgs-fmt} .
         popd
