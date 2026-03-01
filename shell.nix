@@ -3,8 +3,6 @@
 , bear
 , gnumake
 , llvmPackages
-, meson
-, ninja
 }:
 
 mkShell {
@@ -15,7 +13,5 @@ mkShell {
     gnumake
     llvmPackages.bintools
     llvmPackages.clang-tools
-    meson
-    ninja
   ];
 }
