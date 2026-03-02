@@ -10,6 +10,14 @@
 > risk. This driver may damage your hardware, corrupt audio, cause kernel
 > panics, or behave unpredictably.
 
+> [!NOTE]
+> From a human (only this part and some Nix related code is written by me) and
+> all the other stuff is written by Claude. I've only tested this on a UA Apollo
+> Solo on a NixOS laptop, and only the stereo audio playback. There are some
+> looping, and weird artifacts when playing (happens quite randomly) but I think
+> this is enough for me. DSP plugins and recording are not tested and I'm almost
+> certain they will not work.
+
 ## Overview
 
 This is a Linux kernel ALSA/PCIe driver for the **Universal Audio Apollo Solo
@@ -957,4 +965,5 @@ otool -v -s __TEXT_EXEC __text bin/aarch64-darwin/uad2.kext > bin/aarch64-darwin
 
 ## License
 
-This driver is licensed under **GPL** (`MODULE_LICENSE("GPL")`).
+I retain absolutely zero copyright and there will be absolutely zero warranty.
+Use at your own risk.
