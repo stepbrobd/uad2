@@ -287,6 +287,40 @@ static unsigned int uad2_irq_period_for_rate(unsigned int rate)
 	}
 }
 
+/* Periodic timer interval lookup table from kext CUAD2AudioMixer::StartTransport.
+ *
+ * This determines the interrupt rate for audio processing.  The kext's mixer
+ * calls SetPeriodicTimerIntervalInFrames(N-1, 0) where N comes from a rate-
+ * indexed lookup table at kext data segment @ 0x5D20:
+ *   44100/48000   → 256 frames → value 255
+ *   88200/96000   → 512 frames → value 511
+ *   176400/192000 → 1024 frames → value 1023
+ *
+ * This value is written to BAR+0x2270 (REG_PERIODIC_TIMER) and triggers
+ * interrupt vector 0x46 (_periodicTimerCallback), which is the ACTUAL audio
+ * clock that drives the kext's ProcessAudio and period advancement.
+ *
+ * NOTE: Vector 0x47 (end-of-buffer, _endBufferCallback) passes callback ID
+ * 0x6c to the mixer, which ignores it.  Only vector 0x46 (periodic timer,
+ * callback ID 0x6d) triggers ProcessAudio.  The Linux driver must use the
+ * periodic timer interrupt to drive snd_pcm_period_elapsed(). */
+static unsigned int uad2_periodic_timer_for_rate(unsigned int rate)
+{
+	switch (rate) {
+	case 44100:
+	case 48000:
+		return 255; /* 256 - 1 */
+	case 88200:
+	case 96000:
+		return 511; /* 512 - 1 */
+	case 176400:
+	case 192000:
+		return 1023; /* 1024 - 1 */
+	default:
+		return 255;
+	}
+}
+
 /* ============================================================
  * Interrupt vector enable bitmask management
  *
@@ -358,6 +392,13 @@ struct uad2_dev {
 	 * consumed by threaded bottom-half.  Protected by dev->lock. */
 	u64 irq_active;
 
+	/* Counter for periodic timer interrupts.  The hardirq increments
+	 * this atomically; the thread does atomic_xchg(&count, 0) and calls
+	 * snd_pcm_period_elapsed() N times.  This prevents coalescing of
+	 * multiple periodic interrupts into a single period_elapsed call,
+	 * which would cause the app pointer to fall behind the DMA position. */
+	atomic_t periodic_irq_count;
+
 	/* Ring buffer DMA allocations (4 x 4KB pages per ring) */
 	dma_addr_t ring_dma_addr[DSP_RING_DESC_SLOTS];
 	void *ring_dma_buf[DSP_RING_DESC_SLOTS];
@@ -391,6 +432,30 @@ struct uad2_dev {
 	 * We reference-count active streams so StopTransport only stops
 	 * the hardware when the LAST stream stops.  Protected by dev->lock. */
 	int streams_running;
+
+	/* Per-stream running flags.  Used by the IRQ thread to decide
+	 * which substreams should receive snd_pcm_period_elapsed().
+	 * Set in trigger(START), cleared in trigger(STOP).
+	 * Protected by dev->lock. */
+	bool playback_running;
+	bool capture_running;
+
+	/* Number of substreams that have been prepared (pcm_prepare called
+	 * but hw_free not yet called).  Used to prevent hw_free on one
+	 * substream from tearing down the transport that the other substream
+	 * still depends on.  Protected by dev->lock. */
+	int streams_prepared;
+
+	/* Number of substreams currently open (pcm_open called but
+	 * pcm_close not yet called).  The hardware transport is only
+	 * fully torn down when this reaches 0 — NOT on hw_free.
+	 * This prevents the pathological cycle where PipeWire's rapid
+	 * stop→hw_free→prepare→start reconfiguration briefly drives
+	 * streams_prepared to 0, tearing down a transport that was about
+	 * to be re-prepared immediately.  Following the snd-dice/snd-bebob
+	 * pattern: transport lifecycle is tied to open/close, not to
+	 * hw_params/hw_free.  Protected by dev->lock. */
+	int open_count;
 
 	/* Notification interrupt handling */
 	struct completion notify_event; /* signals Connect() on bit 21 */
@@ -1543,6 +1608,9 @@ static int uad2_prepare_transport(struct uad2_dev *dev,
 		uad2_write32(dev, REG_PERIODIC_TIMER,
 			     dev->periodic_timer_interval);
 		__uad2_enable_vector_locked(dev, INTR_SLOT_PERIODIC, true);
+		dev_info(&dev->pci->dev,
+			 "Periodic timer: interval=%u, shadow=0x%llx\n",
+			 dev->periodic_timer_interval, dev->intr_enable_shadow);
 	}
 
 	/* 9-10. Clear position again + read-back flush */
@@ -1657,6 +1725,9 @@ static void uad2_start_transport(struct uad2_dev *dev)
 	uad2_write32(dev, REG_TRANSPORT_CTL, 0xF);
 	WRITE_ONCE(dev->transport_state, 2);
 	spin_unlock_irqrestore(&dev->lock, flags);
+	dev_dbg(&dev->pci->dev,
+		"StartTransport: wrote 0xF, state=2, intr_shadow=0x%llx\n",
+		dev->intr_enable_shadow);
 }
 
 /* ============================================================
@@ -1674,8 +1745,12 @@ static void uad2_stop_transport(struct uad2_dev *dev)
 {
 	unsigned long flags;
 
-	/* Disable end-of-buffer interrupt before stopping */
+	/* Disable end-of-buffer interrupt before stopping (kext behavior) */
 	uad2_disable_vector(dev, INTR_SLOT_ENDBUF);
+
+	/* Disable periodic timer interrupt — no more period-elapsed callbacks
+	 * should fire after the transport is stopped. */
+	uad2_disable_vector(dev, INTR_SLOT_PERIODIC);
 
 	spin_lock_irqsave(&dev->lock, flags);
 	uad2_write32(dev, REG_TRANSPORT_CTL, 0x0);
@@ -1720,6 +1795,8 @@ static void uad2_shutdown(struct uad2_dev *dev)
 	WRITE_ONCE(dev->connected, false);
 	WRITE_ONCE(dev->transport_state, 0);
 	WRITE_ONCE(dev->streams_running, 0);
+	WRITE_ONCE(dev->streams_prepared, 0);
+	WRITE_ONCE(dev->open_count, 0);
 
 	dev_dbg(&dev->pci->dev, "Shutdown complete\n");
 }
@@ -1736,36 +1813,35 @@ static void uad2_shutdown(struct uad2_dev *dev)
  * ============================================================ */
 /* The hardware DMA is completely rigid:
  *   - Buffer = 8192 frames (always, computed by _recomputeBufferFrameSize)
- *   - IRQ period = 8 frames at 48kHz (from kext rate lookup table @ 0x6020)
- *   - 1024 periods per buffer (8192 / 8)
+ *   - Periodic timer interval varies by rate:
+ *     256 frames @ 44.1/48kHz, 512 @ 88.2/96kHz, 1024 @ 176.4/192kHz
  *   - All channels interleaved, S32_LE, fixed channel count
  *
- * ALSA's buffer arithmetic (frames × channels × sample_size) must match
- * the hardware layout exactly.  If ALSA thinks the buffer is smaller
- * (e.g. 96 frames), pcm_pointer returns positions outside ALSA's buffer
- * range, causing hangs and broken period-elapsed accounting.
+ * The periodic timer (vector 0x46) fires snd_pcm_period_elapsed() at
+ * the interval above.  ALSA's period size MUST match this interval for
+ * correct buffer position accounting.
  *
- * We lock period_bytes_min == period_bytes_max and periods_min == periods_max
- * to force ALSA to use exactly the hardware's buffer geometry.
- * PipeWire/PulseAudio handle channel routing and resampling in software.
+ * Since the period varies by sample rate but ALSA constraints are set
+ * at open time (before the rate is known), we allow a range of period
+ * sizes that covers all supported rates.  A constraint rule in pcm_open
+ * ties the exact period to the selected rate.
  *
- * NOTE: The IRQ period varies by sample rate (8/16/32 for 1x/2x/4x rates).
- * We use the smallest value (8) here so the constraints work for all rates.
- * At higher rates, the actual period is larger but divides evenly into 8192.
+ * Period sizes: 256 (1x rates), 512 (2x rates), 1024 (4x rates)
+ * Periods:      32, 16, 8 respectively (8192 / period_size)
  *
- * Playback: 8 frames × 42ch × 4B = 1344 bytes/period, 1024 periods = 1376256 total
- * Capture:  8 frames × 32ch × 4B = 1024 bytes/period, 1024 periods = 1048576 total
+ * Playback: 256 frames × 42ch × 4B = 43008 bytes/period (min)
+ *           1024 frames × 42ch × 4B = 172032 bytes/period (max)
+ * Capture:  256 frames × 32ch × 4B = 32768 bytes/period (min)
+ *           1024 frames × 32ch × 4B = 131072 bytes/period (max)
  */
-#define UAD2_HW_PERIOD_FRAMES 8 /* IRQ period at base rate (48kHz) */
-#define UAD2_PLAY_PERIOD_BYTES \
-	(UAD2_HW_PERIOD_FRAMES * UAD2_OUT_CHANNELS * UAD2_BYTES_PER_SAMPLE)
-#define UAD2_CAP_PERIOD_BYTES \
-	(UAD2_HW_PERIOD_FRAMES * UAD2_IN_CHANNELS * UAD2_BYTES_PER_SAMPLE)
-#define UAD2_HW_PERIODS (UAD2_MAX_BUFFER_FRAMES / UAD2_HW_PERIOD_FRAMES)
+#define UAD2_PERIOD_FRAMES_1X 256 /* period at 44.1/48 kHz */
+#define UAD2_PERIOD_FRAMES_2X 512 /* period at 88.2/96 kHz */
+#define UAD2_PERIOD_FRAMES_4X 1024 /* period at 176.4/192 kHz */
 
 static const struct snd_pcm_hardware uad2_pcm_hw_playback = {
 	.info = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
-		SNDRV_PCM_INFO_MMAP_VALID | SNDRV_PCM_INFO_BLOCK_TRANSFER,
+		SNDRV_PCM_INFO_MMAP_VALID | SNDRV_PCM_INFO_BLOCK_TRANSFER |
+		SNDRV_PCM_INFO_JOINT_DUPLEX,
 	.formats = SNDRV_PCM_FMTBIT_S32_LE, /* 24-in-32 LE, MSB-justified */
 	.rates = SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000 |
 		 SNDRV_PCM_RATE_88200 | SNDRV_PCM_RATE_96000 |
@@ -1774,16 +1850,20 @@ static const struct snd_pcm_hardware uad2_pcm_hw_playback = {
 	.rate_max = 192000,
 	.channels_min = UAD2_OUT_CHANNELS,
 	.channels_max = UAD2_OUT_CHANNELS,
-	.buffer_bytes_max = UAD2_PLAY_PERIOD_BYTES * UAD2_HW_PERIODS,
-	.period_bytes_min = UAD2_PLAY_PERIOD_BYTES,
-	.period_bytes_max = UAD2_PLAY_PERIOD_BYTES,
-	.periods_min = UAD2_HW_PERIODS,
-	.periods_max = UAD2_HW_PERIODS,
+	.buffer_bytes_max = UAD2_MAX_BUFFER_FRAMES * UAD2_OUT_CHANNELS *
+			    UAD2_BYTES_PER_SAMPLE,
+	.period_bytes_min = UAD2_PERIOD_FRAMES_1X * UAD2_OUT_CHANNELS *
+			    UAD2_BYTES_PER_SAMPLE,
+	.period_bytes_max = UAD2_PERIOD_FRAMES_4X * UAD2_OUT_CHANNELS *
+			    UAD2_BYTES_PER_SAMPLE,
+	.periods_min = UAD2_MAX_BUFFER_FRAMES / UAD2_PERIOD_FRAMES_4X,
+	.periods_max = UAD2_MAX_BUFFER_FRAMES / UAD2_PERIOD_FRAMES_1X,
 };
 
 static const struct snd_pcm_hardware uad2_pcm_hw_capture = {
 	.info = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
-		SNDRV_PCM_INFO_MMAP_VALID | SNDRV_PCM_INFO_BLOCK_TRANSFER,
+		SNDRV_PCM_INFO_MMAP_VALID | SNDRV_PCM_INFO_BLOCK_TRANSFER |
+		SNDRV_PCM_INFO_JOINT_DUPLEX,
 	.formats = SNDRV_PCM_FMTBIT_S32_LE,
 	.rates = SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000 |
 		 SNDRV_PCM_RATE_88200 | SNDRV_PCM_RATE_96000 |
@@ -1792,11 +1872,14 @@ static const struct snd_pcm_hardware uad2_pcm_hw_capture = {
 	.rate_max = 192000,
 	.channels_min = UAD2_IN_CHANNELS,
 	.channels_max = UAD2_IN_CHANNELS,
-	.buffer_bytes_max = UAD2_CAP_PERIOD_BYTES * UAD2_HW_PERIODS,
-	.period_bytes_min = UAD2_CAP_PERIOD_BYTES,
-	.period_bytes_max = UAD2_CAP_PERIOD_BYTES,
-	.periods_min = UAD2_HW_PERIODS,
-	.periods_max = UAD2_HW_PERIODS,
+	.buffer_bytes_max = UAD2_MAX_BUFFER_FRAMES * UAD2_IN_CHANNELS *
+			    UAD2_BYTES_PER_SAMPLE,
+	.period_bytes_min = UAD2_PERIOD_FRAMES_1X * UAD2_IN_CHANNELS *
+			    UAD2_BYTES_PER_SAMPLE,
+	.period_bytes_max = UAD2_PERIOD_FRAMES_4X * UAD2_IN_CHANNELS *
+			    UAD2_BYTES_PER_SAMPLE,
+	.periods_min = UAD2_MAX_BUFFER_FRAMES / UAD2_PERIOD_FRAMES_4X,
+	.periods_max = UAD2_MAX_BUFFER_FRAMES / UAD2_PERIOD_FRAMES_1X,
 };
 
 /* ============================================================
@@ -1808,22 +1891,162 @@ static const struct snd_pcm_hardware uad2_pcm_hw_capture = {
  * runtime->dma_area/dma_addr/dma_bytes to point into our
  * pre-allocated 4MB buffer.  This avoids a copy path.
  * ============================================================ */
+
+/*
+ * Constraint rule: tie ALSA period_size to sample rate.
+ *
+ * The hardware's periodic timer fires at rate-dependent intervals:
+ *   44100/48000 Hz   → every 256 frames
+ *   88200/96000 Hz   → every 512 frames
+ *   176400/192000 Hz → every 1024 frames
+ *
+ * ALSA must use the matching period_size so that snd_pcm_period_elapsed()
+ * accounting stays in sync with the hardware interrupt cadence.
+ */
+static const unsigned int uad2_rate_list[] = {
+	44100, 48000, 88200, 96000, 176400, 192000,
+};
+static const unsigned int uad2_period_for_rate[] = {
+	256, 256, 512, 512, 1024, 1024,
+};
+
+static int uad2_rule_period_size(struct snd_pcm_hw_params *params,
+				 struct snd_pcm_hw_rule *rule)
+{
+	struct snd_interval *period =
+		hw_param_interval(params, SNDRV_PCM_HW_PARAM_PERIOD_SIZE);
+	struct snd_interval *rate =
+		hw_param_interval(params, SNDRV_PCM_HW_PARAM_RATE);
+	struct snd_interval new_period;
+	unsigned int min_p = UINT_MAX, max_p = 0;
+	int i;
+
+	/* Find the range of valid period sizes for the current rate range */
+	for (i = 0; i < ARRAY_SIZE(uad2_rate_list); i++) {
+		if (uad2_rate_list[i] >= rate->min &&
+		    uad2_rate_list[i] <= rate->max) {
+			if (uad2_period_for_rate[i] < min_p)
+				min_p = uad2_period_for_rate[i];
+			if (uad2_period_for_rate[i] > max_p)
+				max_p = uad2_period_for_rate[i];
+		}
+	}
+
+	if (min_p > max_p)
+		return -EINVAL;
+
+	snd_interval_any(&new_period);
+	new_period.min = min_p;
+	new_period.max = max_p;
+
+	return snd_interval_refine(period, &new_period);
+}
+
+/*
+ * Constraint rule: buffer_size must equal the hardware buffer (8192 frames).
+ *
+ * The hardware DMA uses a fixed 8192-frame ring buffer. The DMA position
+ * counter (REG_DMA_POSITION) wraps at 8192, not at ALSA's buffer_size.
+ * If ALSA picks a smaller buffer_size, the pointer callback returns values
+ * beyond buffer_size, causing -EIO errors.
+ */
+static int uad2_rule_buffer_size(struct snd_pcm_hw_params *params,
+				 struct snd_pcm_hw_rule *rule)
+{
+	struct snd_interval *buffer =
+		hw_param_interval(params, SNDRV_PCM_HW_PARAM_BUFFER_SIZE);
+	struct snd_interval fixed;
+
+	snd_interval_any(&fixed);
+	fixed.min = UAD2_MAX_BUFFER_FRAMES;
+	fixed.max = UAD2_MAX_BUFFER_FRAMES;
+
+	return snd_interval_refine(buffer, &fixed);
+}
+
+/*
+ * Constraint rule: periods = 8192 / period_size.
+ *
+ * Since buffer_size is fixed at 8192 and period_size depends on rate,
+ * the number of periods must adjust accordingly:
+ *   44100/48000 Hz  → period=256  → periods=32
+ *   88200/96000 Hz  → period=512  → periods=16
+ *   176400/192000 Hz → period=1024 → periods=8
+ */
+static int uad2_rule_periods(struct snd_pcm_hw_params *params,
+			     struct snd_pcm_hw_rule *rule)
+{
+	struct snd_interval *periods =
+		hw_param_interval(params, SNDRV_PCM_HW_PARAM_PERIODS);
+	struct snd_interval *period_size =
+		hw_param_interval(params, SNDRV_PCM_HW_PARAM_PERIOD_SIZE);
+	struct snd_interval new_periods;
+	unsigned int min_periods, max_periods;
+
+	/* periods = buffer_frames / period_size
+	 * When period_size is large, periods is small and vice versa */
+	min_periods = UAD2_MAX_BUFFER_FRAMES / period_size->max;
+	max_periods = UAD2_MAX_BUFFER_FRAMES / period_size->min;
+
+	snd_interval_any(&new_periods);
+	new_periods.min = min_periods;
+	new_periods.max = max_periods;
+
+	return snd_interval_refine(periods, &new_periods);
+}
+
 static int uad2_pcm_open(struct snd_pcm_substream *ss)
 {
 	struct uad2_dev *dev = snd_pcm_substream_chip(ss);
 	unsigned long flags;
+	int err;
 
 	if (ss->stream == SNDRV_PCM_STREAM_PLAYBACK) {
 		ss->runtime->hw = uad2_pcm_hw_playback;
 		spin_lock_irqsave(&dev->lock, flags);
 		dev->playback_ss = ss;
+		dev->open_count++;
 		spin_unlock_irqrestore(&dev->lock, flags);
 	} else {
 		ss->runtime->hw = uad2_pcm_hw_capture;
 		spin_lock_irqsave(&dev->lock, flags);
 		dev->capture_ss = ss;
+		dev->open_count++;
 		spin_unlock_irqrestore(&dev->lock, flags);
 	}
+
+	/* Tell ALSA that playback and capture share a clock source.
+	 * This sets matching sync IDs so userspace (PipeWire/PulseAudio)
+	 * knows the streams are phase-locked. */
+	snd_pcm_set_sync(ss);
+
+	/* Add constraint rule: period_size must match the hardware's
+	 * periodic timer interval for the selected sample rate.
+	 * This prevents ALSA from choosing a period_size that doesn't
+	 * match the actual interrupt cadence. */
+	err = snd_pcm_hw_rule_add(ss->runtime, 0,
+				  SNDRV_PCM_HW_PARAM_PERIOD_SIZE,
+				  uad2_rule_period_size, NULL,
+				  SNDRV_PCM_HW_PARAM_RATE, -1);
+	if (err < 0)
+		return err;
+
+	/* Add constraint rule: buffer_size must be exactly 8192 frames.
+	 * The hardware DMA ring buffer is fixed at 8192 frames and the
+	 * position counter wraps at that boundary. */
+	err = snd_pcm_hw_rule_add(ss->runtime, 0,
+				  SNDRV_PCM_HW_PARAM_BUFFER_SIZE,
+				  uad2_rule_buffer_size, NULL, -1);
+	if (err < 0)
+		return err;
+
+	/* Add constraint rule: periods = 8192 / period_size, since both
+	 * buffer_size and period_size are fixed by hardware. */
+	err = snd_pcm_hw_rule_add(ss->runtime, 0, SNDRV_PCM_HW_PARAM_PERIODS,
+				  uad2_rule_periods, NULL,
+				  SNDRV_PCM_HW_PARAM_PERIOD_SIZE, -1);
+	if (err < 0)
+		return err;
 
 	return 0;
 }
@@ -1832,13 +2055,47 @@ static int uad2_pcm_close(struct snd_pcm_substream *ss)
 {
 	struct uad2_dev *dev = snd_pcm_substream_chip(ss);
 	unsigned long flags;
+	int open_count;
 
 	spin_lock_irqsave(&dev->lock, flags);
 	if (ss->stream == SNDRV_PCM_STREAM_PLAYBACK)
 		dev->playback_ss = NULL;
 	else
 		dev->capture_ss = NULL;
+	dev->open_count--;
+	if (dev->open_count < 0)
+		dev->open_count = 0;
+	open_count = dev->open_count;
 	spin_unlock_irqrestore(&dev->lock, flags);
+
+	/* Following the snd-dice/snd-bebob pattern: only tear down the
+	 * shared transport when ALL substreams have been closed.
+	 *
+	 * This is the key fix for the PipeWire restart loop.  Previously,
+	 * hw_free would tear down the transport whenever streams_prepared
+	 * and streams_running both reached 0.  During PipeWire graph
+	 * reconfiguration (e.g., opening a second app), there's a brief
+	 * window where PipeWire stops and hw_free's both streams before
+	 * immediately re-preparing them.  That brief tear-down caused:
+	 *   1. Full DMA re-initialization (slow, 30-40s delays)
+	 *   2. Stale buffer data replayed ("DJ looping" effect)
+	 *
+	 * Now the transport stays alive as long as any substream is open.
+	 * PipeWire keeps substreams open during reconfiguration, so the
+	 * transport persists through stop→hw_free→prepare→start cycles. */
+	if (open_count == 0) {
+		int state = READ_ONCE(dev->transport_state);
+
+		if (state == 2) {
+			dev_dbg(&dev->pci->dev,
+				"pcm_close: last substream closed, stopping transport\n");
+			uad2_stop_transport(dev);
+		} else if (state == 1) {
+			dev_dbg(&dev->pci->dev,
+				"pcm_close: last substream closed, resetting transport to idle\n");
+			WRITE_ONCE(dev->transport_state, 0);
+		}
+	}
 
 	return 0;
 }
@@ -1879,6 +2136,7 @@ static int uad2_pcm_hw_free(struct snd_pcm_substream *ss)
 {
 	struct uad2_dev *dev = snd_pcm_substream_chip(ss);
 	struct snd_pcm_runtime *runtime = ss->runtime;
+	unsigned long flags;
 
 	/* Don't actually free — the DMA buffer belongs to the device.
 	 * Just clear the runtime pointers. */
@@ -1886,33 +2144,25 @@ static int uad2_pcm_hw_free(struct snd_pcm_substream *ss)
 	runtime->dma_addr = 0;
 	runtime->dma_bytes = 0;
 
-	/* Reset transport state when no streams are actively running.
+	/* Decrement the prepared-streams reference count if this substream
+	 * was counted (pcm_prepare was called).  The private_data flag is
+	 * set by pcm_prepare and cleared here to handle the case where
+	 * pcm_prepare is called multiple times without intervening hw_free.
 	 *
-	 * PipeWire probes the device by calling open → hw_params → prepare
-	 * → hw_free → close WITHOUT ever calling trigger(START).  This
-	 * leaves transport_state=1 (prepared), and all subsequent
-	 * pcm_prepare calls are skipped because of the state>=1 guard.
-	 *
-	 * When hw_free is called and no streams are running, the transport
-	 * is no longer needed — reset state so the next pcm_prepare
-	 * actually programs the hardware.
-	 *
-	 * If transport is running (state=2) with streams_running==0, that
-	 * indicates an inconsistent state — stop hardware defensively. */
-	if (READ_ONCE(dev->streams_running) <= 0) {
-		int state = READ_ONCE(dev->transport_state);
-
-		if (state == 2) {
-			dev_warn(
-				&dev->pci->dev,
-				"hw_free: transport running with no active streams, stopping\n");
-			uad2_stop_transport(dev);
-		} else if (state == 1) {
-			dev_dbg(&dev->pci->dev,
-				"hw_free: resetting transport_state from prepared to idle\n");
-			WRITE_ONCE(dev->transport_state, 0);
-		}
+	 * NOTE: We do NOT tear down the transport here.  Following the
+	 * snd-dice/snd-bebob pattern, transport lifecycle is tied to
+	 * pcm_open/pcm_close (via open_count), not to hw_params/hw_free.
+	 * This prevents the pathological PipeWire reconfiguration cycle
+	 * where a brief hw_free→prepare sequence would cause a full
+	 * transport teardown and re-initialization. */
+	spin_lock_irqsave(&dev->lock, flags);
+	if (runtime->private_data) {
+		runtime->private_data = NULL;
+		dev->streams_prepared--;
+		if (dev->streams_prepared < 0)
+			dev->streams_prepared = 0;
 	}
+	spin_unlock_irqrestore(&dev->lock, flags);
 
 	return 0;
 }
@@ -1941,6 +2191,7 @@ static int uad2_pcm_prepare(struct snd_pcm_substream *ss)
 	struct uad2_dev *dev = snd_pcm_substream_chip(ss);
 	struct snd_pcm_runtime *rt = ss->runtime;
 	unsigned int buffer_frames, irq_period_frames;
+	unsigned long flags;
 	int err;
 
 	/* Set sample rate on hardware (skip if rate unchanged) */
@@ -1951,6 +2202,22 @@ static int uad2_pcm_prepare(struct snd_pcm_substream *ss)
 				&dev->pci->dev,
 				"Sample rate set to %u may not have completed\n",
 				rt->rate);
+	}
+
+	/* Track that this substream has been prepared.
+	 * This reference is decremented in hw_free.  It prevents hw_free
+	 * on one substream from tearing down the transport that the other
+	 * substream still depends on.
+	 *
+	 * Only increment once per substream — ALSA allows pcm_prepare to
+	 * be called multiple times without intervening hw_free.  Use the
+	 * runtime private_data pointer as a boolean flag (non-NULL = already
+	 * counted in streams_prepared). */
+	if (!rt->private_data) {
+		spin_lock_irqsave(&dev->lock, flags);
+		dev->streams_prepared++;
+		spin_unlock_irqrestore(&dev->lock, flags);
+		rt->private_data = dev; /* mark as counted */
 	}
 
 	/* Always use the hardware-computed buffer frame size.
@@ -1968,6 +2235,13 @@ static int uad2_pcm_prepare(struct snd_pcm_substream *ss)
 	 * specific small values (8/16/32), NOT buffer_frames/8 (1024). */
 	irq_period_frames = uad2_irq_period_for_rate(rt->rate);
 	dev->irq_period_frames = irq_period_frames;
+
+	/* Periodic timer interval from kext CUAD2AudioMixer::StartTransport.
+	 * This controls the interrupt that actually drives audio processing.
+	 * Written to BAR+0x2270 and triggers vector 0x46 callbacks.
+	 * Values: 255 (48k), 511 (96k), 1023 (192k).  Represents N-1
+	 * where N is the number of frames between periodic interrupts. */
+	dev->periodic_timer_interval = uad2_periodic_timer_for_rate(rt->rate);
 
 	/* If transport is already running or prepared with the same parameters,
 	 * skip re-preparation.  This avoids the destructive stop-and-re-prepare
@@ -2002,7 +2276,16 @@ static int uad2_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
 	case SNDRV_PCM_TRIGGER_RESUME:
 		spin_lock_irqsave(&dev->lock, flags);
 		dev->streams_running++;
+		if (ss->stream == SNDRV_PCM_STREAM_PLAYBACK)
+			dev->playback_running = true;
+		else
+			dev->capture_running = true;
 		spin_unlock_irqrestore(&dev->lock, flags);
+		dev_dbg(&dev->pci->dev,
+			"trigger START: stream=%s streams_running=%d, transport_state=%d\n",
+			ss->stream == SNDRV_PCM_STREAM_PLAYBACK ? "play" :
+								  "cap",
+			dev->streams_running, READ_ONCE(dev->transport_state));
 		uad2_start_transport(dev);
 		return 0;
 
@@ -2010,6 +2293,10 @@ static int uad2_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
 	case SNDRV_PCM_TRIGGER_SUSPEND:
 		spin_lock_irqsave(&dev->lock, flags);
 		dev->streams_running--;
+		if (ss->stream == SNDRV_PCM_STREAM_PLAYBACK)
+			dev->playback_running = false;
+		else
+			dev->capture_running = false;
 		if (dev->streams_running <= 0) {
 			dev->streams_running = 0;
 			spin_unlock_irqrestore(&dev->lock, flags);
@@ -2158,18 +2445,30 @@ static irqreturn_t uad2_irq_hard(int irq, void *data)
 	if (!active)
 		return IRQ_NONE;
 
-	/* Step 3: Re-arm active vectors by writing back to status registers.
-	 * This must happen BEFORE dispatching to avoid missing interrupts
-	 * that fire during handler execution. */
-	uad2_write32(dev, REG_DMA0_STATUS, (u32)active);
-	if (dev->has_extended_irq && (u32)(active >> 32))
-		uad2_write32(dev, REG_DMA1_STATUS, (u32)(active >> 32));
+	/* Step 3: Write back ALL pending bits to status registers.
+	 *
+	 * The kext writes back the full pending bitmask, not just the
+	 * enabled (active) bits.  The hardware requires all pending
+	 * interrupt sources to be acknowledged by writing their bits
+	 * back to the status registers.  If we only write back the
+	 * active (enabled) bits, the unacknowledged bits keep the
+	 * interrupt line asserted, preventing new MSI edge-triggered
+	 * deliveries — so we'd only ever see one interrupt. */
+	uad2_write32(dev, REG_DMA0_STATUS, pending_lo);
+	if (dev->has_extended_irq && pending_hi)
+		uad2_write32(dev, REG_DMA1_STATUS, pending_hi);
 
 	/* Stash active bitmask for the threaded handler.
 	 * Use atomic OR so concurrent hardirqs accumulate bits. */
 	spin_lock(&dev->lock);
 	dev->irq_active |= active;
 	spin_unlock(&dev->lock);
+
+	/* Count periodic timer interrupts separately to avoid coalescing.
+	 * The bitmask OR above loses count when multiple periodic IRQs
+	 * fire before the thread runs. */
+	if (active & BIT_ULL(INTR_SLOT_PERIODIC))
+		atomic_inc(&dev->periodic_irq_count);
 
 	return IRQ_WAKE_THREAD;
 }
@@ -2184,6 +2483,7 @@ static irqreturn_t uad2_irq_thread(int irq, void *data)
 	struct uad2_dev *dev = data;
 	u64 active;
 	struct snd_pcm_substream *play_ss, *cap_ss;
+	int periodic_count, i;
 
 	/* Consume accumulated active bits */
 	spin_lock_irq(&dev->lock);
@@ -2198,31 +2498,63 @@ static irqreturn_t uad2_irq_thread(int irq, void *data)
 	if (active & BIT_ULL(INTR_SLOT_NOTIFY))
 		uad2_handle_notification(dev);
 
-	/* Period-elapsed interrupts (slot 62/63 = vectors 0x46/0x47) */
-	if (active &
-	    (BIT_ULL(INTR_SLOT_PERIODIC) | BIT_ULL(INTR_SLOT_ENDBUF))) {
-		u32 transport_status = uad2_read32(dev, REG_TRANSPORT_CTL);
+	/* Periodic timer interrupt (slot 62 = vector 0x46).
+	 *
+	 * This is the interrupt that drives audio processing in the kext.
+	 * The kext's mixer ProcessAudio only responds to callback ID 0x6d
+	 * (periodic timer), NOT 0x6c (end-of-buffer).
+	 *
+	 * IMPORTANT: The hardware periodic timer is one-shot-per-fire.
+	 * The kext's ServiceInterrupt unconditionally disables vector 0x46
+	 * in the CTRL register after it fires.  The deferred handler then
+	 * calls ResetPeriodicTimerInterrupt → EnableVector(0x46, 1) to
+	 * re-arm it for the next period.  We must do the same here.
+	 *
+	 * We use atomic_xchg to drain the periodic_irq_count and call
+	 * snd_pcm_period_elapsed() once per actual hardware interrupt.
+	 * With one-shot hardware, periodic_count should always be 1,
+	 * but the counter protects against edge cases. */
+	periodic_count = atomic_xchg(&dev->periodic_irq_count, 0);
+	if (periodic_count > 0) {
+		if (READ_ONCE(dev->streams_running) > 0) {
+			bool play_run, cap_run;
 
-		/* Check for DMA errors */
-		if (transport_status & BIT(7))
-			dev_warn_ratelimited(&dev->pci->dev, "DMA overflow\n");
-		if (transport_status & BIT(8))
-			dev_warn_ratelimited(&dev->pci->dev, "DMA underflow\n");
+			/* Snapshot substream pointers AND running flags under
+			 * lock to avoid race with trigger/open/close */
+			spin_lock_irq(&dev->lock);
+			play_ss = dev->playback_ss;
+			cap_ss = dev->capture_ss;
+			play_run = dev->playback_running;
+			cap_run = dev->capture_running;
+			spin_unlock_irq(&dev->lock);
 
-		/* Snapshot substream pointers under lock to avoid race
-		 * with uad2_pcm_open/close setting them to NULL */
-		spin_lock_irq(&dev->lock);
-		play_ss = dev->playback_ss;
-		cap_ss = dev->capture_ss;
-		spin_unlock_irq(&dev->lock);
+			/* Call period_elapsed N times — once for each hardware
+			 * periodic interrupt that was coalesced. */
+			for (i = 0; i < periodic_count; i++) {
+				if (play_ss && play_run)
+					snd_pcm_period_elapsed(play_ss);
+				if (cap_ss && cap_run)
+					snd_pcm_period_elapsed(cap_ss);
+			}
+		}
 
-		/* Notify ALSA of period elapsed (outside lock —
-		 * snd_pcm_period_elapsed takes its own lock) */
-		if (play_ss)
-			snd_pcm_period_elapsed(play_ss);
-		if (cap_ss)
-			snd_pcm_period_elapsed(cap_ss);
+		/* Re-arm the periodic timer vector (one-shot-per-fire).
+		 * This matches the kext's ResetPeriodicTimerInterrupt()
+		 * which calls EnableVector(0x46, 1) after ProcessAudio.
+		 * Must be done regardless of streams_running state — the
+		 * transport may still be active and we need to keep
+		 * receiving timer interrupts until StopTransport disables
+		 * the vector. */
+		if (READ_ONCE(dev->transport_state) == 2)
+			uad2_enable_vector(dev, INTR_SLOT_PERIODIC, true);
 	}
+
+	/* End-of-buffer interrupt (slot 63 = vector 0x47).
+	 * The kext mixer ignores this (callback ID 0x6c != 0x6d).
+	 * We keep it enabled as a transport lifecycle signal but do NOT
+	 * fire snd_pcm_period_elapsed from it.  Log for diagnostics. */
+	if (active & BIT_ULL(INTR_SLOT_ENDBUF))
+		dev_dbg(&dev->pci->dev, "End-of-buffer interrupt\n");
 
 	return IRQ_HANDLED;
 }
@@ -2457,6 +2789,7 @@ static int uad2_probe(struct pci_dev *pci, const struct pci_device_id *id)
 		goto err_free_irq;
 
 	dev->pcm->private_data = dev;
+	dev->pcm->info_flags = SNDRV_PCM_INFO_JOINT_DUPLEX;
 	snd_pcm_set_ops(dev->pcm, SNDRV_PCM_STREAM_PLAYBACK, &uad2_pcm_ops);
 	snd_pcm_set_ops(dev->pcm, SNDRV_PCM_STREAM_CAPTURE, &uad2_pcm_ops);
 
