@@ -2473,10 +2473,9 @@ static int uad2_probe(struct pci_dev *pci, const struct pci_device_id *id)
 		goto err_free_irq;
 
 	pci_set_drvdata(pci, dev);
-	dev_info(
-		&pci->dev,
-		"UAD2 initialized (v2026.302.4) — play=%uch rec=%uch buf=%u frames\n",
-		dev->play_channels, dev->rec_channels, dev->buffer_frames);
+	dev_info(&pci->dev,
+		 "UAD2 initialized — play=%uch rec=%uch buf=%u frames\n",
+		 dev->play_channels, dev->rec_channels, dev->buffer_frames);
 	return 0;
 
 err_free_irq:
