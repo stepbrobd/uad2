@@ -1,5 +1,5 @@
 {
-  inputs.nixpkgs.url = "github:nixos/nixpkgs/nixpkgs-unstable";
+  inputs.nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
   inputs.systems.url = "github:nix-systems/default";
   inputs.parts.url = "github:hercules-ci/flake-parts";
   inputs.parts.inputs.nixpkgs-lib.follows = "nixpkgs";
@@ -10,9 +10,9 @@
     flake.nixosModules.default = ./module.nix;
 
     perSystem = { lib, pkgs, ... }: {
-      packages.default = pkgs.callPackage ./default.nix { };
+      packages.default = pkgs.callPackage ./default.nix { linuxPackages = pkgs.linuxPackages_latest; };
+      devShells.default = pkgs.callPackage ./shell.nix { linuxPackages = pkgs.linuxPackages_latest; };
       checks.default = pkgs.testers.runNixOSTest ./test.nix;
-      devShells.default = pkgs.callPackage ./shell.nix { };
       formatter = pkgs.writeShellScriptBin "formatter" ''
         set -eoux pipefail
         shopt -s globstar
