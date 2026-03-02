@@ -7,7 +7,10 @@ stdenv.mkDerivation {
   pname = "uad2";
   version = with lib; pipe ./uad2.c [
     readFile
-    (match ''.*MODULE_VERSION\("([^"]+)"\).*'')
+    (splitString "\n")
+    (filter (hasPrefix "MODULE_VERSION"))
+    head
+    (match ''MODULE_VERSION\("([^"]+)"\);'')
     head
   ];
 
