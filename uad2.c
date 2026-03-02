@@ -266,6 +266,27 @@ static const char *const uad2_channel_type_names[] = {
 #define UAD2_CONNECT_RETRIES 10
 #define UAD2_CONNECT_WAIT_MS 100
 
+/* IRQ period lookup table from kext data segment @ 0x6020.
+ * _setSampleClock loads this value into this+0x2880, which
+ * PrepareTransport then writes to REG_IRQ_PERIOD (0x2258).
+ * The firmware uses this to determine the DMA notification interval. */
+static unsigned int uad2_irq_period_for_rate(unsigned int rate)
+{
+	switch (rate) {
+	case 44100:
+	case 48000:
+		return 8;
+	case 88200:
+	case 96000:
+		return 16;
+	case 176400:
+	case 192000:
+		return 32;
+	default:
+		return 8; /* safe fallback: base rate value */
+	}
+}
+
 /* ============================================================
  * Interrupt vector enable bitmask management
  *
@@ -1549,8 +1570,11 @@ static int uad2_prepare_transport(struct uad2_dev *dev,
 	/* 16. Read playback monitor status (flush) */
 	uad2_read32(dev, REG_PLAYBACK_MON_STAT);
 
-	/* 17. Playback monitor config (always enable for now) */
-	uad2_write32(dev, REG_PLAYBACK_MON_CFG, (play_channels - 1) | 0x100);
+	/* 17. Playback monitor config — SKIPPED for Apollo Solo.
+	 * The kext only writes this register when (diagnostic_flags & 0x2),
+	 * which is false for Apollo Solo (diagnostic_flags = 1).
+	 * Writing it unconditionally may confuse the firmware. */
+	/* uad2_write32(dev, REG_PLAYBACK_MON_CFG, (play_channels - 1) | 0x100); */
 
 	spin_unlock_irqrestore(&dev->lock, flags);
 
@@ -1728,8 +1752,8 @@ static void uad2_shutdown(struct uad2_dev *dev)
  * ============================================================ */
 /* The hardware DMA is completely rigid:
  *   - Buffer = 8192 frames (always, computed by _recomputeBufferFrameSize)
- *   - Period = 1024 frames (buffer_frames / 8, the IRQ interval)
- *   - 8 periods per buffer
+ *   - IRQ period = 8 frames at 48kHz (from kext rate lookup table @ 0x6020)
+ *   - 1024 periods per buffer (8192 / 8)
  *   - All channels interleaved, S32_LE, fixed channel count
  *
  * ALSA's buffer arithmetic (frames × channels × sample_size) must match
@@ -1741,13 +1765,19 @@ static void uad2_shutdown(struct uad2_dev *dev)
  * to force ALSA to use exactly the hardware's buffer geometry.
  * PipeWire/PulseAudio handle channel routing and resampling in software.
  *
- * Playback: 1024 frames × 42ch × 4B = 172032 bytes/period, 8 periods = 1376256 total
- * Capture:  1024 frames × 32ch × 4B = 131072 bytes/period, 8 periods = 1048576 total
+ * NOTE: The IRQ period varies by sample rate (8/16/32 for 1x/2x/4x rates).
+ * We use the smallest value (8) here so the constraints work for all rates.
+ * At higher rates, the actual period is larger but divides evenly into 8192.
+ *
+ * Playback: 8 frames × 42ch × 4B = 1344 bytes/period, 1024 periods = 1376256 total
+ * Capture:  8 frames × 32ch × 4B = 1024 bytes/period, 1024 periods = 1048576 total
  */
+#define UAD2_HW_PERIOD_FRAMES 8 /* IRQ period at base rate (48kHz) */
 #define UAD2_PLAY_PERIOD_BYTES \
-	(1024 * UAD2_OUT_CHANNELS * UAD2_BYTES_PER_SAMPLE)
-#define UAD2_CAP_PERIOD_BYTES (1024 * UAD2_IN_CHANNELS * UAD2_BYTES_PER_SAMPLE)
-#define UAD2_HW_PERIODS 8
+	(UAD2_HW_PERIOD_FRAMES * UAD2_OUT_CHANNELS * UAD2_BYTES_PER_SAMPLE)
+#define UAD2_CAP_PERIOD_BYTES \
+	(UAD2_HW_PERIOD_FRAMES * UAD2_IN_CHANNELS * UAD2_BYTES_PER_SAMPLE)
+#define UAD2_HW_PERIODS (UAD2_MAX_BUFFER_FRAMES / UAD2_HW_PERIOD_FRAMES)
 
 static const struct snd_pcm_hardware uad2_pcm_hw_playback = {
 	.info = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
@@ -1948,13 +1978,12 @@ static int uad2_pcm_prepare(struct snd_pcm_substream *ss)
 	 * the hardware cannot sustain interrupts at that rate. */
 	buffer_frames = dev->buffer_frames;
 
-	/* Compute IRQ period from the hardware buffer.  The kext uses
-	 * buffer_frames / 8 as the default period.  ALSA's period_size
-	 * is not directly usable here because it's computed for the
-	 * application's channel count, not the hardware's. */
-	irq_period_frames = buffer_frames / 8;
-	if (irq_period_frames == 0)
-		irq_period_frames = buffer_frames;
+	/* IRQ period value from the kext's rate-based lookup table.
+	 * _setSampleClock stores this in this+0x2880, PrepareTransport
+	 * writes it to REG_IRQ_PERIOD (0x2258).  The firmware expects
+	 * specific small values (8/16/32), NOT buffer_frames/8 (1024). */
+	irq_period_frames = uad2_irq_period_for_rate(rt->rate);
+	dev->irq_period_frames = irq_period_frames;
 
 	/* If transport is already running or prepared with the same parameters,
 	 * skip re-preparation.  This avoids the destructive stop-and-re-prepare
@@ -2634,4 +2663,4 @@ module_pci_driver(uad2_driver);
 MODULE_AUTHOR("Claude Opus 4.6 (Anthropic)");
 MODULE_DESCRIPTION("Universal Audio UAD2 Thunderbolt audio driver");
 MODULE_LICENSE("GPL");
-MODULE_VERSION("2026.302.3");
+MODULE_VERSION("2026.302.4");
