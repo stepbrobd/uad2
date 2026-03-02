@@ -464,7 +464,25 @@ channels) **Field written:** `this+0x287C` (bufferFrameSize)
 
 ## Transport Sequence
 
-### PrepareTransport (from `pcm_prepare`)
+The hardware has a **single shared transport** for both playback and capture
+directions. In macOS, CoreAudio's IOAudioEngine model starts/stops all streams
+atomically through a mixer layer, so the kext never encounters independent
+stream lifecycle. In ALSA, PipeWire opens playback and capture as independent
+streams, so the Linux driver must coordinate them:
+
+- **`pcm_prepare`** always uses `dev->buffer_frames` (8192, hardware-computed)
+  and `irq_period_frames = buffer_frames / 8`. ALSA's `runtime->buffer_size` is
+  in app-facing frames (e.g., 96 for stereo) and must NOT be used for the
+  hardware's interleaved DMA buffer. If the transport is already prepared or
+  running (`transport_state >= 1`), re-preparation is skipped entirely to avoid
+  destroying the other stream's active transport.
+- **`StartTransport`** treats `transport_state == 2` (already running) as a
+  no-op success — the second stream just piggybacks on the running transport.
+- **`StopTransport`** uses a `streams_running` reference counter (incremented on
+  START, decremented on STOP). The hardware is only stopped when the last stream
+  stops (counter reaches 0).
+
+### PrepareTransport (kext sequence)
 
 1. Check `transport_state != 2` (not already running)
 2. Check `is_connected == 1`
@@ -762,223 +780,6 @@ Full object layout (0x5F0 bytes total, from arm64 analysis):
 | `+0x2EF4`  | extended mode flag                     | For variant `0x9`                             |
 | `+0x22EF0` | large-offset DMA address storage       |                                               |
 
-## Driver Changelog
-
-### v2026.301.0 (Current)
-
-- Date-based versioning adopted
-- Two complete rounds of code review with all critical/important issues fixed
-- **Full cross-check against kext disassembly** — four parallel sub-agents
-  analyzed all major kext functions against the driver implementation
-- **Full cross-check against x86_64 kext** — confirmed register offsets, buffer
-  formula /2, DSP wait logic, device ID handshake across both architectures
-
-#### Session 2 Fixes (Critical)
-
-- **`uad2_dsp_wait_ready` loop logic corrected**: The kext loop treats BOTH
-  `0x00000000` AND `DSP_READY_SIG` (`0xa8caed0f`) as "still booting" — it
-  continues polling on either value. The loop only exits early when the value is
-  non-zero AND not equal to `DSP_READY_SIG`. Final success check is `val & 1`
-  (bit 0 must be set). DSP boot sequence:
-  `0 → 0xa8caed0f → final_val (bit 0
-  set)`. Confirmed identically in arm64
-  (`tbnz w20, #0x0`) and x86_64 (`testb $0x1, %r13b`)
-- **Connect handshake `connected` flag timing fixed**: The notification handler
-  checked `dev->connected` and returned early if false, but Connect() set
-  `connected = false` before the doorbell loop. This meant the IRQ-driven
-  notification path was dead during the entire handshake. Fixed to match kext
-  behavior: set `connected = true` BEFORE the doorbell loop (kext sets
-  `this+0x2898 = 1` at the same point)
-- **`uad2_remove` shutdown ordering fixed**: `uad2_shutdown()` and
-  `REG_INTR_ENABLE` disable now happen BEFORE setting `disconnecting = true`, so
-  the MMIO writes actually reach the hardware instead of being silently dropped
-
-#### Session 2 Fixes (Important)
-
-- **Completion-based `_setSampleClock`**: Replaced polling loop with
-  completion-based wait matching kext behavior — uses `reinit_completion` +
-  `wait_for_completion_timeout(2000ms)`. The rate_event is signaled by bit 5 in
-  the notification ISR (same bit as connect_event — both completions are
-  signaled, only the waited-on one wakes)
-- **Full IO descriptor copy**: Notification handler now copies all 72 DWORDs
-  from `BAR+0xC2C4` (playback) and `BAR+0xC1A4` (record) into
-  `dev->play_io_desc[]` / `dev->rec_io_desc[]` arrays, matching kext behavior
-- **Channel config copy on bit 21**: Notification handler copies 10 DWORDs from
-  `BAR+0xC000` into `dev->chan_config[]` on `NOTIFY_CHAN_CONFIG`, then forces
-  bits 0, 1, and 22 (matching kext's `orr w20, w20, #0x00400003`)
-- **Added `rate_event` completion**: New `struct completion rate_event` in
-  `uad2_dev`, initialized in probe, signaled alongside `connect_event` in
-  notification handler on bit 5
-
-#### Cross-Check Fixes (Critical)
-
-- **Interrupt vector-to-slot mapping rewritten**: Renamed `dual_dma` →
-  `has_extended_irq = true`, renamed `INTR_VEC_*` → `INTR_SLOT_*` (32, 62, 63).
-  IRQ handler now reads BOTH DMA0 and DMA1 status registers and combines into
-  u64 `pending` before masking with `intr_enable_shadow`
-- **IO descriptor reads use flat BAR offsets**: Removed incorrect
-  `uad2_fw_reg()` wrapper from `REG_PLAYBACK_IO_DESC` and `REG_RECORD_IO_DESC`
-  reads — these registers do NOT use the `channel_base_index << 2` shift
-- **DSP poll address uses separate base**: Added `dsp_poll_base` computation
-  (`BAR + dsp_index * 0x800`), distinct from `ring_base`
-  (`BAR + 0x2000 +
-  dsp_index * 0x80`). For DSP 0: polls `BAR+0x1A4` not
-  `BAR+0x21A4`
-
-#### Cross-Check Fixes (High)
-
-- **Buffer frame formula includes /2**: Added divide-by-2 before
-  `rounddown_pow_of_two()` — matches kext's `ubfx x8, x8, #1, #31` at 0x4DA1C
-- **DSP wait always called**: Was conditional on wrong `dsp_type == 0`; kext
-  calls `_waitFor469ToStart` when `dsp_type == 1` (which is the expected value
-  for Apollo Solo's SHARC DSP)
-
-#### Cross-Check Fixes (Significant)
-
-- **Bit 21 forces bit 22**: `NOTIFY_CHAN_CONFIG` now also ORs
-  `NOTIFY_RATE_CHANGE`, matching kext's `orr w20, w20, #0x00400003` which sets
-  bits 0, 1, AND 22
-- **HW lock around Connect doorbell**: `spin_lock_irqsave` around doorbell write
-  - `REG_STREAM_ENABLE` write, matching kext's `hw_lock` pattern at
-    `this+0x2888`
-- **DSP interrupt vectors 2,3,4 enabled**: After DSP ring programming, the kext
-  enables `dsp_index*5+{2,3,4}` for error/FIFO callbacks
-
-#### Cross-Check Fixes (Previously Applied, Verified Correct)
-
-- Device ID handshake: writes `0` to `0x2220` (not echoing to `0x2218`)
-- DMA reset: assert/deassert pulse pattern (not double-write)
-- DMA1 register roles: `0x2264` = status, `0x2268` = ctrl (swapped vs DMA0)
-- `dma_ctrl_shadow` initialized to `0x1` (master enable bit)
-
-#### Cross-Check Fixes (Minor)
-
-- Ring capacity: values `>= 0x400` are zeroed (not capped), matching kext
-- TransportPosition clamp: kept `>=` (stricter than kext's `>`) with comment
-
-#### Cross-Check Items NOT Applied (Low Priority)
-
-- **#13**: Missing HW lock in ProgramRegisters — kext holds lock through SG
-  table programming. Only matters during init (sequential), low risk
-- **#15**: PrepareTransport diagnostic_flags adjustments — conditional
-  adjustments to buf_size_kb, channel counts, monitor config based on diagnostic
-  flags bits 1–2. Not needed for normal operation
-- **#17**: DMA ready poll count — kext does max 2 polls with sleep skip before
-  first; Linux does 3. Minor timing difference
-- **#18**: StartTransport variant — kext uses `0x20F` when `extended_mode==0`,
-  not when set. Comment is backwards but code may be correct for Apollo Solo
-- **#20**: DSP ProgramRegisters intermediate capability read — kext does
-  `tst w0, #0x7f` before calling `_waitFor469ToStart`, skipped in Linux (always
-  calls wait)
-
-#### Previous Review Fixes
-
-- R1 (Critical): Added `snd_card_disconnect()` early in `uad2_remove()` to
-  prevent ALSA ops racing with teardown
-- R2 (Critical): Added `disconnecting` flag + `READ_ONCE` guard in
-  `uad2_read32`/`uad2_write32` (MMIO becomes no-op on removal). IRQ handler
-  checks for `0xFFFFFFFF` sentinel (hot-unplug detection)
-- R3/I4 (Critical): `uad2_clock_source_put()` rejects changes with `-EBUSY` when
-  transport is running
-- R4: `uad2_start_transport()` validates `transport_state == 1` and `connected`
-  before writing hardware
-- R5: `uad2_pcm_prepare()` skips `uad2_set_sample_rate()` if rate unchanged
-- R6: DMA-ready poll reduced from 200 iterations to 3 (matching kext's ~2
-  retries)
-- R12: Removed unnecessary `{}` block scope for firmware base address read
-- R14: `period_bytes_min` increased from 256 to 4096
-- R17: PCI ID table sentinel `{ 0 }` → `{ }`
-
-### v0.6.0
-
-- Removed redundant `.ioctl = snd_pcm_lib_ioctl` from `snd_pcm_ops`
-- Added `sync_stop` callback: `uad2_pcm_sync_stop()` calls `synchronize_irq()`
-  to drain in-flight IRQ handlers before stream close (prevents UAF)
-- Fixed IRQ handler race: `playback_ss`/`capture_ss` now protected by
-  `dev->lock` spinlock in open/close, snapshotted under lock in
-  `uad2_irq_handler()`
-- Debug instrumentation: upgraded `dev_dbg` → `dev_info` for first-boot
-  debugging (notification handler status, connect ack, channel config, channel
-  counts, ring capacity, DSP ring base, DMA ready poll, transport prepare
-  summary, per-channel connect outcome)
-- Channel mapping decode and logging: added `uad2_channel_type_names[]` table
-  (15 entries), `IO_DESC_CHAN_OFFSET` constant, `uad2_log_channel_map()`
-  function that reads uint16 descriptors from firmware and logs decoded
-  type/sub-index per channel. Called after successful `uad2_audio_connect()` for
-  both playback and record directions
-- Fixed use-after-free in `uad2_remove()`: reordered `free_irq()` before
-  `snd_card_free()`, freed DMA buffers while dev is still alive
-- Fixed race conditions: `transport_state` and `connected` flag now use
-  `READ_ONCE`/`WRITE_ONCE` for proper data-race annotation; `transport_state`
-  writes moved under `dev->lock` where possible
-- Fixed race on `play_channels`/`rec_channels`: writes in notification handler
-  now use `WRITE_ONCE`, reads in `pcm_prepare` use `READ_ONCE`
-- Interrupt vector enable/disable now self-locking: `uad2_enable_vector()` and
-  `uad2_disable_vector()` take `dev->lock` internally;
-  `__uad2_enable_vector_locked()`/`__uad2_disable_vector_locked()` for callers
-  already holding the lock
-- Fixed `pcm_prepare` clobbering device-global `buffer_frames`: now uses local
-  variables instead of writing back to `dev->buffer_frames`
-- Fixed ring capacity clamp logic: values > `0x400` now capped to `0x400`
-  instead of incorrectly clamped to 0
-- Added `uad2_shutdown()` call in probe error path after partial `hw_program` to
-  clean up partially-initialized hardware state
-- Fixed pointer format leak: `%px` → BAR-relative offsets in DSP ring log,
-  removed virtual address logging from SG buffer allocation
-- Removed redundant `memset` after `dma_alloc_coherent` (returns zeroed memory)
-- Reordered `pci_set_master()` after `dma_set_mask_and_coherent()` in probe
-- `MODULE_LICENSE` changed from `"GPL v2"` to canonical `"GPL"`
-
-### v0.5.0
-
-- Renamed from `apollo_solo` → `uad2` throughout (generic for all UA Thunderbolt
-  devices)
-- PCI ID table extensible for multiple devices (Apollo Twin, x4, x6, etc.)
-
-### v0.4.0
-
-- Proper interrupt vector management: `uad2_enable_vector()` /
-  `uad2_disable_vector()` with 64-bit enable shadow bitmask (mirrors
-  `IntrManager+0x20`)
-- Vector lifecycle: `0x28` enabled in `ProgramRegisters` / disabled in
-  `Shutdown`, `0x46` enabled in `PrepareTransport` if periodic timer configured,
-  `0x47` enabled after DMA ready poll / disabled at start of `StopTransport`
-- Full Shutdown sequence (`uad2_shutdown`): stops transport, clears doorbell,
-  disables notification vector, disconnects — replaces ad-hoc teardown in
-  `remove()`
-- Transport state tracking (0=uninit, 1=prepared, 2=running)
-- `notify_lock` spinlock protecting notification handler (mirrors kext
-  `this+0x2890`)
-- Locking in `PrepareTransport`/`StartTransport`/`StopTransport` (`hw_lock`
-  under spinlock)
-- ALSA mixer controls: Clock Source (Internal/S/PDIF) and Current Sample Rate
-  (read-only)
-- Clock source configurable via mixer; applied in `_setSampleClock` register
-
-### v0.3.0
-
-- Full register map including SG tables (`0x8000–0xBFFF`), firmware base
-  (`0x30/0x34`), notification status (`0xC008`), and all firmware mailbox
-  registers
-- Two 4 MB DMA buffer allocation (scatter-gather source for playback + capture)
-- SG table programming: 1024-entry loop writing 64-bit phys addrs to
-  `BAR+0x8000/0xA000`
-- Firmware base address read from `BAR+0x30/0x34`
-- Global interrupt enable (`BAR+0x0014 = 0xFFFFFFFF`)
-- Full Connect handshake with proper doorbell address, `notifyEvent` via Linux
-  completion, manual notification polling on timeout
-- Notification interrupt handler with full event dispatch
-- Dynamic buffer frame size computation: `floor_pow2(4MB / (max_ch * 4))`, cap
-  8192
-- ALSA PCM buffer mapped directly to 4 MB HW DMA buffer (zero-copy)
-- `PrepareTransport` with DMA ready poll (`BAR+0x2254`)
-- Playback monitor config (`BAR+0x224C`)
-- `channel_base_index = 10` (confirmed from binary data segment @ `0x6018`)
-- Transport start/stop (`0xF` / `0x0` to `BAR+0x2248`)
-- Proper `remove()` with disconnect (`0x10`), secondary counter clear, interrupt
-  disable
-- Corrected format: S32_LE, 42 output / 32 input channels
-
 ## Known Limitations
 
 - **Single MSI vector mode** — hardware has 3 vectors; all currently handled on
@@ -988,13 +789,12 @@ Full object layout (0x5F0 bytes total, from arm64 analysis):
 - **No ALSA mixer controls** for monitor routing (clock source selection IS
   implemented)
 - **No firmware version verification**
-- **No power management** / suspend-resume support
 - **No PCIe error handlers** (`pci_error_handlers`)
 - **No Thunderbolt hot-unplug safety** — device may disappear mid-DMA (partial
   mitigation via `disconnecting` flag and `0xFFFFFFFF` sentinel check)
 - **Channel mapping predicted but NOT verified** on live hardware
-- **`uad2_audio_connect()` doesn't fail** on individual channel timeouts
-  (deferred — needs hardware)
+- **No rate change while running** — changing sample rate while either stream is
+  active requires stopping the shared transport, which is not yet coordinated
 - **Excessive `dev_info` logging** in notification handler (intentionally left
   for first-boot debugging)
 
@@ -1120,7 +920,7 @@ otool -v -s __TEXT_EXEC __text bin/aarch64-darwin/uad2.kext > bin/aarch64-darwin
 
 | File                                | Description                                                                                                                                 |
 | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| `uad2.c`                            | Main driver source (~2338 lines) — PCI probe/remove, ALSA PCM ops, interrupt handling, DMA, firmware connect, transport, mixer, channel map |
+| `uad2.c`                            | Main driver source (~2550 lines) — PCI probe/remove, ALSA PCM ops, interrupt handling, DMA, firmware connect, transport, mixer, channel map |
 | `Makefile`                          | Standard out-of-tree kernel module Makefile (uses `KDIR` from env)                                                                          |
 | `Kbuild`                            | `obj-m := uad2.o`                                                                                                                           |
 | `flake.nix`                         | Nix flake providing build environment                                                                                                       |
