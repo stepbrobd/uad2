@@ -144,10 +144,10 @@ All registers are BAR-relative offsets, 32-bit MMIO.
 | `0x2240` | Buffer Frame Size             | W      | Write `bufferFrameSize - 1` (hardware mask)                                                                                                                                                                 |
 | `0x2244` | DMA Position Counter          | R/W    | Read: current frame position (wrapping counter, not byte offset). Write `0` to clear. If `pos > bufferFrameSize`, clamp to 0                                                                                |
 | `0x2248` | Transport Control             | R/W    | State machine: `0x000`=stop/reset, `0x001`=armed/prepared, `0x00F`=running (normal), `0x20F`=running (extended, device variants `0xA`/`0x9`). Read status bits: bit5=running, bit7=overflow, bit8=underflow |
-| `0x224C` | Playback Monitor Config       | W      | Write `(totalPlayChans - 1) \| 0x100`                                                                                                                                                                       |
+| `0x224C` | Playback Monitor Config       | W      | Write `(totalPlayChans - 1) \| 0x100` — **only when `diagnostic_flags & 0x2`** (Apollo Solo: skipped, flags=1)                                                                                               |
 | `0x2250` | Playback Channel Count        | W      | Total playback channels                                                                                                                                                                                     |
-| `0x2254` | Poll Status                   | R      | Poll for DMA ready (compare vs `irq_period`)                                                                                                                                                                |
-| `0x2258` | Interrupt Period              | W      | IRQ period in frames                                                                                                                                                                                        |
+| `0x2254` | Poll Status                   | R      | Poll for DMA ready (compare vs `irq_period`). Read-only; firmware populates after arm.                                                                                                                      |
+| `0x2258` | Interrupt Period              | W      | IRQ period value from rate lookup table: 8 (44.1/48k), 16 (88.2/96k), 32 (176.4/192k). **Not** buffer_frames/N.                                                                                            |
 | `0x225C` | Record Channel Count          | W      | Record channels (+1 if monitor bit set)                                                                                                                                                                     |
 | `0x2260` | Stream Enable / Clock Trigger | W      | `0x1`=start, `0x10`=stop/disconnect, `0x4`=clock change                                                                                                                                                     |
 
@@ -471,11 +471,13 @@ stream lifecycle. In ALSA, PipeWire opens playback and capture as independent
 streams, so the Linux driver must coordinate them:
 
 - **`pcm_prepare`** always uses `dev->buffer_frames` (8192, hardware-computed)
-  and `irq_period_frames = buffer_frames / 8`. ALSA's `runtime->buffer_size` is
-  in app-facing frames (e.g., 96 for stereo) and must NOT be used for the
-  hardware's interleaved DMA buffer. If the transport is already prepared or
-  running (`transport_state >= 1`), re-preparation is skipped entirely to avoid
-  destroying the other stream's active transport.
+  and `irq_period_frames` from the kext's rate-based lookup table (`_setSampleClock`
+  stores this in `this+0x2880`): 8 at 44.1/48 kHz, 16 at 88.2/96 kHz, 32 at
+  176.4/192 kHz. ALSA's `runtime->buffer_size` is in app-facing frames (e.g., 96
+  for stereo) and must NOT be used for the hardware's interleaved DMA buffer.
+  If the transport is already prepared or running (`transport_state >= 1`),
+  re-preparation is skipped entirely to avoid destroying the other stream's
+  active transport.
 - **`StartTransport`** treats `transport_state == 2` (already running) as a
   no-op success — the second stream just piggybacks on the running transport.
 - **`StopTransport`** uses a `streams_running` reference counter (incremented on
@@ -509,6 +511,28 @@ streams, so the Linux driver must coordinate them:
 20. Poll `BAR+0x2254` until `== irqPeriod` (DMA ready, max ~2 retries with 1 ms
     sleep)
 21. `EnableVector(0x47, 1)` (enable end-of-buffer interrupt)
+
+### IRQ Period Lookup Table
+
+The `irqPeriod` value written to `BAR+0x2258` in step 12 above comes from a
+rate-based lookup table in the kext data segment (@ `0x6020` in the ARM64
+binary). `_setSampleClock` loads the value into `this+0x2880`, and
+`PrepareTransport` writes it to the register. The firmware uses this to
+determine the DMA notification interval.
+
+| Sample Rate  | IRQ Period Value |
+| ------------ | ---------------- |
+| 44100 Hz     | 8                |
+| 48000 Hz     | 8                |
+| 88200 Hz     | 16               |
+| 96000 Hz     | 16               |
+| 176400 Hz    | 32               |
+| 192000 Hz    | 32               |
+
+**Critical:** The firmware expects these specific small values, NOT computed
+values like `buffer_frames / 8` (= 1024). Writing 1024 causes the DMA engine
+to never start — `REG_POLL_STATUS` (`0x2254`) stays at 0, and the transport
+never enters the running state.
 
 ### StartTransport (@ line 71904)
 
@@ -761,7 +785,7 @@ Full object layout (0x5F0 bytes total, from arm64 analysis):
 | `+0x2870`  | end-buffer callback context            |                                               |
 | `+0x2878`  | `transport_state`                      | 0=uninit, 1=prepared, 2=running               |
 | `+0x287C`  | `bufferFrameSize`                      | Computed by `_recomputeBufferFrameSize`       |
-| `+0x2880`  | `interrupt_period`                     | Frames                                        |
+| `+0x2880`  | `interrupt_period`                     | Rate-based: 8/16/32 for 1x/2x/4x rates       |
 | `+0x2888`  | `hw_spinlock` #2                       |                                               |
 | `+0x2890`  | notification spinlock                  | Guards `_handleNotificationInterrupt`         |
 | `+0x2898`  | notification active flag               | Must be non-zero to process events            |
@@ -769,7 +793,7 @@ Full object layout (0x5F0 bytes total, from arm64 analysis):
 | `+0x28A8`  | DMA Buffer B pointer                   | Capture, 4 MB — set in `MapHardware`          |
 | `+0x28B0`  | `device_variant_id` / constant `0xC`   | Set in `Connect`                              |
 | `+0x28B4`  | `current_sample_rate`                  | Enum                                          |
-| `+0x28B8`  | `diagnostic_flags`                     | bit1,2 = monitor enable                       |
+| `+0x28B8`  | `diagnostic_flags`                     | Init=1 for all devices. bit1: enable `0x224C` write; bit2: monitor channel adjust. Apollo Solo: flags=1, so `0x224C` write is **skipped**. |
 | `+0x28BC`  | `diagnostic_status`                    |                                               |
 | `+0x28C0`  | `periodic_timer_interval`              | Frames                                        |
 | `+0x28C8`  | firmware base address                  | 64-bit, from `BAR+0x30/0x34`                  |

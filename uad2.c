@@ -783,9 +783,9 @@ static int uad2_dsp_wait_ready(struct uad2_dev *dev,
 	 * arm64: tbnz w20, #0x0, <success>
 	 * x86_64: testb $0x1, %r13b; jne <success> */
 	if (val & 1) {
-		dev_info(&dev->pci->dev,
-			 "DSP %d ready after %d polls (val=0x%08x)\n",
-			 dsp_index, i + 1, val);
+		dev_dbg(&dev->pci->dev,
+			"DSP %d ready after %d polls (val=0x%08x)\n", dsp_index,
+			i + 1, val);
 		return 0;
 	}
 
@@ -825,8 +825,7 @@ static int uad2_ring_program(struct uad2_dev *dev, void __iomem *ring_base,
 		ring_size = 0;
 	}
 
-	dev_info(&dev->pci->dev, "Ring %d capacity=0x%x\n", ring_idx,
-		 ring_size);
+	dev_dbg(&dev->pci->dev, "Ring %d capacity=0x%x\n", ring_idx, ring_size);
 
 	/* Program ring size and descriptor count */
 	iowrite32(ring_size, ring_base + DSP_RING_SIZE_REG);
@@ -893,8 +892,7 @@ static int uad2_dsp_program(struct uad2_dev *dev, int dsp_index)
 	else
 		dsp_poll_base = dev->bar + 0x2000 + (dsp_index * 0x800);
 
-	dev_info(
-		&dev->pci->dev,
+	dev_dbg(&dev->pci->dev,
 		"DSP %d ring_base=BAR+0x%04lx ring2=BAR+0x%04lx poll=BAR+0x%04lx\n",
 		dsp_index, (unsigned long)(ring_base - dev->bar),
 		(unsigned long)(ring2_base - dev->bar),
@@ -978,8 +976,8 @@ static int uad2_alloc_sg_buffers(struct uad2_dev *dev)
 			return -ENOMEM;
 		}
 		/* dma_alloc_coherent returns zeroed memory */
-		dev_info(&dev->pci->dev, "SG buffer %d: dma=%pad size=0x%zx\n",
-			 i, &dev->sg_dma_addr[i], dev->sg_buf_size);
+		dev_dbg(&dev->pci->dev, "SG buffer %d: dma=%pad size=0x%zx\n",
+			i, &dev->sg_dma_addr[i], dev->sg_buf_size);
 	}
 
 	return 0;
@@ -1057,16 +1055,15 @@ static int uad2_audio_ext_program(struct uad2_dev *dev)
 		sg_offset += SG_ENTRY_SIZE;
 	}
 
-	dev_info(
-		&dev->pci->dev,
+	dev_dbg(&dev->pci->dev,
 		"Scatter-gather tables programmed: %u entries, play_dma=%pad cap_dma=%pad\n",
 		SG_NUM_ENTRIES, &dev->sg_dma_addr[0], &dev->sg_dma_addr[1]);
 
 	/* Phase 3: Read firmware base address (BAR+0x30 lo, BAR+0x34 hi) */
 	dev->fw_base_addr = ((u64)uad2_read32(dev, REG_FW_BASE_HI) << 32) |
 			    uad2_read32(dev, REG_FW_BASE_LO);
-	dev_info(&dev->pci->dev, "Firmware base address: 0x%016llx\n",
-		 dev->fw_base_addr);
+	dev_dbg(&dev->pci->dev, "Firmware base address: 0x%016llx\n",
+		dev->fw_base_addr);
 
 	/* Phase 4: Enable interrupt vector 0x28 (notification interrupt)
 	 *
@@ -1120,7 +1117,7 @@ static void uad2_handle_notification(struct uad2_dev *dev)
 
 	dev->notify_status = status;
 
-	dev_info(&dev->pci->dev, "Notification: 0x%08x\n", status);
+	dev_dbg(&dev->pci->dev, "Notification: 0x%08x\n", status);
 
 	/* Bit 5: Connect/rate-change ack.
 	 * The kext has two separate CUAOS::Event objects both signaled
@@ -1129,7 +1126,7 @@ static void uad2_handle_notification(struct uad2_dev *dev)
 	 * We signal both completions here — only the one being waited
 	 * on will actually wake a thread. */
 	if (status & NOTIFY_CONNECT_ACK) {
-		dev_info(&dev->pci->dev, "Connect/rate ack received\n");
+		dev_dbg(&dev->pci->dev, "Connect/rate ack received\n");
 		complete(&dev->connect_event);
 		complete(&dev->rate_event);
 	}
@@ -1140,7 +1137,7 @@ static void uad2_handle_notification(struct uad2_dev *dev)
 	if (status & NOTIFY_CHAN_CONFIG) {
 		int i;
 
-		dev_info(&dev->pci->dev, "Channel config update\n");
+		dev_dbg(&dev->pci->dev, "Channel config update\n");
 
 		/* Copy 10 DWORDs of channel config from BAR+0xC000 */
 		for (i = 0; i < CHAN_CONFIG_DWORDS; i++)
@@ -1167,8 +1164,8 @@ static void uad2_handle_notification(struct uad2_dev *dev)
 		play_ch = dev->play_io_desc[4];
 		if (play_ch > 0 && play_ch <= 128) {
 			WRITE_ONCE(dev->play_channels, play_ch);
-			dev_info(&dev->pci->dev, "Playback channels: %u\n",
-				 play_ch);
+			dev_dbg(&dev->pci->dev, "Playback channels: %u\n",
+				play_ch);
 		}
 	}
 
@@ -1186,8 +1183,8 @@ static void uad2_handle_notification(struct uad2_dev *dev)
 		rec_ch = dev->rec_io_desc[4];
 		if (rec_ch > 0 && rec_ch <= 128) {
 			WRITE_ONCE(dev->rec_channels, rec_ch);
-			dev_info(&dev->pci->dev, "Record channels: %u\n",
-				 rec_ch);
+			dev_dbg(&dev->pci->dev, "Record channels: %u\n",
+				rec_ch);
 		}
 	}
 
@@ -1249,8 +1246,8 @@ static void uad2_log_channel_map(struct uad2_dev *dev, const char *dir,
 
 	desc_reg = io_desc_base + IO_DESC_CHAN_OFFSET;
 
-	dev_info(&dev->pci->dev, "%s channel map (%u channels):\n", dir,
-		 num_channels);
+	dev_dbg(&dev->pci->dev, "%s channel map (%u channels):\n", dir,
+		num_channels);
 
 	/* Read uint16 descriptors — two per 32-bit register read */
 	for (i = 0; i < num_channels; i += 2) {
@@ -1263,8 +1260,8 @@ static void uad2_log_channel_map(struct uad2_dev *dev, const char *dir,
 					    uad2_channel_type_names[type0] :
 					    "?";
 
-		dev_info(&dev->pci->dev, "  ch %2u: type=%2u sub=%u (%s)\n", i,
-			 type0, sub0, name0);
+		dev_dbg(&dev->pci->dev, "  ch %2u: type=%2u sub=%u (%s)\n", i,
+			type0, sub0, name0);
 
 		if (i + 1 < num_channels) {
 			u8 type1 = desc1 >> 8;
@@ -1274,9 +1271,9 @@ static void uad2_log_channel_map(struct uad2_dev *dev, const char *dir,
 					uad2_channel_type_names[type1] :
 					"?";
 
-			dev_info(&dev->pci->dev,
-				 "  ch %2u: type=%2u sub=%u (%s)\n", i + 1,
-				 type1, sub1, name1);
+			dev_dbg(&dev->pci->dev,
+				"  ch %2u: type=%2u sub=%u (%s)\n", i + 1,
+				type1, sub1, name1);
 		}
 	}
 }
@@ -1586,12 +1583,12 @@ static int uad2_prepare_transport(struct uad2_dev *dev,
 	for (i = 0; i < 3; i++) {
 		u32 poll_val = uad2_read32(dev, REG_POLL_STATUS);
 
-		dev_info(&dev->pci->dev,
-			 "DMA poll %d: REG_POLL_STATUS=0x%x (expect 0x%x)\n", i,
-			 poll_val, irq_period_frames);
+		dev_dbg(&dev->pci->dev,
+			"DMA poll %d: REG_POLL_STATUS=0x%x (expect 0x%x)\n", i,
+			poll_val, irq_period_frames);
 		if (poll_val == irq_period_frames) {
-			dev_info(&dev->pci->dev, "DMA ready after %d polls\n",
-				 i + 1);
+			dev_dbg(&dev->pci->dev, "DMA ready after %d polls\n",
+				i + 1);
 			break;
 		}
 		usleep_range(1000, 2000);
@@ -1600,8 +1597,7 @@ static int uad2_prepare_transport(struct uad2_dev *dev,
 	/* 21. Enable end-of-buffer interrupt vector */
 	uad2_enable_vector(dev, INTR_SLOT_ENDBUF, true);
 
-	dev_info(
-		&dev->pci->dev,
+	dev_dbg(&dev->pci->dev,
 		"Transport prepared: buf=%u irq=%u play=%u rec=%u intr_shadow=0x%llx\n",
 		buffer_frames, irq_period_frames, play_channels, rec_channels,
 		dev->intr_enable_shadow);
@@ -1661,18 +1657,6 @@ static void uad2_start_transport(struct uad2_dev *dev)
 	uad2_write32(dev, REG_TRANSPORT_CTL, 0xF);
 	WRITE_ONCE(dev->transport_state, 2);
 	spin_unlock_irqrestore(&dev->lock, flags);
-
-	{
-		u32 readback = uad2_read32(dev, REG_TRANSPORT_CTL);
-		u32 dma1_stat = uad2_read32(dev, REG_DMA1_STATUS);
-		u32 dma1_ctrl = uad2_read32(dev, REG_DMA1_INTR_CTRL);
-		u32 dma_pos = uad2_read32(dev, REG_DMA_POSITION);
-
-		dev_info(
-			&dev->pci->dev,
-			"StartTransport: wrote 0xF, readback=0x%08x dma1_stat=0x%08x dma1_ctrl=0x%08x pos=%u\n",
-			readback, dma1_stat, dma1_ctrl, dma_pos);
-	}
 }
 
 /* ============================================================
@@ -2210,22 +2194,6 @@ static irqreturn_t uad2_irq_thread(int irq, void *data)
 	if (!active)
 		return IRQ_NONE;
 
-	/* Diagnostic: dump key registers on every IRQ while transport is
-	 * running, so we can see what the hardware is actually doing.
-	 * Read DMA1 status/ctrl, transport ctl, and DMA position. */
-	if (READ_ONCE(dev->transport_state) == 2) {
-		u32 dma1_stat = uad2_read32(dev, REG_DMA1_STATUS);
-		u32 dma1_ctrl = uad2_read32(dev, REG_DMA1_INTR_CTRL);
-		u32 transport = uad2_read32(dev, REG_TRANSPORT_CTL);
-		u32 dma_pos = uad2_read32(dev, REG_DMA_POSITION);
-
-		dev_info_ratelimited(
-			&dev->pci->dev,
-			"IRQ diag: active=0x%llx dma1_stat=0x%08x dma1_ctrl=0x%08x transport=0x%08x pos=%u shadow_hi=0x%08x\n",
-			active, dma1_stat, dma1_ctrl, transport, dma_pos,
-			(u32)(dev->intr_enable_shadow >> 32));
-	}
-
 	/* Notification interrupt (slot 32 = vector 0x28) */
 	if (active & BIT_ULL(INTR_SLOT_NOTIFY))
 		uad2_handle_notification(dev);
@@ -2234,14 +2202,6 @@ static irqreturn_t uad2_irq_thread(int irq, void *data)
 	if (active &
 	    (BIT_ULL(INTR_SLOT_PERIODIC) | BIT_ULL(INTR_SLOT_ENDBUF))) {
 		u32 transport_status = uad2_read32(dev, REG_TRANSPORT_CTL);
-		u32 dma_pos = uad2_read32(dev, REG_DMA_POSITION);
-
-		dev_info_ratelimited(
-			&dev->pci->dev,
-			"period IRQ: active=0x%llx transport=0x%x pos=%u play=%p cap=%p\n",
-			active, transport_status, dma_pos,
-			READ_ONCE(dev->playback_ss),
-			READ_ONCE(dev->capture_ss));
 
 		/* Check for DMA errors */
 		if (transport_status & BIT(7))
@@ -2515,7 +2475,7 @@ static int uad2_probe(struct pci_dev *pci, const struct pci_device_id *id)
 	pci_set_drvdata(pci, dev);
 	dev_info(
 		&pci->dev,
-		"UAD2 initialized (v2026.302.0) — play=%uch rec=%uch buf=%u frames\n",
+		"UAD2 initialized (v2026.302.4) — play=%uch rec=%uch buf=%u frames\n",
 		dev->play_channels, dev->rec_channels, dev->buffer_frames);
 	return 0;
 
