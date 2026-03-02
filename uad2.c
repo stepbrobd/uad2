@@ -2246,8 +2246,16 @@ static int uad2_pcm_prepare(struct snd_pcm_substream *ss)
 	/* If transport is already running or prepared with the same parameters,
 	 * skip re-preparation.  This avoids the destructive stop-and-re-prepare
 	 * cycle that kills the other stream when PipeWire opens both playback
-	 * and capture independently. */
+	 * and capture independently.
+	 *
+	 * Since the transport now stays running across trigger(STOP)/START
+	 * cycles, the DMA buffer may contain stale audio data.  Zero the
+	 * playback buffer to prevent the "DJ looping" artifact where old
+	 * audio is replayed when a new stream starts. */
 	if (READ_ONCE(dev->transport_state) >= 1) {
+		if (ss->stream == SNDRV_PCM_STREAM_PLAYBACK && rt->dma_area &&
+		    rt->dma_bytes)
+			memset(rt->dma_area, 0, rt->dma_bytes);
 		dev_dbg(&dev->pci->dev,
 			"pcm_prepare: transport already %s (state=%d), skipping re-prepare\n",
 			READ_ONCE(dev->transport_state) == 2 ? "running" :
@@ -2297,16 +2305,41 @@ static int uad2_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
 			dev->playback_running = false;
 		else
 			dev->capture_running = false;
-		if (dev->streams_running <= 0) {
+		if (dev->streams_running < 0)
 			dev->streams_running = 0;
-			spin_unlock_irqrestore(&dev->lock, flags);
-			uad2_stop_transport(dev);
-		} else {
-			spin_unlock_irqrestore(&dev->lock, flags);
-			dev_dbg(&dev->pci->dev,
-				"StopTransport deferred: %d streams still active\n",
-				dev->streams_running);
-		}
+		spin_unlock_irqrestore(&dev->lock, flags);
+
+		/* NOTE: We do NOT stop the hardware transport here.
+		 *
+		 * Following the snd-dice/snd-bebob pattern, the DMA
+		 * transport runs continuously once started and only stops
+		 * when the last substream closes (pcm_close).  This is
+		 * critical for PipeWire which rapidly cycles through
+		 * stop→hw_free→prepare→start during graph reconfiguration.
+		 *
+		 * Stopping the transport here caused:
+		 *   1. transport_state reset to 0
+		 *   2. Next pcm_prepare does full DMA re-init (slow)
+		 *   3. Audio loops (stale DMA buffer replayed)
+		 *   4. 30-40 second delays
+		 *
+		 * With the transport left running:
+		 *   - The periodic timer IRQ keeps firing but skips
+		 *     period_elapsed (playback_running/capture_running
+		 *     are both false)
+		 *   - The DMA writes harmlessly to our 4MB buffers
+		 *   - When PipeWire triggers START again, it joins the
+		 *     already-running transport instantly (no re-init)
+		 *   - pcm_prepare sees transport_state >= 1 and skips
+		 *     the expensive re-preparation
+		 *
+		 * Transport teardown happens in pcm_close when open_count
+		 * reaches 0, or in uad2_shutdown/uad2_remove. */
+		dev_dbg(&dev->pci->dev,
+			"trigger STOP: stream=%s streams_running=%d (transport kept alive)\n",
+			ss->stream == SNDRV_PCM_STREAM_PLAYBACK ? "play" :
+								  "cap",
+			READ_ONCE(dev->streams_running));
 		return 0;
 	}
 	return -EINVAL;
