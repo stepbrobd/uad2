@@ -1608,9 +1608,9 @@ static int uad2_prepare_transport(struct uad2_dev *dev,
 		uad2_write32(dev, REG_PERIODIC_TIMER,
 			     dev->periodic_timer_interval);
 		__uad2_enable_vector_locked(dev, INTR_SLOT_PERIODIC, true);
-		dev_info(&dev->pci->dev,
-			 "Periodic timer: interval=%u, shadow=0x%llx\n",
-			 dev->periodic_timer_interval, dev->intr_enable_shadow);
+		dev_dbg(&dev->pci->dev,
+			"Periodic timer: interval=%u, shadow=0x%llx\n",
+			dev->periodic_timer_interval, dev->intr_enable_shadow);
 	}
 
 	/* 9-10. Clear position again + read-back flush */
@@ -1756,6 +1756,7 @@ static void uad2_stop_transport(struct uad2_dev *dev)
 	uad2_write32(dev, REG_TRANSPORT_CTL, 0x0);
 	WRITE_ONCE(dev->transport_state, 0);
 	spin_unlock_irqrestore(&dev->lock, flags);
+	dev_dbg(&dev->pci->dev, "StopTransport: state=0\n");
 }
 
 /* ============================================================
@@ -2015,6 +2016,12 @@ static int uad2_pcm_open(struct snd_pcm_substream *ss)
 		spin_unlock_irqrestore(&dev->lock, flags);
 	}
 
+	dev_dbg(&dev->pci->dev,
+		"pcm_open: stream=%s open_count=%d transport_state=%d streams_prepared=%d streams_running=%d\n",
+		ss->stream == SNDRV_PCM_STREAM_PLAYBACK ? "play" : "cap",
+		READ_ONCE(dev->open_count), READ_ONCE(dev->transport_state),
+		dev->streams_prepared, READ_ONCE(dev->streams_running));
+
 	/* Tell ALSA that playback and capture share a clock source.
 	 * This sets matching sync IDs so userspace (PipeWire/PulseAudio)
 	 * knows the streams are phase-locked. */
@@ -2067,6 +2074,12 @@ static int uad2_pcm_close(struct snd_pcm_substream *ss)
 		dev->open_count = 0;
 	open_count = dev->open_count;
 	spin_unlock_irqrestore(&dev->lock, flags);
+
+	dev_dbg(&dev->pci->dev,
+		"pcm_close: stream=%s open_count=%d transport_state=%d streams_running=%d streams_prepared=%d\n",
+		ss->stream == SNDRV_PCM_STREAM_PLAYBACK ? "play" : "cap",
+		open_count, READ_ONCE(dev->transport_state),
+		READ_ONCE(dev->streams_running), dev->streams_prepared);
 
 	/* Following the snd-dice/snd-bebob pattern: only tear down the
 	 * shared transport when ALL substreams have been closed.
@@ -2164,6 +2177,12 @@ static int uad2_pcm_hw_free(struct snd_pcm_substream *ss)
 	}
 	spin_unlock_irqrestore(&dev->lock, flags);
 
+	dev_dbg(&dev->pci->dev,
+		"hw_free: stream=%s streams_prepared=%d open_count=%d transport_state=%d\n",
+		ss->stream == SNDRV_PCM_STREAM_PLAYBACK ? "play" : "cap",
+		dev->streams_prepared, dev->open_count,
+		READ_ONCE(dev->transport_state));
+
 	return 0;
 }
 
@@ -2251,18 +2270,29 @@ static int uad2_pcm_prepare(struct snd_pcm_substream *ss)
 	 * Since the transport now stays running across trigger(STOP)/START
 	 * cycles, the DMA buffer may contain stale audio data.  Zero the
 	 * playback buffer to prevent the "DJ looping" artifact where old
-	 * audio is replayed when a new stream starts. */
+	 * audio is replayed when a new stream starts.
+	 *
+	 * Only zero when no streams are running — during PipeWire's rapid
+	 * STOP→prepare→START cycles the buffer is about to be filled
+	 * immediately so zeroing is unnecessary overhead. */
 	if (READ_ONCE(dev->transport_state) >= 1) {
 		if (ss->stream == SNDRV_PCM_STREAM_PLAYBACK && rt->dma_area &&
-		    rt->dma_bytes)
+		    rt->dma_bytes && READ_ONCE(dev->streams_running) == 0)
 			memset(rt->dma_area, 0, rt->dma_bytes);
 		dev_dbg(&dev->pci->dev,
-			"pcm_prepare: transport already %s (state=%d), skipping re-prepare\n",
+			"pcm_prepare: stream=%s transport already %s (state=%d) streams_prepared=%d\n",
+			ss->stream == SNDRV_PCM_STREAM_PLAYBACK ? "play" :
+								  "cap",
 			READ_ONCE(dev->transport_state) == 2 ? "running" :
 							       "prepared",
-			READ_ONCE(dev->transport_state));
+			READ_ONCE(dev->transport_state), dev->streams_prepared);
 		return 0;
 	}
+
+	dev_dbg(&dev->pci->dev,
+		"pcm_prepare: stream=%s FULL PREPARE (transport_state=%d) streams_prepared=%d\n",
+		ss->stream == SNDRV_PCM_STREAM_PLAYBACK ? "play" : "cap",
+		READ_ONCE(dev->transport_state), dev->streams_prepared);
 
 	/* Prepare transport with hardware parameters.
 	 * Always program the full hardware channel counts — the DMA
@@ -2336,10 +2366,10 @@ static int uad2_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
 		 * Transport teardown happens in pcm_close when open_count
 		 * reaches 0, or in uad2_shutdown/uad2_remove. */
 		dev_dbg(&dev->pci->dev,
-			"trigger STOP: stream=%s streams_running=%d (transport kept alive)\n",
+			"trigger STOP: stream=%s streams_running=%d open_count=%d (transport kept alive)\n",
 			ss->stream == SNDRV_PCM_STREAM_PLAYBACK ? "play" :
 								  "cap",
-			READ_ONCE(dev->streams_running));
+			READ_ONCE(dev->streams_running), dev->open_count);
 		return 0;
 	}
 	return -EINVAL;

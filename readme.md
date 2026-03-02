@@ -87,7 +87,7 @@ Confirmed from `ioreg` IOAudioEngine + IOAudioStream on macOS:
 
 The project uses a **Nix flake** (`flake.nix`) that provides:
 
-- Linux kernel headers (currently 6.19.4)
+- Linux kernel headers (currently 6.19.3)
 - `bear` (for `compile_commands.json` generation)
 - `clang-tools` (for LSP)
 - `gnumake`
@@ -105,7 +105,7 @@ make
 bear -- make
 ```
 
-The module compiles cleanly with zero warnings against kernel 6.19.4.
+The module compiles cleanly with zero warnings against kernel 6.19.3.
 
 > **Note:** LSP errors about `-mpreferred-stack-boundary=3`,
 > `-mindirect-branch=thunk-extern`, etc. are **false positives** — clang does
@@ -476,21 +476,87 @@ The hardware has a **single shared transport** for both playback and capture
 directions. In macOS, CoreAudio's IOAudioEngine model starts/stops all streams
 atomically through a mixer layer, so the kext never encounters independent
 stream lifecycle. In ALSA, PipeWire opens playback and capture as independent
-streams, so the Linux driver must coordinate them:
+streams, so the Linux driver must coordinate them.
 
-- **`pcm_prepare`** always uses `dev->buffer_frames` (8192, hardware-computed)
-  and `irq_period_frames` from the kext's rate-based lookup table
-  (`_setSampleClock` stores this in `this+0x2880`): 8 at 44.1/48 kHz, 16 at
-  88.2/96 kHz, 32 at 176.4/192 kHz. ALSA's `runtime->buffer_size` is in
-  app-facing frames (e.g., 96 for stereo) and must NOT be used for the
-  hardware's interleaved DMA buffer. If the transport is already prepared or
-  running (`transport_state >= 1`), re-preparation is skipped entirely to avoid
-  destroying the other stream's active transport.
-- **`StartTransport`** treats `transport_state == 2` (already running) as a
-  no-op success — the second stream just piggybacks on the running transport.
-- **`StopTransport`** uses a `streams_running` reference counter (incremented on
-  START, decremented on STOP). The hardware is only stopped when the last stream
-  stops (counter reaches 0).
+### Linux Driver Stream Lifecycle
+
+The driver follows the `snd-dice`/`snd-bebob` pattern for shared-transport
+management. The key principle is: **transport lifecycle is tied to
+`pcm_open`/`pcm_close`, not to `hw_params`/`hw_free` or `trigger`**.
+
+#### Reference Counters
+
+| Counter            | Incremented      | Decremented     | Purpose                                      |
+| ------------------ | ---------------- | --------------- | -------------------------------------------- |
+| `open_count`       | `pcm_open`       | `pcm_close`     | Tracks open substreams; transport stops at 0 |
+| `streams_prepared` | `pcm_prepare`    | `hw_free`       | Tracks prepared substreams                   |
+| `streams_running`  | `trigger(START)` | `trigger(STOP)` | Tracks started substreams                    |
+
+#### `pcm_open`
+
+- Increments `open_count`.
+- Sets ALSA hardware constraints (period size, buffer size = 8192 frames).
+- Calls `snd_pcm_set_sync()` to signal shared clock to userspace.
+- Adds `SNDRV_PCM_INFO_JOINT_DUPLEX` flag.
+
+#### `pcm_prepare`
+
+- Sets sample rate via `_setSampleClock` sequence.
+- Increments `streams_prepared` (once per substream, tracked via
+  `runtime->private_data` flag).
+- **If `transport_state >= 1`** (already prepared or running): skips
+  re-preparation entirely. For playback, zeros the DMA buffer only if
+  `streams_running == 0` to prevent stale audio replay.
+- **If `transport_state == 0`**: does full `PrepareTransport` sequence (programs
+  all transport registers, SG tables, enables periodic timer interrupt).
+- Always uses `dev->buffer_frames` (8192, hardware-computed) and
+  `irq_period_frames` from the kext's rate-based lookup table: 8 at 44.1/48 kHz,
+  16 at 88.2/96 kHz, 32 at 176.4/192 kHz.
+
+#### `trigger(START)`
+
+- Increments `streams_running`, sets per-stream `playback_running` or
+  `capture_running` flag.
+- Calls `StartTransport`. If `transport_state == 2` (already running), this is a
+  no-op — the stream piggybacks on the existing transport.
+
+#### `trigger(STOP)`
+
+- Decrements `streams_running`, clears per-stream running flag.
+- **Does NOT stop the hardware transport.** The DMA keeps running, writing
+  harmlessly to the pre-allocated 4MB buffers. The periodic timer IRQ continues
+  firing but skips `snd_pcm_period_elapsed()` for non-running streams.
+
+This is critical for PipeWire, which rapidly cycles through `STOP` -> `hw_free`
+-> `prepare` -> `START` during audio graph reconfiguration (e.g., when a new
+application starts playing audio). Stopping the transport here would cause full
+DMA re-initialization (30-40 second delays) and stale buffer replay.
+
+#### `hw_free`
+
+- Clears ALSA runtime DMA pointers.
+- Decrements `streams_prepared` if this substream was prepared.
+- Does NOT tear down the transport.
+
+#### `pcm_close`
+
+- Decrements `open_count`.
+- **When `open_count` reaches 0**: calls `StopTransport` (if running) or resets
+  `transport_state` to 0 (if prepared but not running). This is the only place
+  during normal operation where the transport is torn down.
+
+#### Interrupt Handling
+
+The periodic timer (vector `0x46`, slot 62) drives audio processing:
+
+- **Hardirq**: reads pending interrupt bits from DMA0/DMA1 STATUS registers,
+  writes all pending bits back for acknowledgment, increments
+  `periodic_irq_count` atomically, wakes threaded handler. No logging or
+  unnecessary MMIO in the hardirq path.
+- **Threaded handler**: atomically reads and clears `periodic_irq_count`, calls
+  `snd_pcm_period_elapsed()` N times for each running stream. Re-arms vector
+  `0x46` by calling `EnableVector` (the hardware disables this vector on each
+  fire; see ServiceInterrupt analysis below).
 
 ### PrepareTransport (kext sequence)
 
@@ -827,84 +893,47 @@ Full object layout (0x5F0 bytes total, from arm64 analysis):
 - **Channel mapping predicted but NOT verified** on live hardware
 - **No rate change while running** — changing sample rate while either stream is
   active requires stopping the shared transport, which is not yet coordinated
-- **Excessive `dev_info` logging** in notification handler (intentionally left
-  for first-boot debugging)
+- **No DSP plugin support** — the mixer/DSP processing layer from the macOS kext
+  is not implemented
+- **No capture testing** — only playback has been tested; capture streams are
+  exposed but untested
+- **`speaker-test` crashes at 42 channels** — `speaker-test` allocates channel
+  map arrays for up to 16 channels only, causing SIGSEGV at channel 16+. This is
+  a bug in `speaker-test`, not the driver. Use PipeWire or direct `aplay`
+  instead.
 
-## Testing Plan
+## Testing Status
 
-### Priority Order
+### Completed
 
-#### 1. Build and Fix Compilation Errors
+- **Build**: compiles cleanly with zero warnings against kernel 6.19.3
+- **Module load**: `insmod uad2.ko` succeeds, card appears in
+  `/proc/asound/cards`, PCM device visible in `aplay -l`
+- **Firmware connect**: 20-channel doorbell sequence completes, IO descriptors
+  read successfully, channel counts detected (42 play / 32 rec)
+- **Interrupt delivery**: MSI vector 0 fires, notification handler dispatches
+  connect/IO/DMA events correctly
+- **DMA / SG tables**: playback and capture 4MB DMA buffers allocated, SG table
+  entries written to BAR+0x8000/0xA000
+- **Playback via PipeWire**: audio plays through browser and desktop apps.
+  Multiple simultaneous applications work (PipeWire mixes to the 42ch hardware
+  stream). Transport survives PipeWire graph reconfiguration without audible
+  glitches.
+- **Direct ALSA playback**: `aplay -D hw:X,0 -f S32_LE -c 42 -r 48000` works
+- **PipeWire profiles**: "multichannel output", "multichannel duplex", and "pro
+  audio" profiles all functional
 
-- Run `make` against the running kernel
-- Fix any real compilation errors (not the clang/GCC LSP false positives)
-- The driver used `snd_pcm_lib_ioctl` which was removed in kernel 5.18+; if
-  building against >= 5.18, remove the `.ioctl` line from `snd_pcm_ops`
-- Verify all includes resolve and types are correct
+### Not Yet Tested
 
-#### 2. Channel Mapping (Critical for Audio Output)
-
-The driver programs `REG_PLAYBACK_CHAN_CNT` with `dev->play_channels` (42) and
-`REG_RECORD_CHAN_CNT` with `dev->rec_channels` (32), meaning the DMA buffer is
-always 42-channel interleaved for playback.
-
-**Problems:**
-
-- Most apps want stereo. Writing 2ch to a 42ch interleaved buffer means audio
-  lands in channels 0–1, but we don't know if those map to the monitor outputs
-- The driver currently does NOT adjust channel counts based on ALSA
-  `runtime->channels`
-
-**Fix options:**
-
-1. Decode the channel-to-output mapping from the kext/ioreg data (the macOS
-   `IOAudioStream` objects have `StartingChannelID` fields)
-2. As a first test, write a 42ch S32_LE buffer with audio in different channel
-   pairs to discover which pair produces output
-3. Test whether the hardware can operate with fewer channels (write a smaller
-   count to `REG_PLAYBACK_CHAN_CNT`)
-
-#### 3. Interrupt Delivery Verification
-
-- Load the module and check `/proc/interrupts` for the MSI vector
-- Verify that the notification handler fires during Connect
-- If Connect times out on all 20 channels, the interrupt path is broken
-- Fallback: the manual polling in the Connect loop should still work
-
-#### 4. DMA Buffer Sanity
-
-- After probe, read back SG table entries from `BAR+0x8000` to verify they match
-  allocated DMA addresses
-- Read `BAR+0x2244` (position counter) — should be 0 before transport starts
-- After starting playback, verify position counter advances
-
-#### 5. Runtime Testing Sequence
-
-```sh
-# a) Load module
-sudo insmod uad2.ko
-# Check dmesg for probe success
-dmesg | tail -50
-
-# b) Verify card appears
-cat /proc/asound/cards
-
-# c) Verify PCM device
-aplay -l
-
-# d) DMA smoke test (silence, verify no kernel panics)
-aplay -D hw:X,0 -f S32_LE -c 42 -r 48000 /dev/zero
-
-# e) Generate test tone on specific channel pairs to find monitor outputs
-# f) Test with real audio via plughw
-```
-
-#### 6. Hardening (After Basic Audio Works)
-
-- Add error recovery in Connect (currently continues on timeout)
-- Add PCIe error handling (`pci_error_handlers`)
-- Consider Thunderbolt hot-unplug safety
-- Test suspend/resume if relevant
+- **Capture / recording** — streams are exposed but never tested with actual
+  audio input
+- **DSP plugins** — not implemented; requires reverse engineering the mixer
+  layer
+- **Sample rate changes while running** — only 48 kHz tested during active
+  playback
+- **Suspend/resume**
+- **Thunderbolt hot-unplug/replug**
+- **Multi-device** (multiple Apollo units)
 
 ## Disassembly Reference
 
@@ -952,7 +981,7 @@ otool -v -s __TEXT_EXEC __text bin/aarch64-darwin/uad2.kext > bin/aarch64-darwin
 
 | File                                | Description                                                                                                                                 |
 | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| `uad2.c`                            | Main driver source (~2550 lines) — PCI probe/remove, ALSA PCM ops, interrupt handling, DMA, firmware connect, transport, mixer, channel map |
+| `uad2.c`                            | Main driver source (~3000 lines) — PCI probe/remove, ALSA PCM ops, interrupt handling, DMA, firmware connect, transport, mixer, channel map |
 | `Makefile`                          | Standard out-of-tree kernel module Makefile (uses `KDIR` from env)                                                                          |
 | `Kbuild`                            | `obj-m := uad2.o`                                                                                                                           |
 | `flake.nix`                         | Nix flake providing build environment                                                                                                       |
