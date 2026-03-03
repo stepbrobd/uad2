@@ -392,12 +392,6 @@ struct uad2_dev {
 	 * consumed by threaded bottom-half.  Protected by dev->lock. */
 	u64 irq_active;
 
-	/* Flag set by hardirq when a periodic timer interrupt fires.
-	 * The threaded handler checks this to decide whether to call
-	 * snd_pcm_period_elapsed().  Using atomic_t for lock-free
-	 * access between hardirq and thread contexts. */
-	atomic_t periodic_irq_pending;
-
 	/* Ring buffer DMA allocations (4 x 4KB pages per ring) */
 	dma_addr_t ring_dma_addr[DSP_RING_DESC_SLOTS];
 	void *ring_dma_buf[DSP_RING_DESC_SLOTS];
@@ -488,10 +482,6 @@ struct uad2_dev {
 	 * Set to 0 on cold-start prepare (transport was stopped), set to
 	 * current REG_DMA_POSITION on hot re-prepare. */
 	u32 dma_pos_offset;
-
-	/* Diagnostic: track DMA position between periodic interrupts */
-	u32 dbg_last_dma_pos;
-	u32 dbg_periodic_count;
 };
 
 /* ============================================================
@@ -1619,8 +1609,6 @@ static int uad2_prepare_transport(struct uad2_dev *dev,
 	/* 7. Clear DMA position counter */
 	uad2_write32(dev, REG_DMA_POSITION, 0);
 	dev->dma_pos_offset = 0;
-	dev->dbg_last_dma_pos = 0;
-	dev->dbg_periodic_count = 0;
 
 	/* 8. Periodic timer (if configured) */
 	if (dev->periodic_timer_interval) {
@@ -1853,6 +1841,14 @@ static void uad2_shutdown(struct uad2_dev *dev)
  *           1024 frames × 42ch × 4B = 172032 bytes/period (max)
  * Capture:  256 frames × 32ch × 4B = 32768 bytes/period (min)
  *           1024 frames × 32ch × 4B = 131072 bytes/period (max)
+ *
+ * SNDRV_PCM_INFO_BATCH: The hardware DMA position register only updates
+ * at period boundaries (every 256 frames at 48kHz = 5.33ms).  Between
+ * interrupts, .pointer() returns a stale position.  PipeWire's rate
+ * estimator and ALSA's internal hw_ptr tracking need to know this to
+ * avoid declaring spurious XRUNs when the position appears to jump by
+ * a full period at once.  The BATCH flag tells them the position is
+ * updated in coarse batches, not smoothly.
  */
 #define UAD2_PERIOD_FRAMES_1X 256 /* period at 44.1/48 kHz */
 #define UAD2_PERIOD_FRAMES_2X 512 /* period at 88.2/96 kHz */
@@ -1861,7 +1857,7 @@ static void uad2_shutdown(struct uad2_dev *dev)
 static const struct snd_pcm_hardware uad2_pcm_hw_playback = {
 	.info = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
 		SNDRV_PCM_INFO_MMAP_VALID | SNDRV_PCM_INFO_BLOCK_TRANSFER |
-		SNDRV_PCM_INFO_JOINT_DUPLEX,
+		SNDRV_PCM_INFO_JOINT_DUPLEX | SNDRV_PCM_INFO_BATCH,
 	.formats = SNDRV_PCM_FMTBIT_S32_LE, /* 24-in-32 LE, MSB-justified */
 	.rates = SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000 |
 		 SNDRV_PCM_RATE_88200 | SNDRV_PCM_RATE_96000 |
@@ -1883,7 +1879,7 @@ static const struct snd_pcm_hardware uad2_pcm_hw_playback = {
 static const struct snd_pcm_hardware uad2_pcm_hw_capture = {
 	.info = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
 		SNDRV_PCM_INFO_MMAP_VALID | SNDRV_PCM_INFO_BLOCK_TRANSFER |
-		SNDRV_PCM_INFO_JOINT_DUPLEX,
+		SNDRV_PCM_INFO_JOINT_DUPLEX | SNDRV_PCM_INFO_BATCH,
 	.formats = SNDRV_PCM_FMTBIT_S32_LE,
 	.rates = SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000 |
 		 SNDRV_PCM_RATE_88200 | SNDRV_PCM_RATE_96000 |
@@ -2511,13 +2507,15 @@ static const struct snd_pcm_ops uad2_pcm_ops = {
  * With Linux MSI (single vector mode), all interrupts arrive on
  * vector 0, so we dispatch based on the pending bitmask.
  *
- * We use a threaded IRQ to avoid calling uad2_handle_notification()
- * and snd_pcm_period_elapsed() from hardirq context.  This eliminates
- * the reentrancy hazard where the connect loop's manual poll of
- * uad2_handle_notification() could deadlock with a concurrent hardirq
- * invocation on the same CPU.  The hardirq top half only reads/acks
- * the status registers and stashes the active bitmask; the thread
- * bottom half does all dispatch work.
+ * We use a threaded IRQ for uad2_handle_notification() (which needs
+ * process context due to the reentrancy hazard with the connect loop's
+ * manual poll) and for re-arming the one-shot periodic timer vector.
+ *
+ * snd_pcm_period_elapsed() is called directly from the hardirq top
+ * half for minimum latency — this eliminates the variable thread
+ * scheduling delay that caused ALSA to see multi-period position
+ * jumps (manifesting as audible skips in PipeWire).  The function is
+ * hardirq-safe (uses snd_pcm_stream_lock_irqsave() internally).
  * ============================================================ */
 
 /*
@@ -2603,24 +2601,54 @@ static irqreturn_t uad2_irq_hard(int irq, void *data)
 	if (dev->has_extended_irq && (u32)(active >> 32))
 		uad2_write32(dev, REG_DMA1_STATUS, (u32)(active >> 32));
 
-	/* Signal that a periodic timer interrupt fired.
-	 * The threaded handler will call snd_pcm_period_elapsed(). */
-	if (active & BIT_ULL(INTR_SLOT_PERIODIC))
-		atomic_set(&dev->periodic_irq_pending, 1);
+	/* Periodic timer interrupt (slot 62 = vector 0x46): call
+	 * snd_pcm_period_elapsed() directly from hardirq context.
+	 *
+	 * snd_pcm_period_elapsed() is hardirq-safe — it uses
+	 * snd_pcm_stream_lock_irqsave() internally.  Many ALSA drivers
+	 * (HDA, USB-audio, etc.) call it from hardirq.
+	 *
+	 * Moving this out of the threaded handler eliminates variable
+	 * thread scheduling latency that caused ALSA to see multi-period
+	 * position jumps, which PipeWire manifested as audible skips.
+	 *
+	 * IMPORTANT: We must NOT hold dev->lock when calling
+	 * snd_pcm_period_elapsed(), because trigger() is called by ALSA
+	 * with the stream lock held and then takes dev->lock internally.
+	 * Lock ordering must be: stream_lock → dev->lock.  We already
+	 * released dev->lock above, so we're safe here. */
+	if (active & BIT_ULL(INTR_SLOT_PERIODIC)) {
+		struct snd_pcm_substream *play_ss, *cap_ss;
+		bool play_run, cap_run;
+
+		spin_lock(&dev->lock);
+		play_ss = dev->playback_ss;
+		cap_ss = dev->capture_ss;
+		play_run = dev->playback_running;
+		cap_run = dev->capture_running;
+		spin_unlock(&dev->lock);
+
+		if (play_ss && play_run)
+			snd_pcm_period_elapsed(play_ss);
+		if (cap_ss && cap_run)
+			snd_pcm_period_elapsed(cap_ss);
+	}
 
 	return IRQ_WAKE_THREAD;
 }
 
 /*
- * Threaded bottom half: dispatch interrupt events.
- * Runs in process context — safe to call uad2_handle_notification()
- * and snd_pcm_period_elapsed().
+ * Threaded bottom half: dispatch deferred interrupt events.
+ * Runs in process context — needed for uad2_handle_notification()
+ * and re-arming the one-shot periodic timer vector.
+ *
+ * snd_pcm_period_elapsed() is now called directly from the hardirq
+ * top half for lowest latency — see uad2_irq_hard().
  */
 static irqreturn_t uad2_irq_thread(int irq, void *data)
 {
 	struct uad2_dev *dev = data;
 	u64 active;
-	struct snd_pcm_substream *play_ss, *cap_ss;
 
 	/* Consume accumulated active bits */
 	spin_lock_irq(&dev->lock);
@@ -2637,86 +2665,25 @@ static irqreturn_t uad2_irq_thread(int irq, void *data)
 
 	/* Periodic timer interrupt (slot 62 = vector 0x46).
 	 *
-	 * This is the interrupt that drives audio processing in the kext.
-	 * The kext's mixer ProcessAudio only responds to callback ID 0x6d
-	 * (periodic timer), NOT 0x6c (end-of-buffer).
+	 * Re-arm the one-shot periodic timer vector.  The hardirq
+	 * disabled this vector in intr_enable_shadow (kext one-shot
+	 * behavior).  We must re-enable it here so the next period's
+	 * interrupt fires.  This matches the kext's deferred handler
+	 * calling ResetPeriodicTimerInterrupt → EnableVector(0x46, 1).
 	 *
-	 * IMPORTANT: The hardware periodic timer is one-shot-per-fire.
-	 * The kext's ServiceInterrupt unconditionally disables vector 0x46
-	 * in the CTRL register after it fires.  The deferred handler then
-	 * calls ResetPeriodicTimerInterrupt -> EnableVector(0x46, 1) to
-	 * re-arm it for the next period.  We must do the same here.
-	 *
-	 * snd_pcm_period_elapsed() always calls our .pointer() callback
-	 * to read the actual hardware DMA position.  It computes hw_ptr
-	 * from that position and handles multi-period advancement
-	 * internally.  Even if multiple periods elapsed since the last
-	 * call, a single snd_pcm_period_elapsed() is sufficient — ALSA
-	 * will see the full advancement and wake userspace accordingly.
-	 * (See sound/core/pcm_lib.c update_hw_ptr_interrupt.) */
-	if (atomic_xchg(&dev->periodic_irq_pending, 0)) {
-		u32 dma_pos = uad2_read32(dev, REG_DMA_POSITION);
-		u32 last_pos = dev->dbg_last_dma_pos;
-		u32 count = ++dev->dbg_periodic_count;
-
-		dev->dbg_last_dma_pos = dma_pos;
-
-		/* Log every periodic interrupt: position, delta, count.
-		 * This is the key diagnostic for the DJ looping bug. */
-		dev_dbg(&dev->pci->dev,
-			"periodic[%u]: pos=%u last=%u running=%d transport=%d shadow=0x%llx\n",
-			count, dma_pos, last_pos,
-			READ_ONCE(dev->streams_running),
-			READ_ONCE(dev->transport_state),
-			dev->intr_enable_shadow);
-
-		/* Warn if position appears stuck (same value two consecutive
-		 * interrupts — could indicate DMA stall or register read
-		 * problem). */
-		if (dma_pos == last_pos && count > 1 &&
-		    READ_ONCE(dev->streams_running) > 0)
-			dev_warn(&dev->pci->dev,
-				 "periodic[%u]: DMA position STUCK at %u!\n",
-				 count, dma_pos);
-
-		if (READ_ONCE(dev->streams_running) > 0) {
-			bool play_run, cap_run;
-
-			spin_lock_irq(&dev->lock);
-			play_ss = dev->playback_ss;
-			cap_ss = dev->capture_ss;
-			play_run = dev->playback_running;
-			cap_run = dev->capture_running;
-			spin_unlock_irq(&dev->lock);
-
-			if (play_ss && play_run)
-				snd_pcm_period_elapsed(play_ss);
-			if (cap_ss && cap_run)
-				snd_pcm_period_elapsed(cap_ss);
-		}
-
-		/* Re-arm the periodic timer vector (one-shot-per-fire).
-		 * This matches the kext's ResetPeriodicTimerInterrupt()
-		 * which calls EnableVector(0x46, 1) after ProcessAudio.
-		 * Must be done regardless of streams_running state -- the
-		 * transport may still be active and we need to keep
-		 * receiving timer interrupts until StopTransport disables
-		 * the vector. */
+	 * Re-arm must happen regardless of streams_running — the
+	 * transport may still be active and we need to keep receiving
+	 * timer interrupts until stop_transport disables the vector. */
+	if (active & BIT_ULL(INTR_SLOT_PERIODIC)) {
 		if (READ_ONCE(dev->transport_state) == 2)
 			uad2_enable_vector(dev, INTR_SLOT_PERIODIC, true);
-		else
-			dev_warn(
-				&dev->pci->dev,
-				"periodic[%u]: re-arm SKIPPED (transport_state=%d)\n",
-				count, READ_ONCE(dev->transport_state));
 	}
 
 	/* End-of-buffer interrupt (slot 63 = vector 0x47).
 	 * The kext mixer ignores this (callback ID 0x6c != 0x6d).
 	 * We keep it enabled as a transport lifecycle signal but do NOT
-	 * fire snd_pcm_period_elapsed from it.  Log for diagnostics. */
-	if (active & BIT_ULL(INTR_SLOT_ENDBUF))
-		dev_dbg(&dev->pci->dev, "End-of-buffer interrupt\n");
+	 * fire snd_pcm_period_elapsed from it. */
+	/* (nothing to do for end-of-buffer) */
 
 	return IRQ_HANDLED;
 }
