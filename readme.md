@@ -13,9 +13,13 @@
 > [!NOTE]
 > From a human (only this part and some Nix related code is written by me) and
 > all the other stuff is written by Claude. I've only tested this on a UA Apollo
-> Solo on a NixOS laptop. Stereo playback, multichannel duplex (42ch play + 32ch
-> capture), and PipeWire profile switching all work with zero XRUNs. DSP plugins
-> and recording are not tested and I'm almost certain they will not work.
+> Solo with a NixOS laptop. Stereo playback at 48kHz seem to work just fine, but
+> if the audio stream passed to ALSA is not resampled to 48kHz, the playback
+> will break (as in no audio what so ever, and I need to replug the interface to
+> MacBook and use the UA Mixer app to reinitialize the profile). The workaround
+> I have on this is to lock PipeWire to 48kHz and resample everything that's not
+> at 48kHz. DSP plugins and recording are not tested and I'm certain they will
+> not work.
 
 ## Overview
 
