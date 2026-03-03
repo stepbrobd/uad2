@@ -13,10 +13,9 @@
 > [!NOTE]
 > From a human (only this part and some Nix related code is written by me) and
 > all the other stuff is written by Claude. I've only tested this on a UA Apollo
-> Solo on a NixOS laptop, and only the stereo audio playback. There are some
-> looping, and weird artifacts when playing (happens quite randomly) but I think
-> this is enough for me. DSP plugins and recording are not tested and I'm almost
-> certain they will not work.
+> Solo on a NixOS laptop. Stereo playback, multichannel duplex (42ch play + 32ch
+> capture), and PipeWire profile switching all work with zero XRUNs. DSP plugins
+> and recording are not tested and I'm almost certain they will not work.
 
 ## Overview
 
@@ -87,7 +86,7 @@ Confirmed from `ioreg` IOAudioEngine + IOAudioStream on macOS:
 
 The project uses a **Nix flake** (`flake.nix`) that provides:
 
-- Linux kernel headers (currently 6.19.3)
+- Linux kernel headers (currently 6.19.5)
 - `bear` (for `compile_commands.json` generation)
 - `clang-tools` (for LSP)
 - `gnumake`
@@ -105,7 +104,7 @@ make
 bear -- make
 ```
 
-The module compiles cleanly with zero warnings against kernel 6.19.3.
+The module compiles cleanly with zero warnings against kernel 6.19.5.
 
 > **Note:** LSP errors about `-mpreferred-stack-boundary=3`,
 > `-mindirect-branch=thunk-extern`, etc. are **false positives** — clang does
@@ -550,13 +549,14 @@ DMA re-initialization (30-40 second delays) and stale buffer replay.
 The periodic timer (vector `0x46`, slot 62) drives audio processing:
 
 - **Hardirq**: reads pending interrupt bits from DMA0/DMA1 STATUS registers,
-  writes all pending bits back for acknowledgment, increments
-  `periodic_irq_count` atomically, wakes threaded handler. No logging or
-  unnecessary MMIO in the hardirq path.
-- **Threaded handler**: atomically reads and clears `periodic_irq_count`, calls
-  `snd_pcm_period_elapsed()` N times for each running stream. Re-arms vector
-  `0x46` by calling `EnableVector` (the hardware disables this vector on each
-  fire; see ServiceInterrupt analysis below).
+  filters through `intr_enable_shadow`, ACKs only active bits. For the periodic
+  timer vector: disables the one-shot vector in the enable shadow (kext
+  fidelity), then calls `snd_pcm_period_elapsed()` directly for each running
+  stream. Lock ordering: `dev->lock` is released before calling
+  `snd_pcm_period_elapsed()` (which internally acquires the stream group lock).
+- **Threaded handler**: re-arms vector `0x46` by calling `EnableVector` (the
+  hardware disables this vector on each fire; see ServiceInterrupt analysis
+  below). Dispatches deferred notification interrupts.
 
 ### PrepareTransport (kext sequence)
 
@@ -902,11 +902,31 @@ Full object layout (0x5F0 bytes total, from arm64 analysis):
   a bug in `speaker-test`, not the driver. Use PipeWire or direct `aplay`
   instead.
 
+### DMA Position Behavior
+
+The hardware DMA position register (`BAR+0x2244`) only updates at period
+boundaries (every 256 frames at 48 kHz = 5.33 ms), not smoothly between
+interrupts. The driver reports `SNDRV_PCM_INFO_BATCH` to inform ALSA/PipeWire of
+this coarse position update behavior. Without this flag, PipeWire's rate
+estimator sees discontinuities when the position jumps by 256 frames at once,
+causing false XRUNs.
+
+### Position-Offset Approach
+
+When a running stream is re-prepared (e.g., PipeWire graph reconfiguration), the
+driver does NOT stop and restart the DMA transport. Instead, it snapshots the
+current DMA position as `dma_pos_offset` at prepare time, and the `.pointer()`
+callback returns `(hw_pos - dma_pos_offset) % buffer_frames`. This gives ALSA a
+0-relative position matching its reset `hw_ptr=0`, while the hardware transport
+continues uninterrupted. Stopping and re-preparing the transport is
+fundamentally broken on this hardware — `REG_POLL_STATUS` never converges after
+a stop+re-prepare cycle.
+
 ## Testing Status
 
 ### Completed
 
-- **Build**: compiles cleanly with zero warnings against kernel 6.19.3
+- **Build**: compiles cleanly with zero warnings against kernel 6.19.5
 - **Module load**: `insmod uad2.ko` succeeds, card appears in
   `/proc/asound/cards`, PCM device visible in `aplay -l`
 - **Firmware connect**: 20-channel doorbell sequence completes, IO descriptors
@@ -918,7 +938,9 @@ Full object layout (0x5F0 bytes total, from arm64 analysis):
 - **Playback via PipeWire**: audio plays through browser and desktop apps.
   Multiple simultaneous applications work (PipeWire mixes to the 42ch hardware
   stream). Transport survives PipeWire graph reconfiguration without audible
-  glitches.
+  glitches. Zero XRUNs during sustained playback.
+- **Multichannel duplex**: PipeWire "multichannel duplex" profile opens both
+  42ch playback + 32ch capture simultaneously without issues
 - **Direct ALSA playback**: `aplay -D hw:X,0 -f S32_LE -c 42 -r 48000` works
 - **PipeWire profiles**: "multichannel output", "multichannel duplex", and "pro
   audio" profiles all functional
@@ -981,7 +1003,7 @@ otool -v -s __TEXT_EXEC __text bin/aarch64-darwin/uad2.kext > bin/aarch64-darwin
 
 | File                                | Description                                                                                                                                 |
 | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| `uad2.c`                            | Main driver source (~3000 lines) — PCI probe/remove, ALSA PCM ops, interrupt handling, DMA, firmware connect, transport, mixer, channel map |
+| `uad2.c`                            | Main driver source (~2900 lines) — PCI probe/remove, ALSA PCM ops, interrupt handling, DMA, firmware connect, transport, mixer, channel map |
 | `Makefile`                          | Standard out-of-tree kernel module Makefile (uses `KDIR` from env)                                                                          |
 | `Kbuild`                            | `obj-m := uad2.o`                                                                                                                           |
 | `flake.nix`                         | Nix flake providing build environment                                                                                                       |
