@@ -888,13 +888,18 @@ Full object layout (0x5F0 bytes total, from arm64 analysis):
   implemented)
 - **No firmware version verification**
 - **No PCIe error handlers** (`pci_error_handlers`)
-- **No Thunderbolt hot-unplug safety** — device may disappear mid-DMA (partial
-  mitigation via `disconnecting` flag and `0xFFFFFFFF` sentinel check)
 - **Channel mapping predicted but NOT verified** on live hardware
-- **No rate change while running** — changing sample rate while either stream is
-  active requires stopping the shared transport, which is not yet coordinated
+- **No rate change while running** — sample rate switching has been
+  reverse-engineered and tested (see "Sample Rate Switching" below) but is not
+  enabled because it resets the device's internal DSP mixer routing. A userspace
+  mixer application is required to restore mixer coefficients after a rate
+  change; see "Future Work".
 - **No DSP plugin support** — the mixer/DSP processing layer from the macOS kext
   is not implemented
+- **No userspace mixer application** — the Apollo Solo's internal monitor
+  mixer/routing is configured entirely by the macOS UAD Console app via a
+  register interface at BAR+0x3800. Without a Linux equivalent, the mixer state
+  can only be set by the Mac. See "Future Work".
 - **No capture testing** — only playback has been tested; capture streams are
   exposed but untested
 - **`speaker-test` crashes at 42 channels** — `speaker-test` allocates channel
@@ -982,10 +987,164 @@ re-probe on reconnect.
   audio input
 - **DSP plugins** — not implemented; requires reverse engineering the mixer
   layer
-- **Sample rate changes while running** — only 48 kHz tested during active
-  playback
 - **Suspend/resume**
 - **Multi-device** (multiple Apollo units)
+
+### Sample Rate Switching
+
+Sample rate switching has been fully reverse-engineered from the kext and tested
+via direct ALSA access. **The firmware handshake works correctly**, but the
+feature is not enabled in the driver because it resets the device's internal DSP
+mixer, causing loss of audio output.
+
+**What was tested:**
+
+All 6 supported rates (44100, 48000, 88200, 96000, 176400, 192000 Hz) were
+tested via `aplay -D hw:X,0 -f S32_LE -c 42 -r RATE -d 2 /dev/zero`. The
+firmware acknowledged each rate change in ~125 ms. The hardware registers (IRQ
+period, periodic timer, buffer frame size) were correctly reprogrammed for each
+speed class:
+
+| Speed Class | Rates          | IRQ Period | Periodic Timer | Period Frames |
+| ----------- | -------------- | ---------- | -------------- | ------------- |
+| 1x          | 44100, 48000   | 8          | 255            | 256           |
+| 2x          | 88200, 96000   | 16         | 511            | 512           |
+| 4x          | 176400, 192000 | 32         | 1023           | 1024          |
+
+**The problem: internal mixer reset.** When the sample rate changes, the Apollo
+Solo's firmware resets its internal DSP mixer routing to zeros. On macOS, the
+UAD Console application receives a notification (callback ID `0x68`) and
+immediately restores all mixer coefficients via
+`SetMixerParam`/`SetMixerBusParam` calls through the kernel driver's user-client
+interface. On Linux, there is no equivalent userspace application, so after a
+rate change the device's meters still show signal but no audio reaches the
+physical outputs. This state persists across module reloads — only plugging the
+device back into a Mac with the Console app restores the mixer.
+
+**To re-implement sample rate switching**, the following code was tested and
+verified working in `uad2_pcm_prepare()`:
+
+```c
+/* In uad2_pcm_prepare(), inside the (dev->current_rate != rt->rate) block,
+ * BEFORE calling uad2_set_sample_rate(): */
+if (READ_ONCE(dev->transport_state) >= 1)
+    uad2_stop_transport(dev);
+```
+
+This forces the cold-prepare path after a rate change, which reprograms
+`REG_IRQ_PERIOD`, `REG_PERIODIC_TIMER`, and `REG_BUFFER_FRAME_SIZE` for the new
+rate. The existing `uad2_set_sample_rate()` function correctly implements the
+firmware clock handshake (`REG_SAMPLE_CLOCK` write → `0x4` to
+`REG_STREAM_ENABLE` → wait for `rate_event` completion with 2s timeout).
+
+The rate switch code was reverted because enabling it without a mixer restore
+mechanism would silently kill audio output. It should be re-enabled once a
+userspace mixer application exists.
+
+**Note on PipeWire:** PipeWire's default NixOS configuration uses
+`default.clock.allowed-rates = [48000]`, so `pw-play` always resamples to 48 kHz
+and never triggers a real hardware rate switch. To test rate switching, use
+direct ALSA access: `aplay -D hw:X,0 -f S32_LE -c 42 -r RATE`.
+
+## Future Work
+
+### Userspace Mixer Application
+
+The Apollo Solo has an internal DSP mixer controlled through a hardware register
+interface at `BAR+0x3800`. On macOS, the **UAD Console** application manages
+this mixer entirely from userspace via the kext's `SetMixerParam`,
+`SetMixerBusParam`, and `SetOtherParam` user-client calls. The kext driver
+itself does **not** set any mixer coefficients — it only provides the register
+write mechanism.
+
+A Linux userspace mixer application will need to be reverse-engineered and
+implemented. This is required for:
+
+- **Restoring mixer state after sample rate changes** (the firmware zeros all
+  mixer coefficients on rate change)
+- **Setting up monitor routing** (which inputs/outputs are connected and at what
+  gain)
+- **Controlling headphone/line output levels**
+- **Any DSP processing** (EQ, compression, etc.)
+
+#### Hardware Mixer Register Map (`CPcieDeviceMixer`)
+
+The mixer uses 38 settings (indices 0x00–0x25), each occupying 8 bytes (two
+32-bit registers). The register block is at `BAR+0x3800`:
+
+**Control registers:**
+
+| Offset  | R/W | Description                                         |
+| ------- | --- | --------------------------------------------------- |
+| `+0x08` | W   | Version/commit — write incremented counter to apply |
+| `+0x0C` | R   | Firmware version counter (must match before write)  |
+| `+0x10` | R/W | Readback ready (1=data available, write 0 to ack)   |
+| `+0x14` | R   | Readback data base — 40 × uint32 metering values    |
+
+**Mixer setting register offsets (relative to BAR+0x3800):**
+
+| Index Range | Formula            | BAR+0x3800 Offsets     |
+| ----------- | ------------------ | ---------------------- |
+| 0x00–0x0F   | `index * 8 + 0xB4` | 0x00B4–0x0130 (8 gaps) |
+| 0x10–0x1F   | `index * 8 + 0xBC` | 0x013C–0x01B8 (8 gaps) |
+| 0x20–0x25   | `index * 8 + 0xC0` | 0x01C0–0x01EC          |
+
+There are 8-byte gaps between ranges (at 0x0134 and 0x01B8).
+
+**Per-setting data format (8 bytes = two 32-bit writes):**
+
+```
+Register at offset+0:  [31:16] = group_bits[15:0]  | [15:0] = coeff_word_0
+Register at offset+4:  [31:16] = group_bits[31:16] | [15:0] = coeff_word_1
+```
+
+Where `group_bits` is a 32-bit bitmask of active/dirty bits and the coefficient
+is split into two 16-bit halves.
+
+**Commit protocol:**
+
+1. Read firmware version from `+0x0C`
+2. Verify it matches the driver's cached version
+3. Write all 38 settings
+4. Increment version, write to `+0x08` (acts as a doorbell/commit)
+
+The firmware will not process settings if the version counters are out of sync.
+The `GetReadback` metering path (40 values at `+0x14` through `+0xB0`) also
+opportunistically flushes deferred settings.
+
+#### Kext Mixer Functions (Analyzed)
+
+| Function                                 | Dump Line | Description                                 |
+| ---------------------------------------- | --------- | ------------------------------------------- |
+| `CPcieDeviceMixer::Initialize`           | 68750     | Sets BAR base, syncs version counter        |
+| `CPcieDeviceMixer::_writeSetting`        | 69047     | Writes one setting to hardware              |
+| `CPcieDeviceMixer::_flushCachedSettings` | 69013     | Writes all 38 settings + commit             |
+| `CPcieDeviceMixer::WriteSetting`         | 69222     | Public API: update cache + write + commit   |
+| `CPcieDeviceMixer::GetReadback`          | 68921     | Reads 40 metering values + deferred flush   |
+| `CUAD2DeviceMixer::SetOtherParam`        | 67693     | Maps param IDs → setting indices + bitmasks |
+| `CUAD2DeviceMixer::AckSampleRateChange`  | 65455     | DMA command 0x1A0002 to firmware            |
+| `CMessenger::DispatchSetMixerParam`      | 52910     | Userspace → kernel mixer param dispatch     |
+| `CMessenger::DispatchSetMixerBusParam`   | 52794     | Batch mixer bus param dispatch              |
+
+#### Implementation Strategy
+
+Two approaches are possible:
+
+1. **Save/restore**: Read all 38 mixer settings from hardware at probe time
+   (while they contain a valid configuration from the Mac), cache them, and
+   restore after rate changes. Simple but fragile — requires initial setup via
+   Mac.
+
+2. **Full userspace mixer**: Reverse-engineer the `SetOtherParam` switch table
+   (param IDs 0x01–0x8A mapping to setting indices and bitmasks) and implement a
+   Linux userspace application or ALSA mixer controls. This is the proper
+   solution and what the macOS stack does.
+
+### Re-enable Sample Rate Switching
+
+Once a mixer save/restore or userspace mixer is implemented, re-enable rate
+switching by adding the transport stop before `uad2_set_sample_rate()` in
+`uad2_pcm_prepare()` (see "Sample Rate Switching" in Testing Status above).
 
 ## Disassembly Reference
 
@@ -1015,6 +1174,21 @@ otool -v -s __TEXT_EXEC __text bin/aarch64-darwin/uad2.kext > bin/aarch64-darwin
 | `CPcieAudioExtension::TransportPosition`            | —                    | 72057       | Done          |
 | `CPcieAudioExtension::_recomputeBufferFrameSize`    | `0x4D9E0`            | 72414       | Done (v0.3.0) |
 | `CPcieAudioExtension::_setSampleClock`              | —                    | 72712       | Done          |
+| `CPcieDeviceMixer::Initialize`                      | `0x4A188`            | 68750       | Done          |
+| `CPcieDeviceMixer::_writeSetting`                   | `0x4A610`            | 69047       | Done          |
+| `CPcieDeviceMixer::_flushCachedSettings`            | `0x4A58C`            | 69013       | Done          |
+| `CPcieDeviceMixer::WriteSetting`                    | —                    | 69222       | Done          |
+| `CPcieDeviceMixer::GetReadback`                     | `0x4A420`            | 68921       | Done          |
+| `CUAD2DeviceMixer::AckSampleRateChange`             | `0x46E74`            | 65455       | Done          |
+| `CDeviceManager::_setSampleClock`                   | `0x2E8EC`            | 40218       | Done          |
+| `CDeviceManager::SetAudioClock`                     | `0x2ECE8`            | 40475       | Done          |
+| `CDeviceManager::_updateRoutingTablesForEvent`      | `0x2949C`            | 34773       | Done          |
+| `CMessenger::DispatchSetAudioSampleRate`            | `0x3DAC0`            | 55867       | Done          |
+| `CMessenger::DispatchSetMixerParam`                 | —                    | 52910       | Done          |
+| `CMessenger::DispatchSetMixerBusParam`              | —                    | 52794       | Done          |
+| `CUAD2AudioMixer::HandleNotification`               | `0x1A220`            | 18968       | Done          |
+| `CUAD2AudioMixer::StartTransport`                   | `0x1B30C`            | 20059       | Done          |
+| `CUAD2AudioMixer::StopTransport`                    | `0x1ABE4`            | 19598       | Done          |
 | `_notifyIntrCallback`                               | (schedules deferred) | —           | Done (v0.4.0) |
 | `_endBufferCallback`                                | —                    | —           | Done (v0.4.0) |
 | `_periodicTimerCallback`                            | —                    | —           | Done (v0.4.0) |
@@ -1022,11 +1196,14 @@ otool -v -s __TEXT_EXEC __text bin/aarch64-darwin/uad2.kext > bin/aarch64-darwin
 
 ### Potential Future Analysis
 
-- `CDeviceManager::_setSampleClock` @ line 40218 (higher-level clock
-  orchestration)
 - Multi-vector MSI setup (register multiple MSI vectors for `0x28`, `0x46`,
   `0x47`)
-- Monitor mixer routing (`BAR+0x224C` and related registers)
+- `SetOtherParam` switch table — full mapping of param IDs 0x01–0x8A to mixer
+  setting indices and bitmasks (required for userspace mixer implementation)
+- `SetMixerBusParam` — bus/channel/group/value parameter format
+- `CUAD2AudioMixer::HandleNotification` — notification dispatch table for IDs
+  0x67–0x6F (partially analyzed: 0x68 = rate change ack, 0x6E/0x6F = routing
+  table rebuild)
 
 ## Project Files
 
