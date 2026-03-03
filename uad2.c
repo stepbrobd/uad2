@@ -392,12 +392,11 @@ struct uad2_dev {
 	 * consumed by threaded bottom-half.  Protected by dev->lock. */
 	u64 irq_active;
 
-	/* Counter for periodic timer interrupts.  The hardirq increments
-	 * this atomically; the thread does atomic_xchg(&count, 0) and calls
-	 * snd_pcm_period_elapsed() N times.  This prevents coalescing of
-	 * multiple periodic interrupts into a single period_elapsed call,
-	 * which would cause the app pointer to fall behind the DMA position. */
-	atomic_t periodic_irq_count;
+	/* Flag set by hardirq when a periodic timer interrupt fires.
+	 * The threaded handler checks this to decide whether to call
+	 * snd_pcm_period_elapsed().  Using atomic_t for lock-free
+	 * access between hardirq and thread contexts. */
+	atomic_t periodic_irq_pending;
 
 	/* Ring buffer DMA allocations (4 x 4KB pages per ring) */
 	dma_addr_t ring_dma_addr[DSP_RING_DESC_SLOTS];
@@ -476,6 +475,23 @@ struct uad2_dev {
 	/* PCM substream pointers for IRQ handler (accessed under lock) */
 	struct snd_pcm_substream *playback_ss;
 	struct snd_pcm_substream *capture_ss;
+
+	/* DMA position offset for hw_ptr alignment.
+	 * When pcm_prepare is called while the transport is already running,
+	 * ALSA resets hw_ptr to 0 but the hardware DMA position counter is
+	 * at some arbitrary value.  We snapshot the hardware position at
+	 * prepare time and subtract it in .pointer() so that ALSA sees
+	 * positions starting from 0.  This avoids the need to stop and
+	 * re-prepare the transport (which causes DMA poll convergence
+	 * failures and audio artifacts).
+	 *
+	 * Set to 0 on cold-start prepare (transport was stopped), set to
+	 * current REG_DMA_POSITION on hot re-prepare. */
+	u32 dma_pos_offset;
+
+	/* Diagnostic: track DMA position between periodic interrupts */
+	u32 dbg_last_dma_pos;
+	u32 dbg_periodic_count;
 };
 
 /* ============================================================
@@ -1574,11 +1590,11 @@ static int uad2_prepare_transport(struct uad2_dev *dev,
 		return -ENODEV;
 	}
 
-	/* NOTE: This stop-and-re-prepare path is currently unreachable through
-	 * normal ALSA operation because uad2_pcm_prepare() returns early when
-	 * transport_state >= 1.  Kept as a safety net in case PrepareTransport
-	 * is ever called directly from another code path (e.g. sample rate
-	 * change while running). */
+	/* Safety net: if transport is running, stop it before re-preparing.
+	 * This path should not be reached during normal ALSA operation
+	 * because uad2_pcm_prepare() uses the fast-path (position offset)
+	 * when transport_state >= 1.  Kept for direct callers like sample
+	 * rate change while running. */
 	if (READ_ONCE(dev->transport_state) == 2) {
 		dev_dbg(&dev->pci->dev,
 			"PrepareTransport: stopping running transport for re-prepare\n");
@@ -1602,6 +1618,9 @@ static int uad2_prepare_transport(struct uad2_dev *dev,
 
 	/* 7. Clear DMA position counter */
 	uad2_write32(dev, REG_DMA_POSITION, 0);
+	dev->dma_pos_offset = 0;
+	dev->dbg_last_dma_pos = 0;
+	dev->dbg_periodic_count = 0;
 
 	/* 8. Periodic timer (if configured) */
 	if (dev->periodic_timer_interval) {
@@ -2262,32 +2281,47 @@ static int uad2_pcm_prepare(struct snd_pcm_substream *ss)
 	 * where N is the number of frames between periodic interrupts. */
 	dev->periodic_timer_interval = uad2_periodic_timer_for_rate(rt->rate);
 
-	/* If transport is already running or prepared with the same parameters,
-	 * skip re-preparation.  This avoids the destructive stop-and-re-prepare
-	 * cycle that kills the other stream when PipeWire opens both playback
-	 * and capture independently.
+	/* Transport re-preparation strategy:
 	 *
-	 * Since the transport now stays running across trigger(STOP)/START
-	 * cycles, the DMA buffer may contain stale audio data.  Zero the
-	 * playback buffer to prevent the "DJ looping" artifact where old
-	 * audio is replayed when a new stream starts.
+	 * ALSA's snd_pcm_prepare() always resets hw_ptr and appl_ptr to 0
+	 * (via snd_pcm_do_reset → snd_pcm_lib_ioctl_reset).  Our .pointer()
+	 * callback must return values consistent with hw_ptr=0 after prepare.
 	 *
-	 * Only zero when no streams are running — during PipeWire's rapid
-	 * STOP→prepare→START cycles the buffer is about to be filled
-	 * immediately so zeroing is unnecessary overhead. */
+	 * If the transport is already running, we do NOT stop it.  Stopping
+	 * and re-preparing causes DMA poll convergence failures (the hardware
+	 * REG_POLL_STATUS register retains stale values after stop, never
+	 * reaching the expected irq_period value).  This leads to starting
+	 * the transport in a half-initialized state → artifacts, pitch
+	 * changes, scratchy noise.
+	 *
+	 * Instead, we use a position-offset approach inspired by the
+	 * snd-dice/AMDTP driver pattern:
+	 *   - Snapshot the current DMA position as dma_pos_offset
+	 *   - In .pointer(), return (hw_pos - dma_pos_offset) % buffer_frames
+	 *   - This makes ALSA see positions starting from 0, matching hw_ptr
+	 *
+	 * For cold-start (transport not yet prepared), we do the full
+	 * prepare_transport sequence which resets DMA position to 0. */
 	if (READ_ONCE(dev->transport_state) >= 1) {
-		if (ss->stream == SNDRV_PCM_STREAM_PLAYBACK && rt->dma_area &&
-		    rt->dma_bytes && READ_ONCE(dev->streams_running) == 0)
-			memset(rt->dma_area, 0, rt->dma_bytes);
+		/* Transport already prepared or running — skip re-preparation.
+		 * Snapshot current DMA position as offset for .pointer(). */
+		u32 cur_pos = uad2_read32(dev, REG_DMA_POSITION);
+
+		if (cur_pos >= dev->buffer_frames)
+			cur_pos = 0;
+		dev->dma_pos_offset = cur_pos;
 		dev_dbg(&dev->pci->dev,
-			"pcm_prepare: stream=%s transport already %s (state=%d) streams_prepared=%d\n",
+			"pcm_prepare: stream=%s FAST PATH (transport_state=%d) dma_pos_offset=%u streams_prepared=%d\n",
 			ss->stream == SNDRV_PCM_STREAM_PLAYBACK ? "play" :
 								  "cap",
-			READ_ONCE(dev->transport_state) == 2 ? "running" :
-							       "prepared",
-			READ_ONCE(dev->transport_state), dev->streams_prepared);
+			READ_ONCE(dev->transport_state), cur_pos,
+			dev->streams_prepared);
 		return 0;
 	}
+
+	/* Cold start — full transport preparation.
+	 * prepare_transport writes REG_DMA_POSITION=0, so offset is 0. */
+	dev->dma_pos_offset = 0;
 
 	dev_dbg(&dev->pci->dev,
 		"pcm_prepare: stream=%s FULL PREPARE (transport_state=%d) streams_prepared=%d\n",
@@ -2360,8 +2394,9 @@ static int uad2_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
 		 *   - The DMA writes harmlessly to our 4MB buffers
 		 *   - When PipeWire triggers START again, it joins the
 		 *     already-running transport instantly (no re-init)
-		 *   - pcm_prepare sees transport_state >= 1 and skips
-		 *     the expensive re-preparation
+		 *   - pcm_prepare snapshots the DMA position as an offset
+		 *     so .pointer() reports 0-relative positions matching
+		 *     ALSA's hw_ptr=0 reset
 		 *
 		 * Transport teardown happens in pcm_close when open_count
 		 * reaches 0, or in uad2_shutdown/uad2_remove. */
@@ -2386,7 +2421,7 @@ static int uad2_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
 static snd_pcm_uframes_t uad2_pcm_pointer(struct snd_pcm_substream *ss)
 {
 	struct uad2_dev *dev = snd_pcm_substream_chip(ss);
-	u32 pos;
+	u32 pos, offset;
 
 	pos = uad2_read32(dev, REG_DMA_POSITION);
 
@@ -2396,6 +2431,16 @@ static snd_pcm_uframes_t uad2_pcm_pointer(struct snd_pcm_substream *ss)
 	 * Clamp against the hardware value for safety. */
 	if (pos >= dev->buffer_frames)
 		pos = 0;
+
+	/* Apply the position offset from pcm_prepare.
+	 * When prepare is called while the transport is already running,
+	 * we snapshot the DMA position at prepare time.  Subtracting it
+	 * here makes ALSA see positions starting from 0, consistent with
+	 * the hw_ptr=0 reset that ALSA performs internally.
+	 *
+	 * For cold-start prepare, dma_pos_offset is 0 (no-op). */
+	offset = READ_ONCE(dev->dma_pos_offset);
+	pos = (pos - offset + dev->buffer_frames) % dev->buffer_frames;
 
 	return pos;
 }
@@ -2483,7 +2528,7 @@ static irqreturn_t uad2_irq_hard(int irq, void *data)
 {
 	struct uad2_dev *dev = data;
 	u32 pending_lo, pending_hi = 0;
-	u64 pending, active;
+	u64 pending, active, one_shot;
 
 	/* Step 1: Read pending interrupt bitmask from DMA status registers */
 	pending_lo = uad2_read32(dev, REG_DMA0_STATUS);
@@ -2500,38 +2545,68 @@ static irqreturn_t uad2_irq_hard(int irq, void *data)
 
 	pending = (u64)pending_hi << 32 | pending_lo;
 
-	/* Step 2: AND with enable shadow to get active slots */
-	spin_lock(&dev->lock);
-	active = pending & dev->intr_enable_shadow;
-	spin_unlock(&dev->lock);
-
-	if (!active)
-		return IRQ_NONE;
-
-	/* Step 3: Write back ALL pending bits to status registers.
+	/* Step 2: Under a single spinlock, filter active bits, disable
+	 * one-shot vectors in the enable shadow, and stash active bits
+	 * for the threaded handler.
 	 *
-	 * The kext writes back the full pending bitmask, not just the
-	 * enabled (active) bits.  The hardware requires all pending
-	 * interrupt sources to be acknowledged by writing their bits
-	 * back to the status registers.  If we only write back the
-	 * active (enabled) bits, the unacknowledged bits keep the
-	 * interrupt line asserted, preventing new MSI edge-triggered
-	 * deliveries — so we'd only ever see one interrupt. */
-	uad2_write32(dev, REG_DMA0_STATUS, pending_lo);
-	if (dev->has_extended_irq && pending_hi)
-		uad2_write32(dev, REG_DMA1_STATUS, pending_hi);
-
-	/* Stash active bitmask for the threaded handler.
-	 * Use atomic OR so concurrent hardirqs accumulate bits. */
+	 * The kext's ServiceInterrupt:
+	 *   active = pending & enableShadow
+	 *   enableShadow &= ~oneShotActive
+	 *   write enableShadow to DMA0/DMA1 ENABLE registers
+	 *   deferredPending |= active
+	 *
+	 * One-shot vectors (periodic timer slot 62, end-of-buffer slot 63)
+	 * must be disabled in the ENABLE registers HERE in the hardirq,
+	 * BEFORE we ack the status bits.  Otherwise a new event could fire
+	 * immediately after ack and before the threaded handler re-arms,
+	 * causing spurious/duplicate interrupts. */
 	spin_lock(&dev->lock);
+
+	active = pending & dev->intr_enable_shadow;
+	if (!active) {
+		spin_unlock(&dev->lock);
+		return IRQ_NONE;
+	}
+
+	/* Disable one-shot vectors (periodic + end-of-buffer) in shadow.
+	 * The threaded handler re-arms periodic via EnableVector(0x46, 1).
+	 * End-of-buffer is re-armed by prepare_transport. */
+	one_shot = active &
+		   (BIT_ULL(INTR_SLOT_PERIODIC) | BIT_ULL(INTR_SLOT_ENDBUF));
+	if (one_shot) {
+		dev->intr_enable_shadow &= ~one_shot;
+		uad2_write32(dev, REG_DMA0_INTR_CTRL,
+			     (u32)dev->intr_enable_shadow);
+		if (dev->has_extended_irq)
+			uad2_write32(dev, REG_DMA1_INTR_CTRL,
+				     (u32)(dev->intr_enable_shadow >> 32));
+	}
+
 	dev->irq_active |= active;
+
 	spin_unlock(&dev->lock);
 
-	/* Count periodic timer interrupts separately to avoid coalescing.
-	 * The bitmask OR above loses count when multiple periodic IRQs
-	 * fire before the thread runs. */
+	/* Step 3: Ack only the ACTIVE (enabled) bits to status registers.
+	 *
+	 * The kext filters pending through the enable shadow early on
+	 * (active = pending & enableShadow) and only writes active bits
+	 * back to the status registers — never raw pending.  This avoids
+	 * acking interrupts we didn't enable, which could confuse the
+	 * firmware or clear events meant for other purposes.
+	 *
+	 * With MSI, un-acked but disabled bits remain pending in the
+	 * device's internal state.  If a slot is later enabled, the
+	 * pending bit will become active on the next read — correct
+	 * level-triggered-like behavior within the device's interrupt
+	 * controller. */
+	uad2_write32(dev, REG_DMA0_STATUS, (u32)active);
+	if (dev->has_extended_irq && (u32)(active >> 32))
+		uad2_write32(dev, REG_DMA1_STATUS, (u32)(active >> 32));
+
+	/* Signal that a periodic timer interrupt fired.
+	 * The threaded handler will call snd_pcm_period_elapsed(). */
 	if (active & BIT_ULL(INTR_SLOT_PERIODIC))
-		atomic_inc(&dev->periodic_irq_count);
+		atomic_set(&dev->periodic_irq_pending, 1);
 
 	return IRQ_WAKE_THREAD;
 }
@@ -2546,7 +2621,6 @@ static irqreturn_t uad2_irq_thread(int irq, void *data)
 	struct uad2_dev *dev = data;
 	u64 active;
 	struct snd_pcm_substream *play_ss, *cap_ss;
-	int periodic_count, i;
 
 	/* Consume accumulated active bits */
 	spin_lock_irq(&dev->lock);
@@ -2570,20 +2644,44 @@ static irqreturn_t uad2_irq_thread(int irq, void *data)
 	 * IMPORTANT: The hardware periodic timer is one-shot-per-fire.
 	 * The kext's ServiceInterrupt unconditionally disables vector 0x46
 	 * in the CTRL register after it fires.  The deferred handler then
-	 * calls ResetPeriodicTimerInterrupt → EnableVector(0x46, 1) to
+	 * calls ResetPeriodicTimerInterrupt -> EnableVector(0x46, 1) to
 	 * re-arm it for the next period.  We must do the same here.
 	 *
-	 * We use atomic_xchg to drain the periodic_irq_count and call
-	 * snd_pcm_period_elapsed() once per actual hardware interrupt.
-	 * With one-shot hardware, periodic_count should always be 1,
-	 * but the counter protects against edge cases. */
-	periodic_count = atomic_xchg(&dev->periodic_irq_count, 0);
-	if (periodic_count > 0) {
+	 * snd_pcm_period_elapsed() always calls our .pointer() callback
+	 * to read the actual hardware DMA position.  It computes hw_ptr
+	 * from that position and handles multi-period advancement
+	 * internally.  Even if multiple periods elapsed since the last
+	 * call, a single snd_pcm_period_elapsed() is sufficient — ALSA
+	 * will see the full advancement and wake userspace accordingly.
+	 * (See sound/core/pcm_lib.c update_hw_ptr_interrupt.) */
+	if (atomic_xchg(&dev->periodic_irq_pending, 0)) {
+		u32 dma_pos = uad2_read32(dev, REG_DMA_POSITION);
+		u32 last_pos = dev->dbg_last_dma_pos;
+		u32 count = ++dev->dbg_periodic_count;
+
+		dev->dbg_last_dma_pos = dma_pos;
+
+		/* Log every periodic interrupt: position, delta, count.
+		 * This is the key diagnostic for the DJ looping bug. */
+		dev_dbg(&dev->pci->dev,
+			"periodic[%u]: pos=%u last=%u running=%d transport=%d shadow=0x%llx\n",
+			count, dma_pos, last_pos,
+			READ_ONCE(dev->streams_running),
+			READ_ONCE(dev->transport_state),
+			dev->intr_enable_shadow);
+
+		/* Warn if position appears stuck (same value two consecutive
+		 * interrupts — could indicate DMA stall or register read
+		 * problem). */
+		if (dma_pos == last_pos && count > 1 &&
+		    READ_ONCE(dev->streams_running) > 0)
+			dev_warn(&dev->pci->dev,
+				 "periodic[%u]: DMA position STUCK at %u!\n",
+				 count, dma_pos);
+
 		if (READ_ONCE(dev->streams_running) > 0) {
 			bool play_run, cap_run;
 
-			/* Snapshot substream pointers AND running flags under
-			 * lock to avoid race with trigger/open/close */
 			spin_lock_irq(&dev->lock);
 			play_ss = dev->playback_ss;
 			cap_ss = dev->capture_ss;
@@ -2591,25 +2689,26 @@ static irqreturn_t uad2_irq_thread(int irq, void *data)
 			cap_run = dev->capture_running;
 			spin_unlock_irq(&dev->lock);
 
-			/* Call period_elapsed N times — once for each hardware
-			 * periodic interrupt that was coalesced. */
-			for (i = 0; i < periodic_count; i++) {
-				if (play_ss && play_run)
-					snd_pcm_period_elapsed(play_ss);
-				if (cap_ss && cap_run)
-					snd_pcm_period_elapsed(cap_ss);
-			}
+			if (play_ss && play_run)
+				snd_pcm_period_elapsed(play_ss);
+			if (cap_ss && cap_run)
+				snd_pcm_period_elapsed(cap_ss);
 		}
 
 		/* Re-arm the periodic timer vector (one-shot-per-fire).
 		 * This matches the kext's ResetPeriodicTimerInterrupt()
 		 * which calls EnableVector(0x46, 1) after ProcessAudio.
-		 * Must be done regardless of streams_running state — the
+		 * Must be done regardless of streams_running state -- the
 		 * transport may still be active and we need to keep
 		 * receiving timer interrupts until StopTransport disables
 		 * the vector. */
 		if (READ_ONCE(dev->transport_state) == 2)
 			uad2_enable_vector(dev, INTR_SLOT_PERIODIC, true);
+		else
+			dev_warn(
+				&dev->pci->dev,
+				"periodic[%u]: re-arm SKIPPED (transport_state=%d)\n",
+				count, READ_ONCE(dev->transport_state));
 	}
 
 	/* End-of-buffer interrupt (slot 63 = vector 0x47).
