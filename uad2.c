@@ -177,18 +177,6 @@
 /* IO descriptor channel type offset: uint16 descriptors start at +0x18
  * within the IO descriptor block (after header fields).
  * Each uint16: high byte = type index, low byte = sub-index */
-#define IO_DESC_CHAN_OFFSET 0x18
-
-/* Channel type names (from kext binary string table @ 0x60368)
- * Index into this table is the high byte of the uint16 channel descriptor */
-static const char *const uad2_channel_type_names[] = {
-	[0] = "MIC/LINE/HIZ", [1] = "MIC/LINE", [2] = "AUX",
-	[3] = "LINE",	      [4] = "ADAT",	[5] = "S/PDIF",
-	[6] = "AES/EBU",      [7] = "VIRTUAL",	[8] = "MADI",
-	[9] = "MON",	      [10] = "CUE",	[11] = "TALKBACK",
-	[12] = "RESERVED",    [13] = "DANTE",	[14] = "UNKNOWN",
-};
-#define UAD2_NUM_CHAN_TYPES ARRAY_SIZE(uad2_channel_type_names)
 
 /* ============================================================
  * DSP ring buffer registers (relative to ring_base)
@@ -593,7 +581,6 @@ static int uad2_set_sample_rate(struct uad2_dev *dev, unsigned int rate)
 				 dev_id);
 
 		dev->current_rate = rate;
-		dev_dbg(&dev->pci->dev, "Sample rate changed to %u Hz\n", rate);
 		return 0;
 	}
 
@@ -853,12 +840,8 @@ static int uad2_dsp_wait_ready(struct uad2_dev *dev,
 	/* Kext final success check: bit 0 of last read value must be set.
 	 * arm64: tbnz w20, #0x0, <success>
 	 * x86_64: testb $0x1, %r13b; jne <success> */
-	if (val & 1) {
-		dev_dbg(&dev->pci->dev,
-			"DSP %d ready after %d polls (val=0x%08x)\n", dsp_index,
-			i + 1, val);
+	if (val & 1)
 		return 0;
-	}
 
 	dev_err(&dev->pci->dev,
 		"DSP %d failed to start (timeout after %dms, val=0x%08x)\n",
@@ -895,8 +878,6 @@ static int uad2_ring_program(struct uad2_dev *dev, void __iomem *ring_base,
 			ring_idx, ring_size);
 		ring_size = 0;
 	}
-
-	dev_dbg(&dev->pci->dev, "Ring %d capacity=0x%x\n", ring_idx, ring_size);
 
 	/* Program ring size and descriptor count */
 	iowrite32(ring_size, ring_base + DSP_RING_SIZE_REG);
@@ -962,12 +943,6 @@ static int uad2_dsp_program(struct uad2_dev *dev, int dsp_index)
 		dsp_poll_base = dev->bar + (dsp_index * 0x800);
 	else
 		dsp_poll_base = dev->bar + 0x2000 + (dsp_index * 0x800);
-
-	dev_dbg(&dev->pci->dev,
-		"DSP %d ring_base=BAR+0x%04lx ring2=BAR+0x%04lx poll=BAR+0x%04lx\n",
-		dsp_index, (unsigned long)(ring_base - dev->bar),
-		(unsigned long)(ring2_base - dev->bar),
-		(unsigned long)(dsp_poll_base - dev->bar));
 
 	/* Wait for DSP firmware.
 	 * Kext condition: dsp_type == 1 && this+0x18 == 0.
@@ -1047,8 +1022,6 @@ static int uad2_alloc_sg_buffers(struct uad2_dev *dev)
 			return -ENOMEM;
 		}
 		/* dma_alloc_coherent returns zeroed memory */
-		dev_dbg(&dev->pci->dev, "SG buffer %d: dma=%pad size=0x%zx\n",
-			i, &dev->sg_dma_addr[i], dev->sg_buf_size);
 	}
 
 	return 0;
@@ -1126,16 +1099,9 @@ static int uad2_audio_ext_program(struct uad2_dev *dev)
 		sg_offset += SG_ENTRY_SIZE;
 	}
 
-	dev_dbg(&dev->pci->dev,
-		"Scatter-gather tables programmed: %u entries, play_dma=%pad cap_dma=%pad\n",
-		SG_NUM_ENTRIES, &dev->sg_dma_addr[0], &dev->sg_dma_addr[1]);
-
 	/* Phase 3: Read firmware base address (BAR+0x30 lo, BAR+0x34 hi) */
 	dev->fw_base_addr = ((u64)uad2_read32(dev, REG_FW_BASE_HI) << 32) |
 			    uad2_read32(dev, REG_FW_BASE_LO);
-	dev_dbg(&dev->pci->dev, "Firmware base address: 0x%016llx\n",
-		dev->fw_base_addr);
-
 	/* Phase 4: Enable interrupt vector 0x28 (notification interrupt)
 	 *
 	 * In the kext, this calls CPcieIntrManager::EnableVector(0x28, 1).
@@ -1188,8 +1154,6 @@ static void uad2_handle_notification(struct uad2_dev *dev)
 
 	dev->notify_status = status;
 
-	dev_dbg(&dev->pci->dev, "Notification: 0x%08x\n", status);
-
 	/* Bit 5: Connect/rate-change ack.
 	 * The kext has two separate CUAOS::Event objects both signaled
 	 * by bit 5: connect_event (this+0x2830) used during Connect(),
@@ -1197,7 +1161,6 @@ static void uad2_handle_notification(struct uad2_dev *dev)
 	 * We signal both completions here — only the one being waited
 	 * on will actually wake a thread. */
 	if (status & NOTIFY_CONNECT_ACK) {
-		dev_dbg(&dev->pci->dev, "Connect/rate ack received\n");
 		complete(&dev->connect_event);
 		complete(&dev->rate_event);
 	}
@@ -1207,8 +1170,6 @@ static void uad2_handle_notification(struct uad2_dev *dev)
 	 * IO descriptor re-reads and rate change handling. */
 	if (status & NOTIFY_CHAN_CONFIG) {
 		int i;
-
-		dev_dbg(&dev->pci->dev, "Channel config update\n");
 
 		/* Copy 10 DWORDs of channel config from BAR+0xC000 */
 		for (i = 0; i < CHAN_CONFIG_DWORDS; i++)
@@ -1233,11 +1194,8 @@ static void uad2_handle_notification(struct uad2_dev *dev)
 
 		/* Channel count is at DWORD[4] (offset +0x10) */
 		play_ch = dev->play_io_desc[4];
-		if (play_ch > 0 && play_ch <= 128) {
+		if (play_ch > 0 && play_ch <= 128)
 			WRITE_ONCE(dev->play_channels, play_ch);
-			dev_dbg(&dev->pci->dev, "Playback channels: %u\n",
-				play_ch);
-		}
 	}
 
 	/* Bit 1: Record IO ready — kext copies 72 DWORDs from BAR+0xC1A4 */
@@ -1252,21 +1210,8 @@ static void uad2_handle_notification(struct uad2_dev *dev)
 
 		/* Channel count is at DWORD[4] */
 		rec_ch = dev->rec_io_desc[4];
-		if (rec_ch > 0 && rec_ch <= 128) {
+		if (rec_ch > 0 && rec_ch <= 128)
 			WRITE_ONCE(dev->rec_channels, rec_ch);
-			dev_dbg(&dev->pci->dev, "Record channels: %u\n",
-				rec_ch);
-		}
-	}
-
-	/* Bit 22: Rate change */
-	if (status & NOTIFY_RATE_CHANGE) {
-		dev_dbg(&dev->pci->dev, "Rate change notification\n");
-	}
-
-	/* Bit 4: DMA ready */
-	if (status & NOTIFY_DMA_READY) {
-		dev_dbg(&dev->pci->dev, "DMA ready notification\n");
 	}
 
 	/* Bit 6: Error */
@@ -1279,74 +1224,10 @@ static void uad2_handle_notification(struct uad2_dev *dev)
 		complete(&dev->notify_event);
 	}
 
-	/* Bit 7: End buffer */
-	if (status & NOTIFY_END_BUFFER) {
-		dev_dbg(&dev->pci->dev, "End buffer notification\n");
-	}
-
 	/* Clear the notification register (write-to-clear) */
 	uad2_write32(dev, notify_reg, 0x0);
 
 	spin_unlock_irqrestore(&dev->notify_lock, flags);
-}
-
-/* ============================================================
- * Channel mapping decode and logging
- *
- * After firmware Connect, the IO descriptor areas contain uint16
- * descriptors for each channel.  Each uint16 encodes:
- *   high byte (bits 15:8) = type index into uad2_channel_type_names[]
- *   low byte  (bits 7:0)  = sub-index within that type
- *
- * From kext _parseIONames @ 0x4d818 (line 72299):
- *   - Stereo types (MON, S/PDIF, AES/EBU, AUX, CUE): pair via (sub+1)/2
- *   - L/R suffix for types with bit pattern: even=L, odd=R
- *
- * Descriptor locations (NO channel_base_index offset — flat BAR):
- *   Playback: BAR + 0xC2C4 + 0x18
- *   Record:   BAR + 0xC1A4 + 0x18
- * ============================================================ */
-static void uad2_log_channel_map(struct uad2_dev *dev, const char *dir,
-				 u32 io_desc_base, unsigned int num_channels)
-{
-	u32 desc_reg;
-	unsigned int i;
-
-	if (num_channels == 0 || num_channels > 128)
-		return;
-
-	desc_reg = io_desc_base + IO_DESC_CHAN_OFFSET;
-
-	dev_dbg(&dev->pci->dev, "%s channel map (%u channels):\n", dir,
-		num_channels);
-
-	/* Read uint16 descriptors — two per 32-bit register read */
-	for (i = 0; i < num_channels; i += 2) {
-		u32 dword = uad2_read32(dev, desc_reg + (i / 2) * 4);
-		u16 desc0 = dword & 0xFFFF;
-		u16 desc1 = (dword >> 16) & 0xFFFF;
-		u8 type0 = desc0 >> 8;
-		u8 sub0 = desc0 & 0xFF;
-		const char *name0 = (type0 < UAD2_NUM_CHAN_TYPES) ?
-					    uad2_channel_type_names[type0] :
-					    "?";
-
-		dev_dbg(&dev->pci->dev, "  ch %2u: type=%2u sub=%u (%s)\n", i,
-			type0, sub0, name0);
-
-		if (i + 1 < num_channels) {
-			u8 type1 = desc1 >> 8;
-			u8 sub1 = desc1 & 0xFF;
-			const char *name1 =
-				(type1 < UAD2_NUM_CHAN_TYPES) ?
-					uad2_channel_type_names[type1] :
-					"?";
-
-			dev_dbg(&dev->pci->dev,
-				"  ch %2u: type=%2u sub=%u (%s)\n", i + 1,
-				type1, sub1, name1);
-		}
-	}
 }
 
 /* ============================================================
@@ -1434,10 +1315,6 @@ static int uad2_audio_connect(struct uad2_dev *dev)
 			if (try_wait_for_completion(&dev->notify_event))
 				goto connect_done;
 		}
-
-		dev_dbg(&dev->pci->dev,
-			"Connect attempt %d: no response after %d retries\n",
-			chan, UAD2_CONNECT_RETRIES);
 	}
 
 	/* All 20 attempts exhausted without a single firmware response */
@@ -1459,12 +1336,6 @@ connect_done:
 
 	dev->buffer_frames = uad2_compute_buffer_frames(dev->play_channels,
 							dev->rec_channels);
-
-	/* Log the channel mapping from firmware IO descriptors */
-	uad2_log_channel_map(dev, "Playback", REG_PLAYBACK_IO_DESC,
-			     dev->play_channels);
-	uad2_log_channel_map(dev, "Record", REG_RECORD_IO_DESC,
-			     dev->rec_channels);
 
 	dev_info(&dev->pci->dev,
 		 "Audio connected: play=%u rec=%u buffer_frames=%u\n",
@@ -1585,11 +1456,8 @@ static int uad2_prepare_transport(struct uad2_dev *dev,
 	 * because uad2_pcm_prepare() uses the fast-path (position offset)
 	 * when transport_state >= 1.  Kept for direct callers like sample
 	 * rate change while running. */
-	if (READ_ONCE(dev->transport_state) == 2) {
-		dev_dbg(&dev->pci->dev,
-			"PrepareTransport: stopping running transport for re-prepare\n");
+	if (READ_ONCE(dev->transport_state) == 2)
 		uad2_stop_transport(dev);
-	}
 	if (buffer_frames >= 0x10000) {
 		dev_err(&dev->pci->dev,
 			"PrepareTransport: buffer_frames 0x%x out of range\n",
@@ -1615,9 +1483,6 @@ static int uad2_prepare_transport(struct uad2_dev *dev,
 		uad2_write32(dev, REG_PERIODIC_TIMER,
 			     dev->periodic_timer_interval);
 		__uad2_enable_vector_locked(dev, INTR_SLOT_PERIODIC, true);
-		dev_dbg(&dev->pci->dev,
-			"Periodic timer: interval=%u, shadow=0x%llx\n",
-			dev->periodic_timer_interval, dev->intr_enable_shadow);
 	}
 
 	/* 9-10. Clear position again + read-back flush */
@@ -1658,24 +1523,13 @@ static int uad2_prepare_transport(struct uad2_dev *dev,
 	for (i = 0; i < 3; i++) {
 		u32 poll_val = uad2_read32(dev, REG_POLL_STATUS);
 
-		dev_dbg(&dev->pci->dev,
-			"DMA poll %d: REG_POLL_STATUS=0x%x (expect 0x%x)\n", i,
-			poll_val, irq_period_frames);
-		if (poll_val == irq_period_frames) {
-			dev_dbg(&dev->pci->dev, "DMA ready after %d polls\n",
-				i + 1);
+		if (poll_val == irq_period_frames)
 			break;
-		}
 		usleep_range(1000, 2000);
 	}
 
 	/* 21. Enable end-of-buffer interrupt vector */
 	uad2_enable_vector(dev, INTR_SLOT_ENDBUF, true);
-
-	dev_dbg(&dev->pci->dev,
-		"Transport prepared: buf=%u irq=%u play=%u rec=%u intr_shadow=0x%llx\n",
-		buffer_frames, irq_period_frames, play_channels, rec_channels,
-		dev->intr_enable_shadow);
 
 	return 0;
 }
@@ -1712,11 +1566,8 @@ static void uad2_start_transport(struct uad2_dev *dev)
 	 * no-op — the transport is already doing what the caller wants.
 	 * macOS avoids this because CoreAudio starts all streams atomically
 	 * through the mixer layer. */
-	if (READ_ONCE(dev->transport_state) == 2) {
-		dev_dbg(&dev->pci->dev,
-			"StartTransport: already running, no-op\n");
+	if (READ_ONCE(dev->transport_state) == 2)
 		return;
-	}
 	if (READ_ONCE(dev->transport_state) != 1) {
 		dev_warn(&dev->pci->dev,
 			 "StartTransport: not prepared (state=%d)\n",
@@ -1732,9 +1583,6 @@ static void uad2_start_transport(struct uad2_dev *dev)
 	uad2_write32(dev, REG_TRANSPORT_CTL, 0xF);
 	WRITE_ONCE(dev->transport_state, 2);
 	spin_unlock_irqrestore(&dev->lock, flags);
-	dev_dbg(&dev->pci->dev,
-		"StartTransport: wrote 0xF, state=2, intr_shadow=0x%llx\n",
-		dev->intr_enable_shadow);
 }
 
 /* ============================================================
@@ -1763,7 +1611,6 @@ static void uad2_stop_transport(struct uad2_dev *dev)
 	uad2_write32(dev, REG_TRANSPORT_CTL, 0x0);
 	WRITE_ONCE(dev->transport_state, 0);
 	spin_unlock_irqrestore(&dev->lock, flags);
-	dev_dbg(&dev->pci->dev, "StopTransport: state=0\n");
 }
 
 /* ============================================================
@@ -1805,8 +1652,6 @@ static void uad2_shutdown(struct uad2_dev *dev)
 	WRITE_ONCE(dev->streams_running, 0);
 	WRITE_ONCE(dev->streams_prepared, 0);
 	WRITE_ONCE(dev->open_count, 0);
-
-	dev_dbg(&dev->pci->dev, "Shutdown complete\n");
 }
 
 /* ============================================================
@@ -2031,12 +1876,6 @@ static int uad2_pcm_open(struct snd_pcm_substream *ss)
 		spin_unlock_irqrestore(&dev->lock, flags);
 	}
 
-	dev_dbg(&dev->pci->dev,
-		"pcm_open: stream=%s open_count=%d transport_state=%d streams_prepared=%d streams_running=%d\n",
-		ss->stream == SNDRV_PCM_STREAM_PLAYBACK ? "play" : "cap",
-		READ_ONCE(dev->open_count), READ_ONCE(dev->transport_state),
-		dev->streams_prepared, READ_ONCE(dev->streams_running));
-
 	/* Tell ALSA that playback and capture share a clock source.
 	 * This sets matching sync IDs so userspace (PipeWire/PulseAudio)
 	 * knows the streams are phase-locked. */
@@ -2090,12 +1929,6 @@ static int uad2_pcm_close(struct snd_pcm_substream *ss)
 	open_count = dev->open_count;
 	spin_unlock_irqrestore(&dev->lock, flags);
 
-	dev_dbg(&dev->pci->dev,
-		"pcm_close: stream=%s open_count=%d transport_state=%d streams_running=%d streams_prepared=%d\n",
-		ss->stream == SNDRV_PCM_STREAM_PLAYBACK ? "play" : "cap",
-		open_count, READ_ONCE(dev->transport_state),
-		READ_ONCE(dev->streams_running), dev->streams_prepared);
-
 	/* Following the snd-dice/snd-bebob pattern: only tear down the
 	 * shared transport when ALL substreams have been closed.
 	 *
@@ -2115,12 +1948,8 @@ static int uad2_pcm_close(struct snd_pcm_substream *ss)
 		int state = READ_ONCE(dev->transport_state);
 
 		if (state == 2) {
-			dev_dbg(&dev->pci->dev,
-				"pcm_close: last substream closed, stopping transport\n");
 			uad2_stop_transport(dev);
 		} else if (state == 1) {
-			dev_dbg(&dev->pci->dev,
-				"pcm_close: last substream closed, resetting transport to idle\n");
 			WRITE_ONCE(dev->transport_state, 0);
 		}
 	}
@@ -2153,9 +1982,6 @@ static int uad2_pcm_hw_params(struct snd_pcm_substream *ss,
 	runtime->dma_area = dev->sg_dma_buf[buf_idx];
 	runtime->dma_addr = dev->sg_dma_addr[buf_idx];
 	runtime->dma_bytes = buf_bytes;
-
-	dev_dbg(&dev->pci->dev, "hw_params: stream=%d buf_bytes=%zu dma=%pad\n",
-		ss->stream, buf_bytes, &runtime->dma_addr);
 
 	return 0;
 }
@@ -2191,12 +2017,6 @@ static int uad2_pcm_hw_free(struct snd_pcm_substream *ss)
 			dev->streams_prepared = 0;
 	}
 	spin_unlock_irqrestore(&dev->lock, flags);
-
-	dev_dbg(&dev->pci->dev,
-		"hw_free: stream=%s streams_prepared=%d open_count=%d transport_state=%d\n",
-		ss->stream == SNDRV_PCM_STREAM_PLAYBACK ? "play" : "cap",
-		dev->streams_prepared, dev->open_count,
-		READ_ONCE(dev->transport_state));
 
 	return 0;
 }
@@ -2306,23 +2126,12 @@ static int uad2_pcm_prepare(struct snd_pcm_substream *ss)
 		if (cur_pos >= dev->buffer_frames)
 			cur_pos = 0;
 		dev->dma_pos_offset = cur_pos;
-		dev_dbg(&dev->pci->dev,
-			"pcm_prepare: stream=%s FAST PATH (transport_state=%d) dma_pos_offset=%u streams_prepared=%d\n",
-			ss->stream == SNDRV_PCM_STREAM_PLAYBACK ? "play" :
-								  "cap",
-			READ_ONCE(dev->transport_state), cur_pos,
-			dev->streams_prepared);
 		return 0;
 	}
 
 	/* Cold start — full transport preparation.
 	 * prepare_transport writes REG_DMA_POSITION=0, so offset is 0. */
 	dev->dma_pos_offset = 0;
-
-	dev_dbg(&dev->pci->dev,
-		"pcm_prepare: stream=%s FULL PREPARE (transport_state=%d) streams_prepared=%d\n",
-		ss->stream == SNDRV_PCM_STREAM_PLAYBACK ? "play" : "cap",
-		READ_ONCE(dev->transport_state), dev->streams_prepared);
 
 	/* Prepare transport with hardware parameters.
 	 * Always program the full hardware channel counts — the DMA
@@ -2349,11 +2158,6 @@ static int uad2_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
 		else
 			dev->capture_running = true;
 		spin_unlock_irqrestore(&dev->lock, flags);
-		dev_dbg(&dev->pci->dev,
-			"trigger START: stream=%s streams_running=%d, transport_state=%d\n",
-			ss->stream == SNDRV_PCM_STREAM_PLAYBACK ? "play" :
-								  "cap",
-			dev->streams_running, READ_ONCE(dev->transport_state));
 		uad2_start_transport(dev);
 		return 0;
 
@@ -2396,11 +2200,6 @@ static int uad2_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
 		 *
 		 * Transport teardown happens in pcm_close when open_count
 		 * reaches 0, or in uad2_shutdown/uad2_remove. */
-		dev_dbg(&dev->pci->dev,
-			"trigger STOP: stream=%s streams_running=%d open_count=%d (transport kept alive)\n",
-			ss->stream == SNDRV_PCM_STREAM_PLAYBACK ? "play" :
-								  "cap",
-			READ_ONCE(dev->streams_running), dev->open_count);
 		return 0;
 	}
 	return -EINVAL;
