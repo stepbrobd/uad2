@@ -393,18 +393,18 @@ From `CPcieDevice::ProgramRegisters` @ `0xDF48`, exact order:
 3. Read `BAR+(channel_base_index<<2)+0xC008` → notification bitmask
 4. **Dispatch:**
 
-| Bit  | Event                       | Action                                                                                                                                                                                                                   |
-| ---- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| 5    | Connect ack                 | Signal `connectEvent` (`this+0x2838`)                                                                                                                                                                                    |
-| 21   | Channel config (first pass) | Lock `this+0x10`, copy 10 DWORDs from `BAR+0xC000` to `this+0x24`, copy up to `0x5F` DWORDs from `BAR+(idx<<2)+0xC000` to `this+0x4C`, unlock, parse channel names. **Forces bits 0+1 on** (`orr w20, w20, #0x00400003`) |
-| 0    | Playback IO ready           | Lock, copy 72 DWORDs from `BAR+0xC2C4` to `this+0x2E8`, unlock, parse IO names, call `_recomputeBufferFrameSize()`, `Callback(this, 0x66, 0, context)`                                                                   |
-| 1    | Record IO ready             | Lock, copy 72 DWORDs from `BAR+0xC1A4` to `this+0x1C8`, unlock, parse IO names, call `_recomputeBufferFrameSize()`, `Callback(this, 0x65, 0, context)`                                                                   |
-| 22   | Rate change                 | Read `BAR+0xC05C` and `BAR+0xC054`, `callback(0x67)`                                                                                                                                                                     |
-| 4    | DMA ready                   | Read `BAR+0xC054/0xC058/0xC05C`, `callback(0x64)`                                                                                                                                                                        |
-| 6    | Error                       | Log only                                                                                                                                                                                                                 |
-| 21   | (second pass)               | Signal `notifyEvent` (`this+0x2830`) — **wakes `Connect()`**                                                                                                                                                             |
-| 7    | End buffer                  | Signal `endBufferEvent` (`this+0x2840`)                                                                                                                                                                                  |
-| 0\|1 | Combined IO ready           | `callback(0x6E)`                                                                                                                                                                                                         |
+| Bit  | Event                       | Action                                                                                                                                                                                                                                                                       |
+| ---- | --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 5    | Connect ack                 | Signal `connectEvent` (`this+0x2838`)                                                                                                                                                                                                                                        |
+| 21   | Channel config (first pass) | Lock `this+0x10`, write 10 DWORDs from `this+0x24` to `BAR+0xC000` (cached config → device), copy up to `0x5F` DWORDs from `BAR+(idx<<2)+0xC000` to `this+0x4C` (device → cache), unlock, parse channel names. **Forces bits 0, 1, and 22 on** (`orr w20, w20, #0x00400003`) |
+| 0    | Playback IO ready           | Lock, copy 72 DWORDs from `BAR+0xC2C4` to `this+0x2E8`, unlock, parse IO names, call `_recomputeBufferFrameSize()`, `Callback(this, 0x66, 0, context)`                                                                                                                       |
+| 1    | Record IO ready             | Lock, copy 72 DWORDs from `BAR+0xC1A4` to `this+0x1C8`, unlock, parse IO names, call `_recomputeBufferFrameSize()`, `Callback(this, 0x65, 0, context)`                                                                                                                       |
+| 22   | Rate change                 | Read `BAR+0xC05C` and `BAR+0xC054`, `callback(0x67)`                                                                                                                                                                                                                         |
+| 4    | DMA ready                   | Read `BAR+0xC054/0xC058/0xC05C`, `callback(0x64)`                                                                                                                                                                                                                            |
+| 6    | Error                       | Log only                                                                                                                                                                                                                                                                     |
+| 21   | (second pass)               | Signal `notifyEvent` (`this+0x2830`) — **wakes `Connect()`**                                                                                                                                                                                                                 |
+| 7    | End buffer                  | Signal `endBufferEvent` (`this+0x2840`)                                                                                                                                                                                                                                      |
+| 0\|1 | Combined IO ready           | `callback(0x6E)`                                                                                                                                                                                                                                                             |
 
 5. Write `0` to `BAR+(channel_base_index<<2)+0xC008` (clear/ack)
 6. Unlock notification spinlock
@@ -504,8 +504,9 @@ management. The key principle is: **transport lifecycle is tied to
 - Increments `streams_prepared` (once per substream, tracked via
   `runtime->private_data` flag).
 - **If `transport_state >= 1`** (already prepared or running): skips
-  re-preparation entirely. For playback, zeros the DMA buffer only if
-  `streams_running == 0` to prevent stale audio replay.
+  re-preparation entirely. Snapshots the current DMA position as
+  `dma_pos_offset` so that `.pointer()` returns 0-relative positions matching
+  ALSA's reset `hw_ptr=0`.
 - **If `transport_state == 0`**: does full `PrepareTransport` sequence (programs
   all transport registers, SG tables, enables periodic timer interrupt).
 - Always uses `dev->buffer_frames` (8192, hardware-computed) and
@@ -613,7 +614,8 @@ enters the running state.
 1. Check `transport_state == 1` (prepared)
 2. Check `is_connected`
 3. Lock `hw_lock`
-4. Write `BAR+0x2248 = 0x00F` (normal) or `0x20F` (variant `0xA`/`0x9` extended)
+4. Write `BAR+0x2248 = 0x00F` (normal) or `0x20F` (variant `0xA` always; variant
+   `0x9` if `extended_mode_flag` is zero)
 5. Unlock `hw_lock`
 6. Set `transport_state = 2` (running)
 
@@ -875,7 +877,7 @@ Full object layout (0x5F0 bytes total, from arm64 analysis):
 | `+0x28D8`  | task/DMA tag                           | From `MapHardware` arg                                                                                                                     |
 | `+0x28E0`  | flag: enable playback monitor read     |                                                                                                                                            |
 | `+0x28E8`  | DMA mapper / IOMapper object           |                                                                                                                                            |
-| `+0x2EF4`  | extended mode flag                     | For variant `0x9`                                                                                                                          |
+| `+0x22EF4` | extended mode flag                     | For variant `0x9` (constructed via `mov #0x2ef4; movk #0x2, lsl #16`)                                                                      |
 | `+0x22EF0` | large-offset DMA address storage       |                                                                                                                                            |
 
 ## Known Limitations
@@ -887,7 +889,13 @@ Full object layout (0x5F0 bytes total, from arm64 analysis):
 - **No ALSA mixer controls** for monitor routing (clock source selection IS
   implemented)
 - **No firmware version verification**
-- **No PCIe error handlers** (`pci_error_handlers`)
+- **Notification handlers partially implemented** — the kext dispatches
+  notification bits 4 (DMA ready, callback 0x64), 7 (end buffer event), 22 (rate
+  change readback, callback 0x67), and a combined 0|1 handler (callback 0x6E).
+  The Linux driver omits all four — it only handles bits 0, 1, 5, 6, and 21.
+  This is intentional: the driver does not need DMA-ready or end-buffer
+  signaling, rate change is not enabled, and the combined IO callback is
+  redundant with individual bit 0/1 handling.
 - **Channel mapping predicted but NOT verified** on live hardware
 - **No rate change while running** — sample rate switching has been
   reverse-engineered and tested (see "Sample Rate Switching" below) but is not

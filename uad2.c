@@ -1543,7 +1543,7 @@ static int uad2_prepare_transport(struct uad2_dev *dev,
  *   3. Lock hw_lock
  *   4. Check device variant (this+0x28B0):
  *      - variant 0xA → always use 0x20F
- *      - variant 0x9 → use 0x20F if extended_mode_flag (this+0x2EF4) set
+ *      - variant 0x9 → use 0x20F if extended_mode_flag (this+0x22EF4) is zero (cbz)
  *      - otherwise   → use 0xF
  *   5. Write BAR+0x2248 = start_value
  *   6. Unlock hw_lock
