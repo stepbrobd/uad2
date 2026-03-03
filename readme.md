@@ -922,6 +922,33 @@ continues uninterrupted. Stopping and re-preparing the transport is
 fundamentally broken on this hardware — `REG_POLL_STATUS` never converges after
 a stop+re-prepare cycle.
 
+### Thunderbolt Hot-Unplug Safety
+
+The driver handles surprise removal (Thunderbolt cable pull) safely through
+three mechanisms:
+
+1. **`card->sync_irq`** — set to the MSI vector after `request_threaded_irq` in
+   probe. This tells `snd_card_disconnect()` to synchronize against in-flight
+   hardirq handlers before transitioning PCM substreams to DISCONNECTED state,
+   closing a race where the hardirq could call `snd_pcm_period_elapsed()` on a
+   substream that was just moved to DISCONNECTED.
+
+2. **PCI error handlers** (`pci_error_handlers`) — an `.error_detected` callback
+   immediately sets `dev->disconnecting = true` when the PCI subsystem reports
+   an AER or Thunderbolt link-down event, gating all MMIO access before
+   `.remove()` is called.
+
+3. **`SNDRV_PCM_POS_XRUN`** — returned from `.pointer()` when the device is
+   disconnecting, providing a semantically correct error signal to ALSA instead
+   of returning stale or garbage position values.
+
+The remove path performs an ordered teardown: `snd_card_disconnect()` →
+`uad2_shutdown()` (firmware disconnect) → disable global interrupt enable → set
+`disconnecting` flag → `free_irq` → free DMA buffers → `pci_iounmap` →
+`snd_card_free` → release PCI resources. Verified via debug prints during
+physical Thunderbolt cable pulls: all 5 phases complete in ~2-3 ms with clean
+re-probe on reconnect.
+
 ## Testing Status
 
 ### Completed
@@ -945,6 +972,10 @@ a stop+re-prepare cycle.
 - **PipeWire profiles**: "multichannel output", "multichannel duplex", and "pro
   audio" profiles all functional
 
+- **Thunderbolt hot-unplug/replug**: physical cable pull during idle and during
+  active playback both produce clean teardown (all 5 remove phases complete in
+  ~2-3 ms), no kernel oops, clean re-probe on reconnect
+
 ### Not Yet Tested
 
 - **Capture / recording** — streams are exposed but never tested with actual
@@ -954,7 +985,6 @@ a stop+re-prepare cycle.
 - **Sample rate changes while running** — only 48 kHz tested during active
   playback
 - **Suspend/resume**
-- **Thunderbolt hot-unplug/replug**
 - **Multi-device** (multiple Apollo units)
 
 ## Disassembly Reference
@@ -997,7 +1027,6 @@ otool -v -s __TEXT_EXEC __text bin/aarch64-darwin/uad2.kext > bin/aarch64-darwin
 - Multi-vector MSI setup (register multiple MSI vectors for `0x28`, `0x46`,
   `0x47`)
 - Monitor mixer routing (`BAR+0x224C` and related registers)
-- Power management / Thunderbolt hot-plug handling
 
 ## Project Files
 
