@@ -2218,6 +2218,9 @@ static snd_pcm_uframes_t uad2_pcm_pointer(struct snd_pcm_substream *ss)
 	struct uad2_dev *dev = snd_pcm_substream_chip(ss);
 	u32 pos, offset;
 
+	if (unlikely(READ_ONCE(dev->disconnecting)))
+		return SNDRV_PCM_POS_XRUN;
+
 	pos = uad2_read32(dev, REG_DMA_POSITION);
 
 	/* The hardware position counter is in hardware frames (0 to
@@ -2692,6 +2695,13 @@ static int uad2_probe(struct pci_dev *pci, const struct pci_device_id *id)
 	if (err)
 		goto err_free_irq_vectors;
 
+	/* Tell ALSA core our IRQ so snd_card_disconnect() can synchronize
+	 * against in-flight hardirq handlers before transitioning PCM
+	 * substreams to DISCONNECTED state.  Without this, there is a race
+	 * window where the hardirq calls snd_pcm_period_elapsed() on a
+	 * substream that has just been moved to DISCONNECTED. */
+	card->sync_irq = pci_irq_vector(pci, 0);
+
 	/* Hardware initialization (full sequence):
 	 *   1. CPcieDevice::ProgramRegisters (device ID, DMA reset, DSP init)
 	 *   2. CPcieAudioExtension::ProgramRegisters (SG tables, FW base, IRQ)
@@ -2870,12 +2880,40 @@ static int uad2_resume(struct device *d)
 
 static DEFINE_SIMPLE_DEV_PM_OPS(uad2_pm_ops, uad2_suspend, uad2_resume);
 
+/* ============================================================
+ * PCI error recovery (AER / Thunderbolt link-down)
+ *
+ * When the Thunderbolt controller detects a link-down event, the PCI
+ * subsystem may invoke AER recovery BEFORE calling .remove().  Without
+ * an error handler, the default behavior is undefined.  We immediately
+ * gate MMIO access so the IRQ handler and any in-flight ALSA callbacks
+ * won't touch disappeared hardware.
+ * ============================================================ */
+static pci_ers_result_t uad2_error_detected(struct pci_dev *pci,
+					    pci_channel_state_t state)
+{
+	struct uad2_dev *dev = pci_get_drvdata(pci);
+
+	dev_err(&pci->dev, "PCI error detected (state=%d)\n", state);
+	WRITE_ONCE(dev->disconnecting, true);
+
+	if (state == pci_channel_io_perm_failure)
+		return PCI_ERS_RESULT_DISCONNECT;
+
+	return PCI_ERS_RESULT_NEED_RESET;
+}
+
+static const struct pci_error_handlers uad2_err_handler = {
+	.error_detected = uad2_error_detected,
+};
+
 static struct pci_driver uad2_driver = {
 	.name = "uad2",
 	.id_table = uad2_pci_ids,
 	.probe = uad2_probe,
 	.remove = uad2_remove,
 	.driver.pm = pm_sleep_ptr(&uad2_pm_ops),
+	.err_handler = &uad2_err_handler,
 };
 
 module_pci_driver(uad2_driver);
