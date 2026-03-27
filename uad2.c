@@ -638,6 +638,9 @@ struct uad2_dev {
 	bool mixer_ready;
 	u32 mixer_rb_data[MIXER_RB_WORDS];
 
+	/* PCIe setup state */
+	bool pcie_setup_done;
+
 	/* DSP service loop — periodic readback drain + mixer flush.
 	 * The Apollo DSP firmware needs periodic "servicing" from the host.
 	 * Without this, the DSP halts and mixer settings are never processed.
@@ -1027,6 +1030,112 @@ found:
 		 ua_device_name(dev->device_type), dev->device_type,
 		 dev->fw_v2 ? "v2" : "v1", dev->dsp_count, dev->play_channels,
 		 dev->rec_channels, dev->buffer_frames);
+}
+
+/* ============================================================
+ * PCIe setup: disable ASPM, increase completion timeouts
+ *
+ * The Thunderbolt bridge chain may put the PCIe link to sleep via
+ * ASPM (Active State Power Management).  When the link is in L1,
+ * MMIO reads stall for up to 10 seconds (PCIe completion timeout).
+ * The DSP service loop reads BAR0 every 10ms — if the link sleeps,
+ * these reads stall and can cascade into a system freeze.
+ *
+ * This walks the bridge chain from the device up to the root port,
+ * disabling ASPM (LNKCTL bits[1:0]=0) and setting completion
+ * timeout to range D (65-210ms) on each hop.
+ *
+ * Ported from open-apollo ua_audio.c ua_pcie_setup().
+ * Called once from probe after BAR mapping.
+ * ============================================================ */
+static void uad2_pcie_setup(struct uad2_dev *dev)
+{
+	int pos;
+	u16 devctl, devsta, lnkctl, lnksta;
+	struct pci_dev *bridge;
+
+	if (dev->pcie_setup_done)
+		return;
+
+	/* Configure the endpoint device */
+	pos = pci_find_capability(dev->pci, PCI_CAP_ID_EXP);
+	if (pos) {
+		pci_read_config_word(dev->pci, pos + PCI_EXP_DEVCTL, &devctl);
+		pci_read_config_word(dev->pci, pos + PCI_EXP_DEVSTA, &devsta);
+		pci_read_config_word(dev->pci, pos + PCI_EXP_LNKCTL, &lnkctl);
+		pci_read_config_word(dev->pci, pos + PCI_EXP_LNKSTA, &lnksta);
+
+		dev_info(&dev->pci->dev,
+			 "PCIe: LnkCtl=0x%04x LnkSta=0x%04x Gen%u x%u\n",
+			 lnkctl, lnksta, lnksta & 0xF, (lnksta >> 4) & 0x3F);
+
+		/* Disable ASPM on device (bits[1:0] of LNKCTL) */
+		if (lnkctl & 3) {
+			dev_info(&dev->pci->dev,
+				 "Disabling device ASPM (was 0x%x)\n",
+				 lnkctl & 3);
+			lnkctl &= ~3;
+			pci_write_config_word(dev->pci, pos + PCI_EXP_LNKCTL,
+					      lnkctl);
+		}
+
+		/* Clear pending PCIe error status */
+		if (devsta & 0xF) {
+			pci_write_config_word(dev->pci, pos + PCI_EXP_DEVSTA,
+					      devsta);
+		}
+
+		/* Set completion timeout to range D (65-210ms) */
+		{
+			u16 devctl2;
+
+			pci_read_config_word(dev->pci, pos + PCI_EXP_DEVCTL2,
+					     &devctl2);
+			if ((devctl2 & 0xF) != 0x6) {
+				devctl2 = (devctl2 & ~0xF) | 0x6;
+				pci_write_config_word(dev->pci,
+						      pos + PCI_EXP_DEVCTL2,
+						      devctl2);
+			}
+		}
+	}
+
+	/* Walk upstream bridges and disable ASPM on each hop */
+	bridge = dev->pci->bus->self;
+	while (bridge) {
+		pos = pci_find_capability(bridge, PCI_CAP_ID_EXP);
+		if (pos) {
+			u16 devctl2;
+
+			pci_read_config_word(bridge, pos + PCI_EXP_LNKCTL,
+					     &lnkctl);
+			pci_read_config_word(bridge, pos + PCI_EXP_DEVCTL2,
+					     &devctl2);
+
+			/* Disable ASPM */
+			if (lnkctl & 3) {
+				lnkctl &= ~3;
+				pci_write_config_word(
+					bridge, pos + PCI_EXP_LNKCTL, lnkctl);
+				dev_info(&dev->pci->dev,
+					 "Bridge %s: ASPM disabled\n",
+					 pci_name(bridge));
+			}
+
+			/* Set completion timeout to range D */
+			if ((devctl2 & 0xF) != 0x6) {
+				devctl2 = (devctl2 & ~0xF) | 0x6;
+				pci_write_config_word(
+					bridge, pos + PCI_EXP_DEVCTL2, devctl2);
+			}
+		}
+		if (!bridge->bus || !bridge->bus->self)
+			break;
+		bridge = bridge->bus->self;
+	}
+
+	dev->pcie_setup_done = true;
+	dev_info(&dev->pci->dev, "PCIe ASPM/timeout setup complete\n");
 }
 
 /* ============================================================
@@ -3394,6 +3503,7 @@ static int uad2_probe(struct pci_dev *pci, const struct pci_device_id *id)
 	dev->current_rate = 48000;
 
 	uad2_detect_device(dev);
+	uad2_pcie_setup(dev);
 
 	dev->has_extended_irq = dev->fw_v2; /* v2 FW uses DMA1 regs */
 
