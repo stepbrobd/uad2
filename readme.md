@@ -67,6 +67,20 @@ Thunderbolt 2 devices (original Apollo Twin, Apollo 8, Apollo 16, Duo, Quad) are
 
 ## Changelog
 
+### 2026-03-28: ALSA mixer controls for monitor + preamp
+
+Added 12 ALSA mixer controls — works with `alsamixer`, `pavucontrol`, `wpctl`,
+`amixer` out of the box:
+
+- **Monitor**: Playback Volume (0-192), Playback Switch (mute), Dim Switch,
+  Source (MIX/CUE1/CUE2)
+- **Preamp** (per channel): Capture Volume (-144..+65 dB), 48V Phantom Power,
+  Pad, Low Cut, Phase Invert, Input Select (Mic/Line)
+
+All controls write through the DSP mixer batch protocol — no chardev, no daemon,
+no userspace tools required. Changes are flushed to hardware within 10ms via the
+DSP service loop.
+
 ### 2026-03-27: Multi-device support + bug fixes + capture
 
 **Multi-device:**
