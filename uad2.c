@@ -3078,34 +3078,64 @@ static const struct snd_kcontrol_new uad2_clock_source_ctl = {
 	.put = uad2_clock_source_put,
 };
 
-/* Sample rate read-only control (informational) */
+/* Sample rate enum control (read-write).
+ * Allows changing the sample rate via amixer/ALSA control interface.
+ * Maps to the same set_sample_rate function used by pcm_prepare. */
+static const char *const uad2_rate_names[] = {
+	"44100", "48000", "88200", "96000", "176400", "192000",
+};
+static const unsigned int uad2_rate_values[] = {
+	44100, 48000, 88200, 96000, 176400, 192000,
+};
+#define UAD2_NUM_RATES ARRAY_SIZE(uad2_rate_names)
+
 static int uad2_sample_rate_info(struct snd_kcontrol *kctl,
 				 struct snd_ctl_elem_info *info)
 {
-	info->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
-	info->count = 1;
-	info->value.integer.min = 44100;
-	info->value.integer.max = 192000;
-	info->value.integer.step = 0;
-	return 0;
+	return snd_ctl_enum_info(info, 1, UAD2_NUM_RATES, uad2_rate_names);
 }
 
 static int uad2_sample_rate_get(struct snd_kcontrol *kctl,
 				struct snd_ctl_elem_value *val)
 {
 	struct uad2_dev *dev = snd_kcontrol_chip(kctl);
+	unsigned int rate = dev->current_rate ? dev->current_rate : 48000;
+	int i;
 
-	val->value.integer.value[0] = dev->current_rate ? dev->current_rate :
-							  48000;
+	for (i = 0; i < (int)UAD2_NUM_RATES; i++) {
+		if (uad2_rate_values[i] == rate) {
+			val->value.enumerated.item[0] = i;
+			return 0;
+		}
+	}
+	val->value.enumerated.item[0] = 1; /* default: 48000 */
 	return 0;
+}
+
+static int uad2_sample_rate_put(struct snd_kcontrol *kctl,
+				struct snd_ctl_elem_value *val)
+{
+	struct uad2_dev *dev = snd_kcontrol_chip(kctl);
+	unsigned int idx = val->value.enumerated.item[0];
+	unsigned int rate;
+
+	if (idx >= UAD2_NUM_RATES)
+		return -EINVAL;
+
+	rate = uad2_rate_values[idx];
+	if (rate == dev->current_rate)
+		return 0;
+
+	uad2_set_sample_rate(dev, rate);
+	return 1; /* value changed */
 }
 
 static const struct snd_kcontrol_new uad2_sample_rate_ctl = {
 	.iface = SNDRV_CTL_ELEM_IFACE_CARD,
-	.name = "Current Sample Rate",
-	.access = SNDRV_CTL_ELEM_ACCESS_READ | SNDRV_CTL_ELEM_ACCESS_VOLATILE,
+	.name = "Sample Rate",
 	.info = uad2_sample_rate_info,
 	.get = uad2_sample_rate_get,
+	.put = uad2_sample_rate_put,
 };
 
 static int uad2_create_mixer(struct uad2_dev *dev)
