@@ -213,6 +213,13 @@
                                          * Write 0 to acknowledge/clear */
 #define DMA_DESC_MAGIC 0x0aceface
 
+/* --- Bank-shifted notification registers (add channel_base_index<<2) ---
+ * From open-apollo ua_apollo.h.  These contain DSP state info that
+ * the firmware expects the host to read after connect and on events. */
+#define REG_NOTIF_RATE_INFO 0xC054 /* rate info readback */
+#define REG_NOTIF_XPORT_INFO 0xC058 /* transport info readback */
+#define REG_NOTIF_CLOCK_INFO 0xC05C /* clock source info readback */
+
 /* --- Firmware notification status bits (BAR+0xC008 bitmask) --- */
 #define NOTIFY_PLAYBACK_IO BIT(0) /* Playback IO descriptors ready */
 #define NOTIFY_RECORD_IO BIT(1) /* Record IO descriptors ready */
@@ -1679,6 +1686,21 @@ static void uad2_handle_notification(struct uad2_dev *dev)
 			WRITE_ONCE(dev->rec_channels, rec_ch);
 	}
 
+	/* Bit 22: Rate change — read rate and clock info.
+	 * The firmware expects the host to read these registers as
+	 * acknowledgment.  From open-apollo ua_audio.c:976-983. */
+	if (status & NOTIFY_RATE_CHANGE) {
+		uad2_read32(dev, uad2_fw_reg(dev, REG_NOTIF_RATE_INFO));
+		uad2_read32(dev, uad2_fw_reg(dev, REG_NOTIF_CLOCK_INFO));
+	}
+
+	/* Bit 4: DMA ready — read transport and clock info */
+	if (status & NOTIFY_DMA_READY) {
+		uad2_read32(dev, uad2_fw_reg(dev, REG_NOTIF_RATE_INFO));
+		uad2_read32(dev, uad2_fw_reg(dev, REG_NOTIF_XPORT_INFO));
+		uad2_read32(dev, uad2_fw_reg(dev, REG_NOTIF_CLOCK_INFO));
+	}
+
 	/* Bit 6: Error */
 	if (status & NOTIFY_ERROR) {
 		dev_warn(&dev->pci->dev, "Firmware error notification\n");
@@ -1801,6 +1823,26 @@ connect_done:
 	dev_info(&dev->pci->dev,
 		 "Audio connected: play=%u rec=%u buffer_frames=%u\n",
 		 dev->play_channels, dev->rec_channels, dev->buffer_frames);
+
+	/* Synthetic notification reads — the kext's notification handler
+	 * synthetically injects bits 0+1+22 after connect (ORs 0x400003)
+	 * to force the host to read IO descriptors and rate/clock info.
+	 * The firmware state machine expects these reads as acknowledgment
+	 * before advancing to active audio routing.
+	 * From open-apollo ua_audio.c:946-993. */
+	{
+		u32 rate_info =
+			uad2_read32(dev, uad2_fw_reg(dev, REG_NOTIF_RATE_INFO));
+		u32 clock_info = uad2_read32(
+			dev, uad2_fw_reg(dev, REG_NOTIF_CLOCK_INFO));
+		u32 xport_info = uad2_read32(
+			dev, uad2_fw_reg(dev, REG_NOTIF_XPORT_INFO));
+
+		dev_info(
+			&dev->pci->dev,
+			"post-connect: rate=0x%08x clock=0x%08x xport=0x%08x\n",
+			rate_info, clock_info, xport_info);
+	}
 
 	/* Initialize mixer batch protocol and arm capture routing */
 	uad2_mixer_init(dev);
