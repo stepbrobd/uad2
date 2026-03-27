@@ -112,7 +112,6 @@ DSP service loop.
 **New features:**
 
 - Mixer batch protocol: 38-setting val/mask cache with SEQ handshake
-- Capture routing init: settings[1-37] armed with 0x20/0xFF after connect
 - DSP service loop: 100Hz delayed_work for readback drain + mixer flush
 - Notification reads: rate_info, xport_info, clock_info after connect
 - Sample Rate ALSA control: read-write enum with all 6 rates (44.1k–192k)

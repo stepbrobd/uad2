@@ -847,8 +847,8 @@ static void uad2_mixer_init(struct uad2_dev *dev)
 	 * The mixer batch protocol is ready for on-demand writes when
 	 * the user changes controls via ALSA kcontrols. */
 
-	dev_info(&dev->pci->dev,
-		 "mixer init (SEQ=%u, device config preserved)\n", seq_rd);
+	dev_dbg(&dev->pci->dev,
+		"mixer init (SEQ=%u, device config preserved)\n", seq_rd);
 }
 
 /* ============================================================
@@ -917,8 +917,8 @@ static void uad2_dsp_service_start(struct uad2_dev *dev)
 	if (dev->dsp_service_running)
 		return;
 
-	dev_info(&dev->pci->dev, "starting DSP service loop (%u ms)\n",
-		 DSP_SERVICE_INTERVAL_MS);
+	dev_dbg(&dev->pci->dev, "starting DSP service loop (%u ms)\n",
+		DSP_SERVICE_INTERVAL_MS);
 
 	dev->dsp_service_running = true;
 	dev->dsp_service_count = 0;
@@ -1083,13 +1083,13 @@ static void uad2_detect_device(struct uad2_dev *dev)
 	switch (subsys) {
 	case UA_SUBSYS_SOLO:
 		dev->device_type = UA_DEV_APOLLO_SOLO;
-		dev_info(&dev->pci->dev, "subsystem 0x%04x → Apollo Solo\n",
-			 subsys);
+		dev_dbg(&dev->pci->dev, "subsystem 0x%04x → Apollo Solo\n",
+			subsys);
 		break;
 	case UA_SUBSYS_X4_QUAD:
 		dev->device_type = UA_DEV_APOLLO_X4;
-		dev_info(&dev->pci->dev, "subsystem 0x%04x → Apollo x4\n",
-			 subsys);
+		dev_dbg(&dev->pci->dev, "subsystem 0x%04x → Apollo x4\n",
+			subsys);
 		break;
 	default:
 		dev->device_type = 0; /* will try serial prefix below */
@@ -1109,15 +1109,15 @@ static void uad2_detect_device(struct uad2_dev *dev)
 		if (dev->dsp_count > UAD2_MAX_DSPS)
 			dev->dsp_count = UAD2_MAX_DSPS;
 
-		dev_info(&dev->pci->dev, "ext_caps=0x%08x dsp=%u\n", ext_caps,
-			 dev->dsp_count);
+		dev_dbg(&dev->pci->dev, "ext_caps=0x%08x dsp=%u\n", ext_caps,
+			dev->dsp_count);
 
 		/* Read serial for logging */
 		for (i = 0; i < 4; i++)
 			regs[i] = uad2_read32(dev, UA_REG_SERIAL_BASE + i * 4);
 		memcpy(serial, regs, UA_REG_SERIAL_LEN);
 		serial[UA_REG_SERIAL_LEN] = '\0';
-		dev_info(&dev->pci->dev, "serial: %.16s\n", serial);
+		dev_dbg(&dev->pci->dev, "serial: %.16s\n", serial);
 
 		/* Serial prefix lookup only if subsystem ID didn't match.
 		 * Serial prefix is unreliable on some models (Apollo Solo
@@ -1128,10 +1128,10 @@ static void uad2_detect_device(struct uad2_dev *dev)
 					     ua_serial_table[i].prefix, 4)) {
 					dev->device_type =
 						ua_serial_table[i].device_type;
-					dev_info(&dev->pci->dev,
-						 "serial prefix → %s\n",
-						 ua_device_name(
-							 dev->device_type));
+					dev_dbg(&dev->pci->dev,
+						"serial prefix → %s\n",
+						ua_device_name(
+							dev->device_type));
 					break;
 				}
 			}
@@ -1199,15 +1199,15 @@ static void uad2_pcie_setup(struct uad2_dev *dev)
 		pci_read_config_word(dev->pci, pos + PCI_EXP_LNKCTL, &lnkctl);
 		pci_read_config_word(dev->pci, pos + PCI_EXP_LNKSTA, &lnksta);
 
-		dev_info(&dev->pci->dev,
-			 "PCIe: LnkCtl=0x%04x LnkSta=0x%04x Gen%u x%u\n",
-			 lnkctl, lnksta, lnksta & 0xF, (lnksta >> 4) & 0x3F);
+		dev_dbg(&dev->pci->dev,
+			"PCIe: LnkCtl=0x%04x LnkSta=0x%04x Gen%u x%u\n", lnkctl,
+			lnksta, lnksta & 0xF, (lnksta >> 4) & 0x3F);
 
 		/* Disable ASPM on device (bits[1:0] of LNKCTL) */
 		if (lnkctl & 3) {
-			dev_info(&dev->pci->dev,
-				 "Disabling device ASPM (was 0x%x)\n",
-				 lnkctl & 3);
+			dev_dbg(&dev->pci->dev,
+				"Disabling device ASPM (was 0x%x)\n",
+				lnkctl & 3);
 			lnkctl &= ~3;
 			pci_write_config_word(dev->pci, pos + PCI_EXP_LNKCTL,
 					      lnkctl);
@@ -1251,9 +1251,9 @@ static void uad2_pcie_setup(struct uad2_dev *dev)
 				lnkctl &= ~3;
 				pci_write_config_word(
 					bridge, pos + PCI_EXP_LNKCTL, lnkctl);
-				dev_info(&dev->pci->dev,
-					 "Bridge %s: ASPM disabled\n",
-					 pci_name(bridge));
+				dev_dbg(&dev->pci->dev,
+					"Bridge %s: ASPM disabled\n",
+					pci_name(bridge));
 			}
 
 			/* Set completion timeout to range D */
@@ -1269,7 +1269,7 @@ static void uad2_pcie_setup(struct uad2_dev *dev)
 	}
 
 	dev->pcie_setup_done = true;
-	dev_info(&dev->pci->dev, "PCIe ASPM/timeout setup complete\n");
+	dev_dbg(&dev->pci->dev, "PCIe ASPM/timeout setup complete\n");
 }
 
 /* ============================================================
@@ -2111,17 +2111,17 @@ static int uad2_audio_connect(struct uad2_dev *dev)
 	return -ETIMEDOUT;
 
 connect_done:
-	dev_info(&dev->pci->dev, "Connect succeeded on attempt %d (retry %d)\n",
-		 chan, retry);
+	dev_dbg(&dev->pci->dev, "Connect succeeded on attempt %d (retry %d)\n",
+		chan, retry);
 
 	/* Recompute buffer frame size (channels set by uad2_detect_device()
 	 * in probe, or updated from IO descriptor notifications above) */
 	dev->buffer_frames = uad2_compute_buffer_frames(dev->play_channels,
 							dev->rec_channels);
 
-	dev_info(&dev->pci->dev,
-		 "Audio connected: play=%u rec=%u buffer_frames=%u\n",
-		 dev->play_channels, dev->rec_channels, dev->buffer_frames);
+	dev_dbg(&dev->pci->dev,
+		"Audio connected: play=%u rec=%u buffer_frames=%u\n",
+		dev->play_channels, dev->rec_channels, dev->buffer_frames);
 
 	/* Synthetic notification reads — the kext's notification handler
 	 * synthetically injects bits 0+1+22 after connect (ORs 0x400003)
@@ -2137,8 +2137,7 @@ connect_done:
 		u32 xport_info = uad2_read32(
 			dev, uad2_fw_reg(dev, REG_NOTIF_XPORT_INFO));
 
-		dev_info(
-			&dev->pci->dev,
+		dev_dbg(&dev->pci->dev,
 			"post-connect: rate=0x%08x clock=0x%08x xport=0x%08x\n",
 			rate_info, clock_info, xport_info);
 	}
@@ -2881,10 +2880,10 @@ static int uad2_pcm_prepare(struct snd_pcm_substream *ss)
 	 * We do the minimum: stop transport → set rate → cold prepare. */
 	if (dev->current_rate != rt->rate) {
 		if (READ_ONCE(dev->transport_state) >= 1) {
-			dev_info(&dev->pci->dev,
-				 "pcm_prepare: rate change %u → %u, "
-				 "stopping transport for re-prepare\n",
-				 dev->current_rate, rt->rate);
+			dev_dbg(&dev->pci->dev,
+				"pcm_prepare: rate change %u → %u, "
+				"stopping transport for re-prepare\n",
+				dev->current_rate, rt->rate);
 			uad2_stop_transport(dev);
 		}
 
@@ -3979,8 +3978,8 @@ static int uad2_probe(struct pci_dev *pci, const struct pci_device_id *id)
 		goto err_release_regions;
 	}
 
-	dev_info(&pci->dev, "BAR 0 mapped: %pa len=%pa\n",
-		 &pci->resource[0].start, &dev->bar_len);
+	dev_dbg(&pci->dev, "BAR 0 mapped: %pa len=%pa\n",
+		&pci->resource[0].start, &dev->bar_len);
 
 	/*
 	 * Snapshot device ID register at probe time.
@@ -3988,8 +3987,8 @@ static int uad2_probe(struct pci_dev *pci, const struct pci_device_id *id)
 	 * and polled after clock changes.
 	 */
 	dev->expected_device_id = uad2_read32(dev, REG_DEVICE_ID);
-	dev_info(&pci->dev, "Device ID register: 0x%08x\n",
-		 dev->expected_device_id);
+	dev_dbg(&pci->dev, "Device ID register: 0x%08x\n",
+		dev->expected_device_id);
 
 	/* Device detection: read serial prefix, determine model, set channels.
 	 * All Apollo TB devices use channel_base_index=10 (bank_shift=0x0A). */
