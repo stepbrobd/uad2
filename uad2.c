@@ -29,7 +29,9 @@
 #include <linux/delay.h>
 #include <linux/interrupt.h>
 #include <linux/completion.h>
+#include <linux/workqueue.h>
 #include <linux/log2.h>
+#include <linux/string.h>
 #include <sound/core.h>
 #include <sound/pcm.h>
 #include <sound/pcm_params.h>
@@ -174,6 +176,7 @@
 #define MIXER_SETTING_STRIDE 8 /* 2 × u32 per setting */
 #define MIXER_BATCH_COUNT 38 /* Settings flushed per batch */
 #define MIXER_RB_WORDS 40 /* Readback data words */
+#define DSP_SERVICE_INTERVAL_MS 10 /* readback drain + mixer flush rate */
 
 /* --- Scatter-Gather DMA tables (ProgramRegisters @ 0x4bac0) ---
  *
@@ -613,6 +616,14 @@ struct uad2_dev {
 	bool mixer_ready;
 	u32 mixer_rb_data[MIXER_RB_WORDS];
 
+	/* DSP service loop — periodic readback drain + mixer flush.
+	 * The Apollo DSP firmware needs periodic "servicing" from the host.
+	 * Without this, the DSP halts and mixer settings are never processed.
+	 * Runs at 10 Hz via delayed_work. */
+	struct delayed_work dsp_service_work;
+	bool dsp_service_running;
+	unsigned int dsp_service_count;
+
 	/* PCM substream pointers for IRQ handler (accessed under lock) */
 	struct snd_pcm_substream *playback_ss;
 	struct snd_pcm_substream *capture_ss;
@@ -783,6 +794,90 @@ static void uad2_mixer_init(struct uad2_dev *dev)
 
 	dev_info(&dev->pci->dev, "mixer init (SEQ=%u, capture routing armed)\n",
 		 seq_rd);
+}
+
+/* ============================================================
+ * DSP service loop — periodic readback drain + mixer flush
+ *
+ * The Apollo DSP firmware needs periodic "servicing" from the host to
+ * stay alive.  On macOS, the kext calls CDSPResourceManager::Service()
+ * ~103/sec.  Without this, the DSP halts: front panel freezes, mixer
+ * settings are written but never processed (SEQ_RD never advances).
+ *
+ * The readback drain cycle (read status→read data→write 0 to re-arm)
+ * acts as the host liveness signal.  We run this at 100 Hz via
+ * delayed_work.
+ *
+ * Ported from open-apollo ua_audio.c:434-539.
+ * ============================================================ */
+static void uad2_dsp_service_handler(struct work_struct *work)
+{
+	struct uad2_dev *dev = container_of(to_delayed_work(work),
+					    struct uad2_dev, dsp_service_work);
+	u32 rb_status, notif;
+	u32 notify_reg = uad2_fw_reg(dev, REG_FW_NOTIFY_STATUS);
+	unsigned int i;
+
+	if (READ_ONCE(dev->disconnecting) || !dev->dsp_service_running)
+		return;
+
+	/* Poll and clear notification status register.
+	 * If the DSP fires notifications and the host never clears them,
+	 * the DSP may stall.  This register is NOT write-1-to-clear;
+	 * write 0 to clear all bits. */
+	notif = uad2_read32(dev, notify_reg);
+	if (notif == 0xFFFFFFFF) {
+		/* Device gone (Thunderbolt hot-unplug) */
+		dev->dsp_service_running = false;
+		return;
+	}
+	if (notif)
+		uad2_write32(dev, notify_reg, 0x0);
+
+	/* Drain readback data (40 words from 0x3814, re-arm by writing
+	 * 0 to 0x3810).  This is the host liveness signal. */
+	rb_status = uad2_read32(dev, REG_MIXER_RB_STATUS);
+	if (rb_status == 1) {
+		for (i = 0; i < MIXER_RB_WORDS; i++)
+			dev->mixer_rb_data[i] =
+				uad2_read32(dev, REG_MIXER_RB_DATA + i * 4);
+		uad2_write32(dev, REG_MIXER_RB_STATUS, 0);
+	}
+
+	/* Flush pending mixer settings (after initial stabilization) */
+	if (dev->dsp_service_count >= 5)
+		uad2_mixer_flush_settings(dev);
+
+	dev->dsp_service_count++;
+
+	/* Reschedule */
+	if (dev->dsp_service_running)
+		schedule_delayed_work(
+			&dev->dsp_service_work,
+			msecs_to_jiffies(DSP_SERVICE_INTERVAL_MS));
+}
+
+static void uad2_dsp_service_start(struct uad2_dev *dev)
+{
+	if (dev->dsp_service_running)
+		return;
+
+	dev_info(&dev->pci->dev, "starting DSP service loop (%u ms)\n",
+		 DSP_SERVICE_INTERVAL_MS);
+
+	dev->dsp_service_running = true;
+	dev->dsp_service_count = 0;
+	schedule_delayed_work(&dev->dsp_service_work,
+			      msecs_to_jiffies(DSP_SERVICE_INTERVAL_MS));
+}
+
+static void uad2_dsp_service_stop(struct uad2_dev *dev)
+{
+	if (!dev->dsp_service_running)
+		return;
+
+	dev->dsp_service_running = false;
+	cancel_delayed_work_sync(&dev->dsp_service_work);
 }
 
 /* ============================================================
@@ -1710,6 +1805,9 @@ connect_done:
 	/* Initialize mixer batch protocol and arm capture routing */
 	uad2_mixer_init(dev);
 
+	/* Start periodic DSP service loop (readback drain + mixer flush) */
+	uad2_dsp_service_start(dev);
+
 	return 0;
 }
 
@@ -1996,6 +2094,10 @@ static void uad2_stop_transport(struct uad2_dev *dev)
 static void uad2_shutdown(struct uad2_dev *dev)
 {
 	unsigned long flags;
+
+	/* Stop DSP service loop before tearing down connection */
+	uad2_dsp_service_stop(dev);
+	dev->mixer_ready = false;
 
 	/* 1-6: Stop transport and clear doorbell under lock */
 	spin_lock_irqsave(&dev->lock, flags);
@@ -3002,6 +3104,7 @@ static int uad2_probe(struct pci_dev *pci, const struct pci_device_id *id)
 	init_completion(&dev->notify_event);
 	init_completion(&dev->connect_event);
 	init_completion(&dev->rate_event);
+	INIT_DELAYED_WORK(&dev->dsp_service_work, uad2_dsp_service_handler);
 	dev->transport_state = 0;
 	dev->periodic_timer_interval = 0;
 	dev->intr_enable_shadow = 0;
