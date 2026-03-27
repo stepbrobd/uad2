@@ -67,26 +67,65 @@ Thunderbolt 2 devices (original Apollo Twin, Apollo 8, Apollo 16, Duo, Quad) are
 
 ## Changelog
 
-### 2026-03-27: Multi-device support + bug fixes
+### 2026-03-27: Multi-device support + bug fixes + capture
 
-- **Multi-device support**: serial prefix detection for all 15 Apollo TB models
-  with per-model channel count tables. PCI ID table opened to match all devices.
-- **Fix: sample rate switching**: stop transport before rate change, full
+**Multi-device:**
+
+- Serial prefix detection for all 15 Apollo TB models with per-model channel
+  count tables. PCI ID table opened to match all devices.
+- PCI subsystem ID used as primary device detection (serial prefix unreliable on
+  some models — Apollo Solo serial coincidentally matches x16D prefix).
+- Dynamic ALSA card name from detected model ("UA Apollo Solo").
+
+**Bug fixes:**
+
+- **Fix: sample rate switching** — stop transport before rate change, full
   re-prepare with rate-correct parameters (IRQ period, periodic timer), then
-  post-transport clock write to enable DSP active processing. Previously the
-  transport kept running with stale parameters after a rate change.
-- **Fix: extended transport mode**: v2 firmware devices now use `0x20F` start
+  post-transport clock write to enable DSP active processing.
+- **Fix: extended transport mode** — v2 firmware devices now use `0x20F` start
   value (BIT 9 = EXT_MODE). Previously hardcoded to `0xF`.
-- **Mixer batch protocol**: 38-setting val/mask cache with SEQ handshake. DSP
-  reads all settings atomically per SEQ_WR advance.
-- **Capture routing init**: settings[1-37] armed with 0x20/0xFF after connect to
-  activate DSP capture channels.
-- **DSP service loop**: 100Hz delayed_work that drains readback data, clears
-  notification status, and flushes mixer settings. Acts as host liveness signal.
-- **Notification reads**: rate_info, xport_info, clock_info reads on events and
-  after connect (firmware expects these as acknowledgment).
-- **Sample Rate control**: changed from read-only integer to read-write enum
-  with all 6 rates (44.1k–192k).
+- **Fix: capture I/O errors** — three bugs prevented capture from working:
+  1. Shared `dma_pos_offset` between play/rec caused pointer corruption (split
+     into per-direction offsets)
+  2. Transport started in pcm_prepare instead of trigger (caused XRUN before
+     first read)
+  3. Hardware periodic timer IRQ (vector 0x46) never fires on Apollo Solo
+     (replaced with hrtimer at 1ms polling — same approach as snd-usb-audio)
+- **Fix: device detection** — PCI subsystem ID preferred over serial prefix
+  (Apollo Solo serial "2032" falsely matched x16D)
+- **Fix: PCIe ASPM** — disable Active State Power Management on the Thunderbolt
+  bridge chain to prevent link sleep during continuous MMIO reads (DSP service
+  loop). Without this, PCIe completion timeouts can cascade into system freeze.
+
+**New features:**
+
+- Mixer batch protocol: 38-setting val/mask cache with SEQ handshake
+- Capture routing init: settings[1-37] armed with 0x20/0xFF after connect
+- DSP service loop: 100Hz delayed_work for readback drain + mixer flush
+- Notification reads: rate_info, xport_info, clock_info after connect
+- Sample Rate ALSA control: read-write enum with all 6 rates (44.1k–192k)
+- PCIe ASPM disable + completion timeout increase on TB bridge chain
+
+**Verified on live Apollo Solo hardware:**
+
+- Playback: 42ch S32_LE at 48kHz and 96kHz
+- Capture: condenser mic with +48V phantom → -42 dBFS on Ch0 (12MB captured)
+- Rate switching: 48k → 96k → 48k without errors
+- Full duplex: simultaneous playback + capture
+- PipeWire: PCM RUNNING with 6.4ms latency, stable hw_ptr
+- DSP service loop: 46K+ iterations without crash
+- ASPM: upstream TB bridge ASPM disabled at probe time
+
+**Known limitations:**
+
+- PipeWire capture returns zeros (needs UCM2/WirePlumber channel mapping config
+  to map hardware Ch0 → mic input; direct ALSA capture works)
+- Capture requires playback to also be running (shared transport), except on
+  cold start where capture-only opens the transport
+- No preamp/monitor controls from Linux (needs chardev + ioctl interface or ALSA
+  kcontrols — phantom power must be set from macOS)
+- No DSP plugin chain (disabled in both this driver and open-apollo — clobbers
+  capture routing)
 
 ## Overview
 
