@@ -1719,14 +1719,14 @@ static int uad2_prepare_transport(struct uad2_dev *dev,
 	/* 15. Arm transport (prepared state) */
 	uad2_write32(dev, REG_TRANSPORT_CTL, 0x1);
 
-	/* 16. Read playback monitor status (flush) */
+	/* 16. Read playback monitor status (fence read) */
 	uad2_read32(dev, REG_PLAYBACK_MON_STAT);
 
-	/* 17. Playback monitor config — SKIPPED for Apollo Solo.
-	 * The kext only writes this register when (diagnostic_flags & 0x2),
-	 * which is false for Apollo Solo (diagnostic_flags = 1).
-	 * Writing it unconditionally may confuse the firmware. */
-	/* uad2_write32(dev, REG_PLAYBACK_MON_CFG, (play_channels - 1) | 0x100); */
+	/* 17. P2P_ROUTE — tells FPGA how to route audio between DSP and DMA.
+	 * Open-apollo writes this for all models AFTER DMA enable + fence.
+	 * Value: 0x100 | (play_channels - 1).
+	 * Previous code skipped this; open-apollo proved it's needed. */
+	uad2_write32(dev, REG_PLAYBACK_MON_CFG, 0x100 | (play_channels - 1));
 
 	spin_unlock_irqrestore(&dev->lock, flags);
 
@@ -1764,23 +1764,14 @@ static int uad2_prepare_transport(struct uad2_dev *dev,
  *   6. Unlock hw_lock
  *   7. Set transport_state = 2 (running)
  *
- * Apollo Solo uses normal start (0xF).
+ * v2 firmware devices use extended mode (0x20F, BIT 9 = EXT_MODE).
+ * v1 firmware uses normal start (0xF).
  * ============================================================ */
 static void uad2_start_transport(struct uad2_dev *dev)
 {
 	unsigned long flags;
+	u32 start_val;
 
-	/* Validate preconditions (matches kext checks):
-	 * - transport must be prepared (state 1) or already running (state 2)
-	 * - device must be connected
-	 *
-	 * The hardware has a single shared transport for both playback and
-	 * capture.  When PipeWire opens both streams independently, the
-	 * second stream's pcm_trigger(START) arrives while transport is
-	 * already running (state 2) from the first stream.  This is a
-	 * no-op — the transport is already doing what the caller wants.
-	 * macOS avoids this because CoreAudio starts all streams atomically
-	 * through the mixer layer. */
 	if (READ_ONCE(dev->transport_state) == 2)
 		return;
 	if (READ_ONCE(dev->transport_state) != 1) {
@@ -1794,8 +1785,13 @@ static void uad2_start_transport(struct uad2_dev *dev)
 		return;
 	}
 
+	/* v2 firmware (all current Apollo TB devices) requires extended
+	 * mode bit 9 set.  Without it, DSP processing may not activate.
+	 * From open-apollo: 0x20F = DMA+play+rec+IRQ+extended mode. */
+	start_val = dev->fw_v2 ? 0x20F : 0xF;
+
 	spin_lock_irqsave(&dev->lock, flags);
-	uad2_write32(dev, REG_TRANSPORT_CTL, 0xF);
+	uad2_write32(dev, REG_TRANSPORT_CTL, start_val);
 	WRITE_ONCE(dev->transport_state, 2);
 	spin_unlock_irqrestore(&dev->lock, flags);
 }
