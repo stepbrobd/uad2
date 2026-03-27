@@ -30,6 +30,8 @@
 #include <linux/interrupt.h>
 #include <linux/completion.h>
 #include <linux/workqueue.h>
+#include <linux/hrtimer.h>
+#include <linux/hrtimer_types.h>
 #include <linux/log2.h>
 #include <linux/string.h>
 #include <sound/core.h>
@@ -648,23 +650,37 @@ struct uad2_dev {
 	struct snd_pcm_substream *playback_ss;
 	struct snd_pcm_substream *capture_ss;
 
-	/* DMA position offset for hw_ptr alignment.
+	/* Per-direction DMA position offsets for hw_ptr alignment.
 	 * When pcm_prepare is called while the transport is already running,
 	 * ALSA resets hw_ptr to 0 but the hardware DMA position counter is
 	 * at some arbitrary value.  We snapshot the hardware position at
 	 * prepare time and subtract it in .pointer() so that ALSA sees
-	 * positions starting from 0.  This avoids the need to stop and
-	 * re-prepare the transport (which causes DMA poll convergence
-	 * failures and audio artifacts).
+	 * positions starting from 0.
+	 *
+	 * MUST be per-direction: if playback starts first (offset=0) and
+	 * capture opens later (offset=N), a shared offset would break
+	 * playback's pointer tracking → ALSA returns -EIO.
 	 *
 	 * Set to 0 on cold-start prepare (transport was stopped), set to
 	 * current REG_DMA_POSITION on hot re-prepare. */
-	u32 dma_pos_offset;
+	u32 play_pos_offset;
+	u32 rec_pos_offset;
+
+	/* Period elapsed polling timer.
+	 * The Apollo's hardware periodic timer IRQ (vector 0x46) is
+	 * unreliable — fires once then stops.  We use an hrtimer to
+	 * poll SAMPLE_POS and call snd_pcm_period_elapsed() at ~1ms.
+	 * Same approach as USB audio drivers (snd-usb-audio). */
+	struct hrtimer period_timer;
+	bool period_timer_running;
+	snd_pcm_uframes_t last_play_period;
+	snd_pcm_uframes_t last_rec_period;
 };
 
 /* Forward declarations */
 static unsigned int uad2_compute_buffer_frames(unsigned int play_ch,
 					       unsigned int rec_ch);
+static void uad2_period_timer_stop(struct uad2_dev *dev);
 
 /* ============================================================
  * Low-level register accessors
@@ -730,8 +746,9 @@ static inline u32 uad2_mixer_setting_reg(unsigned int index)
  *   wordA = (mask[15:0] << 16) | val[15:0]
  *   wordB = (mask[31:16] << 16) | val[31:16]
  * ============================================================ */
-static void uad2_mixer_write_setting(struct uad2_dev *dev, unsigned int index,
-				     u32 value, u32 mask)
+static void __maybe_unused uad2_mixer_write_setting(struct uad2_dev *dev,
+						    unsigned int index,
+						    u32 value, u32 mask)
 {
 	if (index >= MIXER_BATCH_COUNT)
 		return;
@@ -2024,7 +2041,8 @@ static int uad2_prepare_transport(struct uad2_dev *dev,
 
 	/* 7. Clear DMA position counter */
 	uad2_write32(dev, REG_DMA_POSITION, 0);
-	dev->dma_pos_offset = 0;
+	dev->play_pos_offset = 0;
+	dev->rec_pos_offset = 0;
 
 	/* 8. Periodic timer (if configured) */
 	if (dev->periodic_timer_interval) {
@@ -2176,7 +2194,8 @@ static void uad2_shutdown(struct uad2_dev *dev)
 {
 	unsigned long flags;
 
-	/* Stop DSP service loop before tearing down connection */
+	/* Stop polling timer and DSP service loop */
+	uad2_period_timer_stop(dev);
 	uad2_dsp_service_stop(dev);
 	dev->mixer_ready = false;
 
@@ -2660,47 +2679,127 @@ static int uad2_pcm_prepare(struct snd_pcm_substream *ss)
 	 * Rate change or cold-start (transport_state == 0): do the full
 	 * prepare_transport sequence which resets DMA position to 0. */
 	if (READ_ONCE(dev->transport_state) >= 1) {
-		/* Transport already running at correct rate — fast path */
+		/* Transport already running at correct rate — fast path.
+		 * Set per-direction offset so this stream's .pointer()
+		 * returns 0-relative without affecting the other direction. */
 		u32 cur_pos = uad2_read32(dev, REG_DMA_POSITION);
 
 		if (cur_pos >= dev->buffer_frames)
 			cur_pos = 0;
-		dev->dma_pos_offset = cur_pos;
+		if (ss->stream == SNDRV_PCM_STREAM_PLAYBACK)
+			dev->play_pos_offset = cur_pos;
+		else
+			dev->rec_pos_offset = cur_pos;
 		return 0;
 	}
 
 	/* Cold start (or post-rate-change) — full transport preparation.
 	 * Always program the full hardware channel counts — the DMA
 	 * layout is fixed at all channels interleaved. */
-	dev->dma_pos_offset = 0;
-	err = uad2_prepare_transport(dev, buffer_frames, irq_period_frames,
-				     READ_ONCE(dev->play_channels),
-				     READ_ONCE(dev->rec_channels));
-	if (err)
-		return err;
+	dev->play_pos_offset = 0;
+	dev->rec_pos_offset = 0;
+	/* Prepare transport only — do NOT start it here.
+	 * ALSA expects transport to start in trigger(START).
+	 * Starting here causes the DMA position to advance before
+	 * ALSA's hw_ptr is initialized, resulting in XRUN on first read.
+	 * The post-transport clock write also moves to trigger. */
+	return uad2_prepare_transport(dev, buffer_frames, irq_period_frames,
+				      READ_ONCE(dev->play_channels),
+				      READ_ONCE(dev->rec_channels));
+}
 
-	/* Start transport immediately after prepare so the post-transport
-	 * clock write has an active DMA context.  Open-apollo discovered
-	 * that the clock write AFTER transport start is what transitions
-	 * the DSP from passthrough to active processing mode, enabling
-	 * capture routing.  Without this ordering, the DSP activates with
-	 * no audio flowing and routes silence. */
-	uad2_start_transport(dev);
+/* ============================================================
+ * Period elapsed polling timer (hrtimer)
+ *
+ * The Apollo's hardware periodic timer IRQ (vector 0x46) is unreliable
+ * on most models — fires once then stops.  We use an hrtimer at ~1ms
+ * to poll REG_DMA_POSITION and call snd_pcm_period_elapsed() when a
+ * period boundary is crossed.  Same approach as snd-usb-audio and
+ * open-apollo's period_timer.
+ * ============================================================ */
+#define PERIOD_TIMER_NS 1000000 /* 1 ms polling interval */
 
-	/* Post-transport clock write: source=0xC enables DSP active
-	 * processing.  Unlike clock_source=0 (internal), source=0xC
-	 * gets FPGA acknowledgment and activates the mixer DSP.
-	 * This is the capture-enabling step discovered by open-apollo
-	 * (ua_audio.c:2158-2168). */
-	{
-		u32 clock_cfg = 0xC | (uad2_rate_to_enum(rt->rate) << 8);
+static enum hrtimer_restart uad2_period_timer_fn(struct hrtimer *timer)
+{
+	struct uad2_dev *dev =
+		container_of(timer, struct uad2_dev, period_timer);
+	struct snd_pcm_substream *play_ss, *cap_ss;
+	bool play_run, cap_run;
+	unsigned long flags;
+	u32 pos;
+	snd_pcm_uframes_t cur_period;
 
-		uad2_write32(dev, uad2_fw_reg(dev, REG_SAMPLE_CLOCK),
-			     clock_cfg);
-		uad2_write32(dev, REG_STREAM_ENABLE, 0x4); /* clock doorbell */
+	if (!dev->period_timer_running || READ_ONCE(dev->disconnecting))
+		return HRTIMER_NORESTART;
+
+	pos = uad2_read32(dev, REG_DMA_POSITION);
+	if (pos == 0xFFFFFFFF) {
+		dev->period_timer_running = false;
+		return HRTIMER_NORESTART;
+	}
+	if (pos >= dev->buffer_frames)
+		pos = 0;
+
+	spin_lock_irqsave(&dev->lock, flags);
+	play_ss = dev->playback_ss;
+	cap_ss = dev->capture_ss;
+	play_run = dev->playback_running;
+	cap_run = dev->capture_running;
+	spin_unlock_irqrestore(&dev->lock, flags);
+
+	/* Check playback period boundary */
+	if (play_ss && play_run) {
+		u32 play_off = READ_ONCE(dev->play_pos_offset);
+		u32 adj = (pos - play_off + dev->buffer_frames) %
+			  dev->buffer_frames;
+		snd_pcm_uframes_t period_size =
+			play_ss->runtime ? play_ss->runtime->period_size : 256;
+
+		cur_period = (period_size > 0) ? adj / period_size : 0;
+		if (cur_period != dev->last_play_period) {
+			dev->last_play_period = cur_period;
+			snd_pcm_period_elapsed(play_ss);
+		}
 	}
 
-	return 0;
+	/* Check capture period boundary */
+	if (cap_ss && cap_run) {
+		u32 rec_off = READ_ONCE(dev->rec_pos_offset);
+		u32 adj = (pos - rec_off + dev->buffer_frames) %
+			  dev->buffer_frames;
+		snd_pcm_uframes_t period_size =
+			cap_ss->runtime ? cap_ss->runtime->period_size : 256;
+
+		cur_period = (period_size > 0) ? adj / period_size : 0;
+		if (cur_period != dev->last_rec_period) {
+			dev->last_rec_period = cur_period;
+			snd_pcm_period_elapsed(cap_ss);
+		}
+	}
+
+	hrtimer_forward_now(timer, ns_to_ktime(PERIOD_TIMER_NS));
+	return HRTIMER_RESTART;
+}
+
+static void uad2_period_timer_start(struct uad2_dev *dev)
+{
+	if (dev->period_timer_running)
+		return;
+
+	dev->period_timer_running = true;
+	dev->last_play_period = 0;
+	dev->last_rec_period = 0;
+	hrtimer_start(&dev->period_timer, ns_to_ktime(PERIOD_TIMER_NS),
+		      HRTIMER_MODE_REL);
+}
+
+static void uad2_period_timer_stop(struct uad2_dev *dev)
+{
+	if (!dev->period_timer_running)
+		return;
+
+	dev->period_timer_running = false;
+	hrtimer_cancel(&dev->period_timer);
 }
 
 static int uad2_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
@@ -2719,6 +2818,24 @@ static int uad2_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
 			dev->capture_running = true;
 		spin_unlock_irqrestore(&dev->lock, flags);
 		uad2_start_transport(dev);
+
+		/* Post-transport clock write: source=0xC enables DSP active
+		 * processing.  Only do this on the FIRST stream start
+		 * (streams_running==1), not on subsequent piggybacks.
+		 * Open-apollo: clock write after transport start activates
+		 * the mixer DSP for capture routing. */
+		if (READ_ONCE(dev->streams_running) == 1) {
+			u32 clock_cfg =
+				0xC | ((u32)uad2_rate_to_enum(dev->current_rate)
+				       << 8);
+			uad2_write32(dev, uad2_fw_reg(dev, REG_SAMPLE_CLOCK),
+				     clock_cfg);
+			uad2_write32(dev, REG_STREAM_ENABLE, 0x4);
+		}
+
+		/* Start period-elapsed polling timer — the hardware
+		 * periodic timer IRQ is unreliable on Apollo devices. */
+		uad2_period_timer_start(dev);
 		return 0;
 
 	case SNDRV_PCM_TRIGGER_STOP:
@@ -2760,6 +2877,10 @@ static int uad2_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
 		 *
 		 * Transport teardown happens in pcm_close when open_count
 		 * reaches 0, or in uad2_shutdown/uad2_remove. */
+
+		/* Stop polling timer when no streams are running */
+		if (dev->streams_running == 0)
+			uad2_period_timer_stop(dev);
 		return 0;
 	}
 	return -EINVAL;
@@ -2790,14 +2911,18 @@ static snd_pcm_uframes_t uad2_pcm_pointer(struct snd_pcm_substream *ss)
 	if (pos >= dev->buffer_frames)
 		pos = 0;
 
-	/* Apply the position offset from pcm_prepare.
+	/* Apply per-direction position offset from pcm_prepare.
 	 * When prepare is called while the transport is already running,
 	 * we snapshot the DMA position at prepare time.  Subtracting it
 	 * here makes ALSA see positions starting from 0, consistent with
 	 * the hw_ptr=0 reset that ALSA performs internally.
 	 *
-	 * For cold-start prepare, dma_pos_offset is 0 (no-op). */
-	offset = READ_ONCE(dev->dma_pos_offset);
+	 * Per-direction offsets prevent playback/capture from clobbering
+	 * each other's tracking when one opens after the other. */
+	if (ss->stream == SNDRV_PCM_STREAM_PLAYBACK)
+		offset = READ_ONCE(dev->play_pos_offset);
+	else
+		offset = READ_ONCE(dev->rec_pos_offset);
 	pos = (pos - offset + dev->buffer_frames) % dev->buffer_frames;
 
 	return pos;
@@ -3216,6 +3341,8 @@ static int uad2_probe(struct pci_dev *pci, const struct pci_device_id *id)
 	init_completion(&dev->connect_event);
 	init_completion(&dev->rate_event);
 	INIT_DELAYED_WORK(&dev->dsp_service_work, uad2_dsp_service_handler);
+	hrtimer_setup(&dev->period_timer, uad2_period_timer_fn, CLOCK_MONOTONIC,
+		      HRTIMER_MODE_REL);
 	dev->transport_state = 0;
 	dev->periodic_timer_interval = 0;
 	dev->intr_enable_shadow = 0;
