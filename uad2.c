@@ -155,6 +155,26 @@
 #define REG_PLAYBACK_MON_STAT 0x22C0 /* R: playback monitor status */
 #define REG_SECONDARY_CTL 0x22C4 /* W: 0 on Shutdown */
 
+/* --- DSP Mixer registers (BAR0 + 0x3800 window) ---
+ *
+ * The mixer engine uses a sequence-counter handshake to update settings:
+ *   1. Read MIXER_SEQ_RD (wait for DSP idle: RD == WR)
+ *   2. Write paired (value, mask) words to MIXER_SETTING[index]
+ *   3. Increment and write MIXER_SEQ_WR
+ *   4. DSP reads all 38 settings atomically per SEQ_WR advance
+ *
+ * 38 settings × 8 bytes each (two 32-bit words per setting).
+ * From open-apollo ua_apollo.h / ua_core.c.
+ * ============================================================ */
+#define REG_MIXER_BASE 0x3800
+#define REG_MIXER_SEQ_WR 0x3808 /* Mixer sequence counter (host → DSP) */
+#define REG_MIXER_SEQ_RD 0x380C /* Mixer sequence counter (DSP readback) */
+#define REG_MIXER_RB_STATUS 0x3810 /* Readback: 1=ready, write 0 to re-arm */
+#define REG_MIXER_RB_DATA 0x3814 /* Readback: 40 consecutive u32 words */
+#define MIXER_SETTING_STRIDE 8 /* 2 × u32 per setting */
+#define MIXER_BATCH_COUNT 38 /* Settings flushed per batch */
+#define MIXER_RB_WORDS 40 /* Readback data words */
+
 /* --- Scatter-Gather DMA tables (ProgramRegisters @ 0x4bac0) ---
  *
  * Buffer A (playback): BAR+0x8000..0x9FFF = 1024 entries × 8 bytes
@@ -583,6 +603,16 @@ struct uad2_dev {
 	/* Channel config area copy (10 DWORDs from BAR+0xC000) */
 	u32 chan_config[CHAN_CONFIG_DWORDS];
 
+	/* Mixer batch write state (from open-apollo CPcieDeviceMixer protocol).
+	 * The DSP reads ALL 38 settings atomically on each SEQ_WR advance.
+	 * We maintain cached val/mask arrays and flush the full batch. */
+	u32 mixer_val[MIXER_BATCH_COUNT];
+	u32 mixer_mask[MIXER_BATCH_COUNT];
+	u32 mixer_seq_wr;
+	bool mixer_dirty;
+	bool mixer_ready;
+	u32 mixer_rb_data[MIXER_RB_WORDS];
+
 	/* PCM substream pointers for IRQ handler (accessed under lock) */
 	struct snd_pcm_substream *playback_ss;
 	struct snd_pcm_substream *capture_ss;
@@ -632,6 +662,127 @@ static inline void uad2_write32(struct uad2_dev *dev, u32 offset, u32 val)
 static inline u32 uad2_fw_reg(struct uad2_dev *dev, u32 base_offset)
 {
 	return (dev->channel_base_index << 2) + base_offset;
+}
+
+/* ============================================================
+ * Mixer setting register offset (3-range formula)
+ *
+ * From open-apollo ua_apollo.h ua_mixer_setting_reg().
+ * Settings live in 3 non-contiguous ranges within the 0x3800 window:
+ *   Settings  0-15: base = 0x3800 + 0xB4 + index * 8
+ *   Settings 16-31: base = 0x3800 + 0xBC + index * 8  (+8 gap)
+ *   Settings 32-37: base = 0x3800 + 0xC0 + index * 8  (+4 more gap)
+ * ============================================================ */
+static inline u32 uad2_mixer_setting_reg(unsigned int index)
+{
+	if (index <= 15)
+		return REG_MIXER_BASE + 0xB4 + index * MIXER_SETTING_STRIDE;
+	else if (index <= 31)
+		return REG_MIXER_BASE + 0xBC + index * MIXER_SETTING_STRIDE;
+	else
+		return REG_MIXER_BASE + 0xC0 + index * MIXER_SETTING_STRIDE;
+}
+
+/* ============================================================
+ * Mixer batch write protocol
+ *
+ * The DSP reads ALL 38 settings atomically on each SEQ_WR advance.
+ * Ported from open-apollo ua_core.c ua_mixer_flush_settings().
+ *
+ * Protocol:
+ *   1. Maintain cached val/mask arrays for all 38 settings
+ *   2. On setting change: merge into cache, mark dirty
+ *   3. On service tick: if dirty AND SEQ_RD == cached SEQ_WR,
+ *      write ALL 38 settings to SRAM, then bump SEQ_WR once
+ *
+ * Word encoding per setting:
+ *   wordA = (mask[15:0] << 16) | val[15:0]
+ *   wordB = (mask[31:16] << 16) | val[31:16]
+ * ============================================================ */
+static void uad2_mixer_write_setting(struct uad2_dev *dev, unsigned int index,
+				     u32 value, u32 mask)
+{
+	if (index >= MIXER_BATCH_COUNT)
+		return;
+	if (!dev->mixer_ready)
+		return;
+
+	/* Merge into cache (read-modify-write with mask) */
+	dev->mixer_val[index] = (dev->mixer_val[index] & ~mask) |
+				(value & mask);
+	dev->mixer_mask[index] |= mask;
+	dev->mixer_dirty = true;
+}
+
+static void uad2_mixer_flush_settings(struct uad2_dev *dev)
+{
+	u32 seq_rd, word_a, word_b, reg;
+	int i;
+
+	if (!dev->mixer_ready || !dev->mixer_dirty)
+		return;
+
+	/* Check DSP idle: SEQ_RD must match our cached SEQ_WR */
+	seq_rd = uad2_read32(dev, REG_MIXER_SEQ_RD);
+	if (seq_rd != dev->mixer_seq_wr)
+		return; /* DSP still processing previous batch */
+
+	/* Write ALL 38 settings to SRAM registers.
+	 * Skip settings with no mask — preserves firmware defaults.
+	 * Val AND mask persist across flushes (DSP reads both on
+	 * every SEQ bump).  Do NOT clear mask after writing. */
+	for (i = 0; i < MIXER_BATCH_COUNT; i++) {
+		if (!dev->mixer_mask[i])
+			continue;
+		reg = uad2_mixer_setting_reg(i);
+		word_a = ((dev->mixer_mask[i] & 0xFFFF) << 16) |
+			 (dev->mixer_val[i] & 0xFFFF);
+		word_b = (((dev->mixer_mask[i] >> 16) & 0xFFFF) << 16) |
+			 ((dev->mixer_val[i] >> 16) & 0xFFFF);
+		uad2_write32(dev, reg, word_a);
+		uad2_write32(dev, reg + 4, word_b);
+	}
+
+	/* Single SEQ_WR bump for entire batch */
+	dev->mixer_seq_wr++;
+	uad2_write32(dev, REG_MIXER_SEQ_WR, dev->mixer_seq_wr);
+	dev->mixer_dirty = false;
+}
+
+/* Initialize mixer batch protocol after connect.
+ * Sync SEQ counter, zero cache, activate capture routing.
+ * From open-apollo ua_audio.c:1009-1072. */
+static void uad2_mixer_init(struct uad2_dev *dev)
+{
+	u32 seq_rd;
+	int s;
+
+	seq_rd = uad2_read32(dev, REG_MIXER_SEQ_RD);
+	dev->mixer_seq_wr = seq_rd;
+	uad2_write32(dev, REG_MIXER_SEQ_WR, seq_rd);
+
+	memset(dev->mixer_val, 0, sizeof(dev->mixer_val));
+	memset(dev->mixer_mask, 0, sizeof(dev->mixer_mask));
+	dev->mixer_dirty = false;
+	dev->mixer_ready = true;
+
+	/* Activate DSP capture routing.
+	 * Settings[1-37] = 0x20, mask=0xFF enables type 0x01 capture.
+	 * Setting[35] = 0x05, mask=0x1F is the channel config count.
+	 * Skip setting[2] — monitor core (volume/mute/source/dim).
+	 * Writing it corrupts standalone monitor operation. */
+	for (s = 1; s < MIXER_BATCH_COUNT; s++) {
+		if (s == 2)
+			continue; /* skip monitor core */
+		dev->mixer_val[s] = 0x20;
+		dev->mixer_mask[s] = 0xFF;
+	}
+	dev->mixer_val[35] = 0x05;
+	dev->mixer_mask[35] = 0x1F;
+	dev->mixer_dirty = true;
+
+	dev_info(&dev->pci->dev, "mixer init (SEQ=%u, capture routing armed)\n",
+		 seq_rd);
 }
 
 /* ============================================================
@@ -1555,6 +1706,9 @@ connect_done:
 	dev_info(&dev->pci->dev,
 		 "Audio connected: play=%u rec=%u buffer_frames=%u\n",
 		 dev->play_channels, dev->rec_channels, dev->buffer_frames);
+
+	/* Initialize mixer batch protocol and arm capture routing */
+	uad2_mixer_init(dev);
 
 	return 0;
 }
