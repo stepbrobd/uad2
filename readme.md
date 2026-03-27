@@ -29,7 +29,6 @@ from open-apollo:
 - Serial prefix device detection and per-model channel count tables
 - v1/v2 firmware detection via FPGA revision register
 - DSP mixer batch write protocol (38-setting cache, SEQ handshake, flush)
-- Capture routing activation (settings[1-37]=0x20/0xFF)
 - DSP service loop (readback drain + mixer flush as host liveness signal)
 - Post-transport clock write for DSP active processing mode
 - Extended mode transport start (0x20F) for v2 firmware
@@ -144,6 +143,16 @@ DSP service loop.
 This is a Linux kernel ALSA/PCIe driver for **Universal Audio Apollo
 Thunderbolt** audio interfaces, reverse-engineered from the macOS kext
 `com.uaudio.driver.UAD2System` (arm64e, v11.7.0 build 2).
+
+### Design Philosophy
+
+Unlike open-apollo (which splits control between a kernel driver, a Python mixer
+daemon, and userspace ioctls), this driver keeps **everything in the kernel**.
+All mixer, preamp, and monitor controls are exposed as standard ALSA kcontrols
+and work directly with `alsamixer`, `amixer`, `pavucontrol`, and PipeWire — no
+daemon, no chardev, no userspace tools required. The device's persisted firmware
+state is preserved across reconnects; the driver does not write mixer settings
+at init time.
 
 ### Reverse Engineering Sources
 
