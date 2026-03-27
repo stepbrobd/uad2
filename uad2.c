@@ -2268,25 +2268,37 @@ static int uad2_pcm_prepare(struct snd_pcm_substream *ss)
 	unsigned long flags;
 	int err;
 
-	/* Set sample rate on hardware (skip if rate unchanged) */
+	/* Rate change detection: if the requested rate differs from the
+	 * current rate AND the transport is running, we must stop the
+	 * transport, change the clock, and do a full re-prepare with
+	 * rate-correct parameters (IRQ period, periodic timer).
+	 *
+	 * Previously this just called set_sample_rate() without stopping
+	 * the transport, leaving IRQ period and periodic timer at stale
+	 * values.  The firmware zeros the internal mixer on rate change,
+	 * so a full restart is required anyway.
+	 *
+	 * Discovery: open-apollo does a full disconnect/reconnect cycle.
+	 * We do the minimum: stop transport → set rate → cold prepare. */
 	if (dev->current_rate != rt->rate) {
+		if (READ_ONCE(dev->transport_state) >= 1) {
+			dev_info(&dev->pci->dev,
+				 "pcm_prepare: rate change %u → %u, "
+				 "stopping transport for re-prepare\n",
+				 dev->current_rate, rt->rate);
+			uad2_stop_transport(dev);
+		}
+
 		err = uad2_set_sample_rate(dev, rt->rate);
 		if (err)
 			dev_warn(
 				&dev->pci->dev,
 				"Sample rate set to %u may not have completed\n",
 				rt->rate);
+		/* Fall through to cold-start path (transport_state == 0) */
 	}
 
-	/* Track that this substream has been prepared.
-	 * This reference is decremented in hw_free.  It prevents hw_free
-	 * on one substream from tearing down the transport that the other
-	 * substream still depends on.
-	 *
-	 * Only increment once per substream — ALSA allows pcm_prepare to
-	 * be called multiple times without intervening hw_free.  Use the
-	 * runtime private_data pointer as a boolean flag (non-NULL = already
-	 * counted in streams_prepared). */
+	/* Track that this substream has been prepared. */
 	if (!rt->private_data) {
 		spin_lock_irqsave(&dev->lock, flags);
 		dev->streams_prepared++;
@@ -2294,53 +2306,24 @@ static int uad2_pcm_prepare(struct snd_pcm_substream *ss)
 		rt->private_data = dev; /* mark as counted */
 	}
 
-	/* Always use the hardware-computed buffer frame size.
-	 * The transport's DMA operates on the full interleaved buffer
-	 * (all 42 playback or 32 capture channels × buffer_frames × 4).
-	 * ALSA's runtime->buffer_size is in frames as seen by the app
-	 * (e.g., 2ch stereo), which can be much smaller.  Using that
-	 * value here would program a tiny buffer (e.g. 96 frames) and
-	 * the hardware cannot sustain interrupts at that rate. */
+	/* Hardware buffer frame size (fixed per model) */
 	buffer_frames = dev->buffer_frames;
 
-	/* IRQ period value from the kext's rate-based lookup table.
-	 * _setSampleClock stores this in this+0x2880, PrepareTransport
-	 * writes it to REG_IRQ_PERIOD (0x2258).  The firmware expects
-	 * specific small values (8/16/32), NOT buffer_frames/8 (1024). */
+	/* IRQ period and periodic timer from rate-based lookup tables */
 	irq_period_frames = uad2_irq_period_for_rate(rt->rate);
 	dev->irq_period_frames = irq_period_frames;
-
-	/* Periodic timer interval from kext CUAD2AudioMixer::StartTransport.
-	 * This controls the interrupt that actually drives audio processing.
-	 * Written to BAR+0x2270 and triggers vector 0x46 callbacks.
-	 * Values: 255 (48k), 511 (96k), 1023 (192k).  Represents N-1
-	 * where N is the number of frames between periodic interrupts. */
 	dev->periodic_timer_interval = uad2_periodic_timer_for_rate(rt->rate);
 
 	/* Transport re-preparation strategy:
 	 *
-	 * ALSA's snd_pcm_prepare() always resets hw_ptr and appl_ptr to 0
-	 * (via snd_pcm_do_reset → snd_pcm_lib_ioctl_reset).  Our .pointer()
-	 * callback must return values consistent with hw_ptr=0 after prepare.
+	 * Same-rate re-prepare (transport already running): use the
+	 * position-offset approach.  Snapshot DMA position so .pointer()
+	 * returns 0-relative values matching ALSA's reset hw_ptr.
 	 *
-	 * If the transport is already running, we do NOT stop it.  Stopping
-	 * and re-preparing causes DMA poll convergence failures (the hardware
-	 * REG_POLL_STATUS register retains stale values after stop, never
-	 * reaching the expected irq_period value).  This leads to starting
-	 * the transport in a half-initialized state → artifacts, pitch
-	 * changes, scratchy noise.
-	 *
-	 * Instead, we use a position-offset approach inspired by the
-	 * snd-dice/AMDTP driver pattern:
-	 *   - Snapshot the current DMA position as dma_pos_offset
-	 *   - In .pointer(), return (hw_pos - dma_pos_offset) % buffer_frames
-	 *   - This makes ALSA see positions starting from 0, matching hw_ptr
-	 *
-	 * For cold-start (transport not yet prepared), we do the full
+	 * Rate change or cold-start (transport_state == 0): do the full
 	 * prepare_transport sequence which resets DMA position to 0. */
 	if (READ_ONCE(dev->transport_state) >= 1) {
-		/* Transport already prepared or running — skip re-preparation.
-		 * Snapshot current DMA position as offset for .pointer(). */
+		/* Transport already running at correct rate — fast path */
 		u32 cur_pos = uad2_read32(dev, REG_DMA_POSITION);
 
 		if (cur_pos >= dev->buffer_frames)
@@ -2349,18 +2332,38 @@ static int uad2_pcm_prepare(struct snd_pcm_substream *ss)
 		return 0;
 	}
 
-	/* Cold start — full transport preparation.
-	 * prepare_transport writes REG_DMA_POSITION=0, so offset is 0. */
-	dev->dma_pos_offset = 0;
-
-	/* Prepare transport with hardware parameters.
+	/* Cold start (or post-rate-change) — full transport preparation.
 	 * Always program the full hardware channel counts — the DMA
 	 * layout is fixed at all channels interleaved. */
+	dev->dma_pos_offset = 0;
 	err = uad2_prepare_transport(dev, buffer_frames, irq_period_frames,
 				     READ_ONCE(dev->play_channels),
 				     READ_ONCE(dev->rec_channels));
+	if (err)
+		return err;
 
-	return err;
+	/* Start transport immediately after prepare so the post-transport
+	 * clock write has an active DMA context.  Open-apollo discovered
+	 * that the clock write AFTER transport start is what transitions
+	 * the DSP from passthrough to active processing mode, enabling
+	 * capture routing.  Without this ordering, the DSP activates with
+	 * no audio flowing and routes silence. */
+	uad2_start_transport(dev);
+
+	/* Post-transport clock write: source=0xC enables DSP active
+	 * processing.  Unlike clock_source=0 (internal), source=0xC
+	 * gets FPGA acknowledgment and activates the mixer DSP.
+	 * This is the capture-enabling step discovered by open-apollo
+	 * (ua_audio.c:2158-2168). */
+	{
+		u32 clock_cfg = 0xC | (uad2_rate_to_enum(rt->rate) << 8);
+
+		uad2_write32(dev, uad2_fw_reg(dev, REG_SAMPLE_CLOCK),
+			     clock_cfg);
+		uad2_write32(dev, REG_STREAM_ENABLE, 0x4); /* clock doorbell */
+	}
+
+	return 0;
 }
 
 static int uad2_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
