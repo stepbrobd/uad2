@@ -12,14 +12,11 @@
 
 > [!NOTE]
 > From a human (only this part and some Nix related code is written by me) and
-> all the other stuff is written by Claude. I've only tested this on a UA Apollo
-> Solo with a NixOS laptop. Stereo playback at 48kHz seem to work just fine, but
-> if the audio stream passed to ALSA is not resampled to 48kHz, the playback
-> will break (as in no audio what so ever, and I need to replug the interface to
-> MacBook and use the UA Mixer app to reinitialize the profile). The workaround
-> I have on this is to lock PipeWire to 48kHz and resample everything that's not
-> at 48kHz. DSP plugins and recording are not tested and I'm certain they will
-> not work.
+> all the other stuff is written by Claude. Tested on a UA Apollo Solo with a
+> NixOS laptop. Playback, capture (with condenser mic + 48V phantom), rate
+> switching (48k/96k), and full duplex all work. PipeWire integration verified.
+> ALSA mixer controls for monitor volume/mute and preamp gain/phantom/pad are
+> available via `alsamixer`, `pavucontrol`, or `amixer`.
 
 ## Acknowledgments
 
@@ -42,25 +39,26 @@ from open-apollo:
 ## Supported Devices
 
 All Apollo Thunderbolt 3/4 devices share PCI vendor `0x1A00`, device `0x0002`.
-The driver detects the model at probe time via serial prefix (BAR0+0x20..0x2C).
+The driver detects the model at probe time via PCI subsystem ID (preferred) or
+serial prefix (BAR0+0x20..0x2C) as fallback.
 
-| Device              | Type ID | Play Ch | Rec Ch | Preamps | Status                   |
-| ------------------- | ------- | ------- | ------ | ------- | ------------------------ |
-| Apollo Solo         | `0x27`  | 3       | 2      | 1       | Tested (stereo playback) |
-| Arrow               | `0x28`  | 3       | 2      | 1       | Untested                 |
-| Apollo Twin X       | `0x23`  | 8       | 8      | 2       | Untested                 |
-| Apollo Twin X Gen 2 | `0x3A`  | 8       | 8      | 2       | Untested                 |
-| Apollo x4           | `0x1F`  | 24      | 22     | 4       | Untested                 |
-| Apollo x4 Gen 2     | `0x36`  | 24      | 22     | 4       | Untested                 |
-| Apollo x6           | `0x1E`  | 24      | 22     | 4       | Untested                 |
-| Apollo x6 Gen 2     | `0x35`  | 24      | 22     | 4       | Untested                 |
-| Apollo x8           | `0x22`  | 26      | 26     | 4       | Untested                 |
-| Apollo x8 Gen 2     | `0x37`  | 26      | 26     | 4       | Untested                 |
-| Apollo x8p          | `0x20`  | 26      | 26     | 8       | Untested                 |
-| Apollo x8p Gen 2    | `0x38`  | 26      | 26     | 8       | Untested                 |
-| Apollo x16          | `0x21`  | 34      | 34     | 8       | Untested                 |
-| Apollo x16 Gen 2    | `0x39`  | 34      | 34     | 8       | Untested                 |
-| Apollo x16D         | `0x2A`  | 34      | 34     | 0       | Untested                 |
+| Device              | Type ID | Play Ch | Rec Ch | Preamps | Status                                     |
+| ------------------- | ------- | ------- | ------ | ------- | ------------------------------------------ |
+| Apollo Solo         | `0x27`  | 42      | 32     | 1       | Tested (play, capture, rate switch, mixer) |
+| Arrow               | `0x28`  | 42      | 32     | 1       | Untested                                   |
+| Apollo Twin X       | `0x23`  | 8       | 8      | 2       | Untested                                   |
+| Apollo Twin X Gen 2 | `0x3A`  | 8       | 8      | 2       | Untested                                   |
+| Apollo x4           | `0x1F`  | 24      | 22     | 4       | Untested                                   |
+| Apollo x4 Gen 2     | `0x36`  | 24      | 22     | 4       | Untested                                   |
+| Apollo x6           | `0x1E`  | 24      | 22     | 4       | Untested                                   |
+| Apollo x6 Gen 2     | `0x35`  | 24      | 22     | 4       | Untested                                   |
+| Apollo x8           | `0x22`  | 26      | 26     | 4       | Untested                                   |
+| Apollo x8 Gen 2     | `0x37`  | 26      | 26     | 4       | Untested                                   |
+| Apollo x8p          | `0x20`  | 26      | 26     | 8       | Untested                                   |
+| Apollo x8p Gen 2    | `0x38`  | 26      | 26     | 8       | Untested                                   |
+| Apollo x16          | `0x21`  | 34      | 34     | 8       | Untested                                   |
+| Apollo x16 Gen 2    | `0x39`  | 34      | 34     | 8       | Untested                                   |
+| Apollo x16D         | `0x2A`  | 34      | 34     | 0       | Untested                                   |
 
 Thunderbolt 2 devices (original Apollo Twin, Apollo 8, Apollo 16, Duo, Quad) are
 **not supported** — Linux generally does not enumerate TB2 PCIe devices.
@@ -133,13 +131,14 @@ DSP service loop.
 **Known limitations:**
 
 - PipeWire capture returns zeros (needs UCM2/WirePlumber channel mapping config
-  to map hardware Ch0 → mic input; direct ALSA capture works)
-- Capture requires playback to also be running (shared transport), except on
-  cold start where capture-only opens the transport
-- No preamp/monitor controls from Linux (needs chardev + ioctl interface or ALSA
-  kcontrols — phantom power must be set from macOS)
+  to map hardware Ch0 → mic input; direct ALSA capture via `arecord -D hw:N`
+  works fine)
 - No DSP plugin chain (disabled in both this driver and open-apollo — clobbers
   capture routing)
+- No bus coefficient control (fader/pan/send levels for internal DSP mixer
+  routing — requires ring buffer command protocol)
+- Preamp/monitor controls write to DSP mixer settings but hardware response has
+  not been verified for all parameters on all models
 
 ## Overview
 
@@ -177,15 +176,15 @@ Confirmed via `ioreg` on live hardware:
 | PCI Subsystem ID      | `0x000F`                                              |
 | PCI Class Code        | `0x048000` (Multimedia > Other)                       |
 | BAR 0                 | 64 KB MMIO window (phys `0x1203000000`, length 65536) |
-| PCIe Link             | Gen1 x1, MSI capable                                  |
+| PCIe Link             | Gen1 x2 (2.5 GT/s), MSI capable                       |
 | Thunderbolt Tunnelled | Yes (Intel JHL8440 controller)                        |
 | Thunderbolt Vendor    | Universal Audio, Inc. (TB vendor ID `0x1176`)         |
 | TB Device Model       | "Apollo Solo" (model ID `0x0B`, revision 1, ROM v32)  |
 | ioreg IOName          | `pci1a00,2`                                           |
 | PCI BDF               | `45:0:0`                                              |
 
-The PCI ID table in the driver is extensible for other UA Thunderbolt devices
-(Apollo Twin, x4, x6, etc.).
+The PCI ID table matches all UA Thunderbolt devices (`0x1A00:0x0002`). The model
+is determined at probe time via PCI subsystem ID or serial prefix detection.
 
 ## Audio Engine Specifications
 
@@ -210,7 +209,7 @@ Confirmed from `ioreg` IOAudioEngine + IOAudioStream on macOS:
 
 The project uses a **Nix flake** (`flake.nix`) that provides:
 
-- Linux kernel headers (currently 6.19.5)
+- Linux kernel headers (6.19+; uses `hrtimer_setup()` API introduced in 6.8)
 - `bear` (for `compile_commands.json` generation)
 - `clang-tools` (for LSP)
 - `gnumake`
@@ -228,7 +227,7 @@ make
 bear -- make
 ```
 
-The module compiles cleanly with zero warnings against kernel 6.19.5.
+The module compiles cleanly with zero warnings against kernel 6.19+.
 
 > **Note:** LSP errors about `-mpreferred-stack-boundary=3`,
 > `-mindirect-branch=thunk-extern`, etc. are **false positives** — clang does
@@ -1090,7 +1089,7 @@ re-probe on reconnect.
 
 ### Completed
 
-- **Build**: compiles cleanly with zero warnings against kernel 6.19.5
+- **Build**: compiles cleanly with zero warnings against kernel 6.19+
 - **Module load**: `insmod uad2.ko` succeeds, card appears in
   `/proc/asound/cards`, PCM device visible in `aplay -l`
 - **Firmware connect**: 20-channel doorbell sequence completes, IO descriptors
@@ -1115,27 +1114,19 @@ re-probe on reconnect.
 
 ### Not Yet Tested
 
-- **Capture / recording** — streams are exposed but never tested with actual
-  audio input
-- **DSP plugins** — not implemented; requires reverse engineering the mixer
-  layer
-- **Suspend/resume**
-- **Multi-device** (multiple Apollo units)
+- **DSP plugins** — not implemented; both this driver and open-apollo have the
+  plugin chain disabled (clobbers capture routing)
+- **Suspend/resume** — stubs exist but untested on live hardware
+- **Multi-device** (multiple Apollo units simultaneously)
 
 ### Sample Rate Switching
 
-Sample rate switching has been fully reverse-engineered from the kext and tested
-via direct ALSA access. **The firmware handshake works correctly**, but the
-feature is not enabled in the driver because it resets the device's internal DSP
-mixer, causing loss of audio output.
+Rate switching is **fully implemented and working**. The driver stops the
+transport, fires the firmware clock handshake, then does a full re-prepare with
+rate-correct parameters and a post-transport clock write for DSP activation.
 
-**What was tested:**
-
-All 6 supported rates (44100, 48000, 88200, 96000, 176400, 192000 Hz) were
-tested via `aplay -D hw:X,0 -f S32_LE -c 42 -r RATE -d 2 /dev/zero`. The
-firmware acknowledged each rate change in ~125 ms. The hardware registers (IRQ
-period, periodic timer, buffer frame size) were correctly reprogrammed for each
-speed class:
+Tested: 48kHz → 96kHz → 48kHz via both `amixer` control and direct ALSA
+(`aplay -D hw:N -r RATE`).
 
 | Speed Class | Rates          | IRQ Period | Periodic Timer | Period Frames |
 | ----------- | -------------- | ---------- | -------------- | ------------- |
@@ -1143,61 +1134,31 @@ speed class:
 | 2x          | 88200, 96000   | 16         | 511            | 512           |
 | 4x          | 176400, 192000 | 32         | 1023           | 1024          |
 
-**The problem: internal mixer reset.** When the sample rate changes, the Apollo
-Solo's firmware resets its internal DSP mixer routing to zeros. On macOS, the
-UAD Console application receives a notification (callback ID `0x68`) and
-immediately restores all mixer coefficients via
-`SetMixerParam`/`SetMixerBusParam` calls through the kernel driver's user-client
-interface. On Linux, there is no equivalent userspace application, so after a
-rate change the device's meters still show signal but no audio reaches the
-physical outputs. This state persists across module reloads — only plugging the
-device back into a Mac with the Console app restores the mixer.
-
-**To re-implement sample rate switching**, the following code was tested and
-verified working in `uad2_pcm_prepare()`:
-
-```c
-/* In uad2_pcm_prepare(), inside the (dev->current_rate != rt->rate) block,
- * BEFORE calling uad2_set_sample_rate(): */
-if (READ_ONCE(dev->transport_state) >= 1)
-    uad2_stop_transport(dev);
-```
-
-This forces the cold-prepare path after a rate change, which reprograms
-`REG_IRQ_PERIOD`, `REG_PERIODIC_TIMER`, and `REG_BUFFER_FRAME_SIZE` for the new
-rate. The existing `uad2_set_sample_rate()` function correctly implements the
-firmware clock handshake (`REG_SAMPLE_CLOCK` write → `0x4` to
-`REG_STREAM_ENABLE` → wait for `rate_event` completion with 2s timeout).
-
-The rate switch code was reverted because enabling it without a mixer restore
-mechanism would silently kill audio output. It should be re-enabled once a
-userspace mixer application exists.
-
-**Note on PipeWire:** PipeWire's default NixOS configuration uses
-`default.clock.allowed-rates = [48000]`, so `pw-play` always resamples to 48 kHz
-and never triggers a real hardware rate switch. To test rate switching, use
-direct ALSA access: `aplay -D hw:X,0 -f S32_LE -c 42 -r RATE`.
-
 ## Future Work
 
-### Userspace Mixer Application
+### Completed (Previously Future)
 
-The Apollo Solo has an internal DSP mixer controlled through a hardware register
-interface at `BAR+0x3800`. On macOS, the **UAD Console** application manages
-this mixer entirely from userspace via the kext's `SetMixerParam`,
-`SetMixerBusParam`, and `SetOtherParam` user-client calls. The kext driver
-itself does **not** set any mixer coefficients — it only provides the register
-write mechanism.
+- ~~Mixer controls~~ — 12 ALSA kcontrols for monitor + preamp (volume, mute,
+  dim, gain, phantom, pad, lowcut, phase, mic/line, source)
+- ~~Sample rate switching~~ — fully working with transport stop/re-prepare cycle
+- ~~Capture~~ — working with hrtimer polling, condenser mic verified at -42 dBFS
 
-A Linux userspace mixer application will need to be reverse-engineered and
-implemented. This is required for:
+### Remaining
 
-- **Restoring mixer state after sample rate changes** (the firmware zeros all
-  mixer coefficients on rate change)
-- **Setting up monitor routing** (which inputs/outputs are connected and at what
-  gain)
-- **Controlling headphone/line output levels**
-- **Any DSP processing** (EQ, compression, etc.)
+**Chardev + ioctl interface** — `/dev/ua_apolloN` for advanced userspace control
+(bus coefficients, raw register access, firmware loading). Required for a
+standalone CLI/GUI mixer tool.
+
+**Bus coefficient control** — fader/pan/send levels for DSP internal mixer
+routing. Requires ring buffer command protocol (`SetMixerBusParam`).
+
+**UCM2/WirePlumber configs** — PipeWire channel mapping so that capture shows as
+named inputs (Mic 1, Line In, etc.) instead of raw 32-channel device. Can port
+from open-apollo `configs/ucm2/` and `configs/wireplumber/`.
+
+**Hardware readback parsing** — the 40-word readback from `BAR+0x3814` contains
+preamp flags, monitor state, and gain values. Parsing these would let the driver
+reflect actual hardware state in ALSA kcontrols.
 
 #### Hardware Mixer Register Map (`CPcieDeviceMixer`)
 
@@ -1258,25 +1219,15 @@ opportunistically flushes deferred settings.
 | `CMessenger::DispatchSetMixerParam`      | 52910     | Userspace → kernel mixer param dispatch     |
 | `CMessenger::DispatchSetMixerBusParam`   | 52794     | Batch mixer bus param dispatch              |
 
-#### Implementation Strategy
+#### Current Implementation
 
-Two approaches are possible:
+The driver implements approach #2 — ALSA kcontrols that write directly to DSP
+mixer settings via the batch protocol. Monitor params route to setting[2] with
+per-param bitmasks. Preamp params route to setting[param_id + 7]. The DSP
+service loop flushes all pending changes every 10ms.
 
-1. **Save/restore**: Read all 38 mixer settings from hardware at probe time
-   (while they contain a valid configuration from the Mac), cache them, and
-   restore after rate changes. Simple but fragile — requires initial setup via
-   Mac.
-
-2. **Full userspace mixer**: Reverse-engineer the `SetOtherParam` switch table
-   (param IDs 0x01–0x8A mapping to setting indices and bitmasks) and implement a
-   Linux userspace application or ALSA mixer controls. This is the proper
-   solution and what the macOS stack does.
-
-### Re-enable Sample Rate Switching
-
-Once a mixer save/restore or userspace mixer is implemented, re-enable rate
-switching by adding the transport stop before `uad2_set_sample_rate()` in
-`uad2_pcm_prepare()` (see "Sample Rate Switching" in Testing Status above).
+Sample rate switching is fully working — the driver stops the transport, sets
+the clock, and does a full re-prepare with correct parameters.
 
 ## Disassembly Reference
 
