@@ -838,92 +838,17 @@ static void uad2_mixer_init(struct uad2_dev *dev)
 	dev->mixer_dirty = false;
 	dev->mixer_ready = true;
 
-	/* Activate DSP capture + monitor routing.
+	/* Don't write any mixer settings on init.
 	 *
-	 * The DSP monitor processing module requires a full initialization
-	 * sequence (57 params from open-apollo mixer daemon) to activate.
-	 * Without this, the monitor output stays inactive (front panel
-	 * yellow indicator).
+	 * The device persists all mixer/monitor/preamp/HP configuration
+	 * across power cycles and TB reconnect.  Writing settings here
+	 * clobbers user-configured values.
 	 *
-	 * Strategy: write settings[1-37] = 0x20/0xFF for capture routing,
-	 * then overlay the monitor-critical settings with proper defaults
-	 * matching the macOS init sequence.
-	 *
-	 * Ported from open-apollo ua_mixer_daemon.py
-	 * _push_defaults_to_hardware() lines 891-957. */
-	for (s = 1; s < MIXER_BATCH_COUNT; s++) {
-		dev->mixer_val[s] = 0x20;
-		dev->mixer_mask[s] = 0xFF;
-	}
-	dev->mixer_val[35] = 0x05;
-	dev->mixer_mask[35] = 0x1F;
-
-	/* Setting[2]: monitor core — volume=0 (safe), unmuted, source=MIX,
-	 * CUE1/CUE2 mix enabled, dim off.  Full mask to activate module. */
-	dev->mixer_val[2] = 0x00000000; /* vol=0, unmuted, MIX, no dim */
-	dev->mixer_mask[2] = 0xFFFFFFFF;
-
-	/* Setting[0]: output pad flags — all off */
-	dev->mixer_val[0] = 0x00;
-	dev->mixer_mask[0] = 0xFFFFFFFF;
-
-	/* Setting[1]: SR convert on (bit 31), misc config */
-	dev->mixer_val[1] = BIT(31); /* SR convert = on */
-	dev->mixer_mask[1] = 0xFFFFFFFF;
-
-	/* Setting[6]: mirror A / identify — CUE1 mirror disabled */
-	dev->mixer_val[6] = 0x000000FF; /* mirror = 0xFF (disabled) */
-	dev->mixer_mask[6] = 0xFFFFFFFF;
-
-	/* Setting[7]: mirror B / TB config — talkback config = 1,
-	 * CUE2 mirror disabled */
-	dev->mixer_val[7] = 0x000010FF; /* TBConfig bit12 + mirror=0xFF */
-	dev->mixer_mask[7] = 0xFFFFFFFF;
-
-	/* Setting[8]: digital out mode = S/PDIF (0) */
-	dev->mixer_val[8] = 0x00;
-	dev->mixer_mask[8] = 0xFFFFFFFF;
-
-	/* Setting[11]: output ref + mirror config — +4dBu, mirrors off.
-	 * Unknown_30/31 = 0xFFFFFFFF (mirrors disabled per macOS) */
-	dev->mixer_val[11] = 0xFFFF0000; /* mirror bytes = disabled */
-	dev->mixer_mask[11] = 0xFFFFFFFF;
-
-	/* Setting[12]: HP1 source = CUE1 (0), HP2 source = CUE2 (1<<27) */
-	dev->mixer_val[12] = (1 << 27); /* HP2=CUE2 */
-	dev->mixer_mask[12] = 0xFFFFFFFF;
-
-	/* Setting[13]: talkback off */
-	dev->mixer_val[13] = 0x00;
-	dev->mixer_mask[13] = 0xFFFFFFFF;
-
-	/* Setting[14]: dim level = 7 (max attenuation), dim off */
-	dev->mixer_val[14] = (7 << 28); /* dim_level = 7 */
-	dev->mixer_mask[14] = 0xFFFFFFFF;
-
-	/* Setting[15]: mirror enables off, unknown_3e bit9 = 1 */
-	dev->mixer_val[15] = BIT(9); /* 0x3e = 1 per macOS init */
-	dev->mixer_mask[15] = 0xFFFFFFFF;
-
-	/* Setting[32]: HP/output config flags — all off */
-	dev->mixer_val[32] = 0x00;
-	dev->mixer_mask[32] = 0xFFFFFFFF;
-
-	/* Setting[33]: HP output byte fields — all off */
-	dev->mixer_val[33] = 0x00;
-	dev->mixer_mask[33] = 0xFFFFFFFF;
-
-	/* Sync monitor state cache with init values */
-	dev->monitor.level = 0;
-	dev->monitor.mute = 0; /* unmuted */
-	dev->monitor.dim = false;
-	dev->monitor.source = 0; /* MIX */
-
-	dev->mixer_dirty = true;
+	 * The mixer batch protocol is ready for on-demand writes when
+	 * the user changes controls via ALSA kcontrols. */
 
 	dev_info(&dev->pci->dev,
-		 "mixer init (SEQ=%u, capture + monitor routing armed)\n",
-		 seq_rd);
+		 "mixer init (SEQ=%u, device config preserved)\n", seq_rd);
 }
 
 /* ============================================================
