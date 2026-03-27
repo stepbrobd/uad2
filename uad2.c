@@ -37,12 +37,47 @@
 #include <sound/initval.h>
 
 /* ============================================================
- * PCI identity (confirmed via ioreg on live hardware)
- * Bus 45:0:0, Thunderbolt-tunnelled PCIe Gen1 x1
+ * PCI identity
+ * All Apollo Thunderbolt devices share vendor 0x1A00, device 0x0002.
+ * Device model is determined by serial prefix (BAR0+0x20..0x2C),
+ * not by PCI subsystem ID.
  * ============================================================ */
 #define UA_VENDOR_ID 0x1a00
-#define UAD2_DEVICE_ID_SOLO 0x0002
-#define UAD2_SUBSYS_ID_SOLO 0x000f
+#define UA_DEVICE_ID 0x0002
+
+/* ============================================================
+ * Device type IDs (from open-apollo ua_apollo.h, reconstructed
+ * from kext CPcieDevice::Name() and _deviceTypeFromSerialNumber())
+ *
+ * v2 devices: type from ext_caps register (0x2234) bits[25:20]-1,
+ *             then refined via serial number prefix lookup.
+ * ============================================================ */
+#define UA_DEV_APOLLO_X6 0x1E
+#define UA_DEV_APOLLO_X4 0x1F
+#define UA_DEV_APOLLO_X8P 0x20
+#define UA_DEV_APOLLO_X16 0x21
+#define UA_DEV_APOLLO_X8 0x22
+#define UA_DEV_APOLLO_TWIN_X 0x23
+#define UA_DEV_APOLLO_SOLO 0x27
+#define UA_DEV_ARROW 0x28
+#define UA_DEV_APOLLO_X16D 0x2A
+#define UA_DEV_APOLLO_X6_GEN2 0x35
+#define UA_DEV_APOLLO_X4_GEN2 0x36
+#define UA_DEV_APOLLO_X8_GEN2 0x37
+#define UA_DEV_APOLLO_X8P_GEN2 0x38
+#define UA_DEV_APOLLO_X16_GEN2 0x39
+#define UA_DEV_APOLLO_TWIN_X_GEN2 0x3A
+
+/* Serial prefix register: BAR0+0x20..0x2C, 16-byte ASCII string.
+ * First 4 digits (at offset +4 into the string) identify the model. */
+#define UA_REG_SERIAL_BASE 0x0020
+#define UA_REG_SERIAL_LEN 16
+
+/* FPGA revision register — bit 31 distinguishes v1/v2 firmware */
+#define REG_FPGA_REV 0x2218
+/* Extended capabilities (v2 firmware): bits[25:20] = device family,
+ * bits[15:8] = DSP count */
+#define REG_EXT_CAPS 0x2234
 
 /* ============================================================
  * BAR register offsets  (all 32-bit MMIO, BAR 0 = 64 KB window)
@@ -229,25 +264,116 @@
 #define UA_RATE_192000 6
 
 /* ============================================================
- * Audio engine parameters (from ioreg IOAudioEngine, confirmed live)
- *
- * IOAudioEngineNumSampleFramesPerBuffer = 8192
- * IOAudioEngineSampleOffset = 16
- * Current sample rate = 48000
- * Format: 32-bit container, 24-bit depth, signed int, little-endian
- *         (IOAudioStreamByteOrder=1, alignment=1 = MSB-justified)
- * Input: 32 channels, Output: 42 channels
+ * Audio engine parameters
  * ============================================================ */
 #define UAD2_MAX_BUFFER_FRAMES 8192 /* max from _recomputeBufferFrameSize cap */
 #define UAD2_SAMPLE_OFFSET 16
-#define UAD2_OUT_CHANNELS 42 /* output channels (to device) */
-#define UAD2_IN_CHANNELS 32 /* input channels (from device) */
 #define UAD2_BYTES_PER_SAMPLE 4 /* 24-bit in 32-bit container */
 #define UAD2_MAX_DSPS 8
+#define UAD2_MAX_CHANNELS 64
 
-/* channel_base_index: constant loaded from data segment @ 0x6018 in kext
- * Confirmed value = 10 (0x0A) for Apollo Solo */
+/* channel_base_index = bank_shift for notification register addressing.
+ * All Apollo Thunderbolt devices use 0x0A (verified on Solo, x4). */
 #define UAD2_CHANNEL_BASE_IDX 10
+
+/* ============================================================
+ * Serial prefix → device type lookup table
+ * From open-apollo ua_core.c (extracted from kext
+ * _deviceTypeFromSerialNumber() data at offset 0x3E840)
+ * ============================================================ */
+struct ua_serial_entry {
+	char prefix[5]; /* 4-char ASCII serial prefix + NUL */
+	u32 device_type;
+};
+
+static const struct ua_serial_entry ua_serial_table[] = {
+	{ "2005", UA_DEV_APOLLO_X4 },
+	{ "2016", UA_DEV_APOLLO_X6 },
+	{ "2017", UA_DEV_APOLLO_X8 },
+	{ "2018", UA_DEV_APOLLO_X16 },
+	{ "2019", UA_DEV_APOLLO_X8P },
+	{ "2020", UA_DEV_APOLLO_TWIN_X },
+	{ "2024", UA_DEV_APOLLO_SOLO },
+	{ "2025", UA_DEV_ARROW },
+	{ "2032", UA_DEV_APOLLO_X16D },
+	{ "2073", UA_DEV_APOLLO_X6_GEN2 },
+	{ "2082", UA_DEV_APOLLO_X6_GEN2 },
+	{ "2086", UA_DEV_APOLLO_X8_GEN2 },
+	{ "2087", UA_DEV_APOLLO_X8P_GEN2 },
+	{ "2088", UA_DEV_APOLLO_X16_GEN2 },
+	{ "2089", UA_DEV_APOLLO_TWIN_X_GEN2 },
+	{ "2092", UA_DEV_APOLLO_X4_GEN2 },
+};
+
+/* ============================================================
+ * Per-model channel counts and capabilities
+ * From open-apollo ua_audio.c (macOS IOKit IOAudioEngine properties)
+ *
+ * These are PCIe DMA channel counts, not physical I/O count.
+ * ============================================================ */
+struct ua_model_info {
+	u32 device_type;
+	unsigned int play_ch;
+	unsigned int rec_ch;
+	unsigned int num_preamps;
+	unsigned int num_hiz;
+};
+
+static const struct ua_model_info ua_models[] = {
+	{ UA_DEV_APOLLO_SOLO, 3, 2, 1, 0 },
+	{ UA_DEV_ARROW, 3, 2, 1, 0 },
+	{ UA_DEV_APOLLO_TWIN_X, 8, 8, 2, 2 },
+	{ UA_DEV_APOLLO_TWIN_X_GEN2, 8, 8, 2, 2 },
+	{ UA_DEV_APOLLO_X4, 24, 22, 4, 2 },
+	{ UA_DEV_APOLLO_X4_GEN2, 24, 22, 4, 2 },
+	{ UA_DEV_APOLLO_X6, 24, 22, 4, 2 },
+	{ UA_DEV_APOLLO_X6_GEN2, 24, 22, 4, 2 },
+	{ UA_DEV_APOLLO_X8, 26, 26, 4, 2 },
+	{ UA_DEV_APOLLO_X8_GEN2, 26, 26, 4, 2 },
+	{ UA_DEV_APOLLO_X8P, 26, 26, 8, 2 },
+	{ UA_DEV_APOLLO_X8P_GEN2, 26, 26, 8, 2 },
+	{ UA_DEV_APOLLO_X16, 34, 34, 8, 2 },
+	{ UA_DEV_APOLLO_X16_GEN2, 34, 34, 8, 2 },
+	{ UA_DEV_APOLLO_X16D, 34, 34, 0, 0 },
+};
+
+static const char *ua_device_name(u32 device_type)
+{
+	switch (device_type) {
+	case UA_DEV_APOLLO_X4:
+		return "Apollo x4";
+	case UA_DEV_APOLLO_X6:
+		return "Apollo x6";
+	case UA_DEV_APOLLO_X8:
+		return "Apollo x8";
+	case UA_DEV_APOLLO_X8P:
+		return "Apollo x8p";
+	case UA_DEV_APOLLO_X16:
+		return "Apollo x16";
+	case UA_DEV_APOLLO_X16D:
+		return "Apollo x16D";
+	case UA_DEV_APOLLO_TWIN_X:
+		return "Apollo Twin X";
+	case UA_DEV_APOLLO_SOLO:
+		return "Apollo Solo";
+	case UA_DEV_ARROW:
+		return "Arrow";
+	case UA_DEV_APOLLO_X4_GEN2:
+		return "Apollo x4 Gen 2";
+	case UA_DEV_APOLLO_X6_GEN2:
+		return "Apollo x6 Gen 2";
+	case UA_DEV_APOLLO_X8_GEN2:
+		return "Apollo x8 Gen 2";
+	case UA_DEV_APOLLO_X8P_GEN2:
+		return "Apollo x8p Gen 2";
+	case UA_DEV_APOLLO_X16_GEN2:
+		return "Apollo x16 Gen 2";
+	case UA_DEV_APOLLO_TWIN_X_GEN2:
+		return "Apollo Twin X Gen 2";
+	default:
+		return "Unknown Apollo";
+	}
+}
 
 /* Connect loop: 20 channels with 10 retries each */
 #define UAD2_CONNECT_CHANNELS 20
@@ -364,10 +490,13 @@ struct uad2_dev {
 	                                         * (mirrors kext spinlock at this+0x2890) */
 
 	u32 expected_device_id;
+	u32 device_type; /* UA_DEV_APOLLO_* enum */
+	u32 fpga_rev; /* cached FPGA revision from 0x2218 */
+	bool fw_v2; /* v2 firmware (bit 31 of fpga_rev set) */
 	bool has_extended_irq; /* uses DMA1 regs for upper 32 slots */
 	bool disconnecting; /* set during remove, guards MMIO access */
 	unsigned int dsp_count;
-	u32 channel_base_index; /* 10 for Apollo Solo */
+	u32 channel_base_index; /* 10 (0x0A) for all Apollo TB devices */
 
 	/* Shadow register for DMA master control (never read from HW) */
 	u32 dma_ctrl_shadow;
@@ -472,6 +601,10 @@ struct uad2_dev {
 	u32 dma_pos_offset;
 };
 
+/* Forward declarations */
+static unsigned int uad2_compute_buffer_frames(unsigned int play_ch,
+					       unsigned int rec_ch);
+
 /* ============================================================
  * Low-level register accessors
  * Mirrors CUAOS::ReadReg / CUAOS::WriteReg
@@ -499,6 +632,92 @@ static inline void uad2_write32(struct uad2_dev *dev, u32 offset, u32 val)
 static inline u32 uad2_fw_reg(struct uad2_dev *dev, u32 base_offset)
 {
 	return (dev->channel_base_index << 2) + base_offset;
+}
+
+/* ============================================================
+ * Device detection — read serial prefix, look up model, set channels
+ *
+ * All Apollo Thunderbolt devices share PCI vendor 0x1A00, device 0x0002.
+ * The model is identified by a 4-digit ASCII serial prefix read from
+ * BAR0+0x20..0x2C.  The FPGA revision register (0x2218) bit 31
+ * distinguishes v1 (clear) from v2 (set) firmware; v2 devices use
+ * the extended capabilities register (0x2234) for DSP count.
+ *
+ * Ported from open-apollo ua_core.c ua_read_serial_type() and
+ * ua_detect_capabilities().
+ * ============================================================ */
+static void uad2_detect_device(struct uad2_dev *dev)
+{
+	char serial[UA_REG_SERIAL_LEN + 1];
+	u32 regs[4];
+	u32 ext_caps;
+	int i;
+
+	/* Cache FPGA revision and detect firmware version */
+	dev->fpga_rev = uad2_read32(dev, REG_FPGA_REV);
+
+	if ((s32)dev->fpga_rev >= 0) {
+		/* v1 firmware: device type from FPGA rev bits[31:28] - 1 */
+		dev->fw_v2 = false;
+		dev->device_type = (dev->fpga_rev >> 28) - 1;
+		dev->dsp_count = 1; /* v1 default, refine from subsys ID */
+	} else {
+		/* v2 firmware: DSP count from ext_caps, type from serial */
+		dev->fw_v2 = true;
+		ext_caps = uad2_read32(dev, REG_EXT_CAPS);
+		dev->dsp_count = (ext_caps >> 8) & 0xFF;
+		if (dev->dsp_count > UAD2_MAX_DSPS)
+			dev->dsp_count = UAD2_MAX_DSPS;
+
+		/* Read 16-byte serial string from BAR0+0x20..0x2C */
+		for (i = 0; i < 4; i++)
+			regs[i] = uad2_read32(dev, UA_REG_SERIAL_BASE + i * 4);
+		memcpy(serial, regs, UA_REG_SERIAL_LEN);
+		serial[UA_REG_SERIAL_LEN] = '\0';
+
+		dev_info(&dev->pci->dev, "serial: %.16s\n", serial);
+
+		/* Match 4-char prefix (at offset 4) against lookup table */
+		dev->device_type = 0;
+		for (i = 0; i < (int)ARRAY_SIZE(ua_serial_table); i++) {
+			if (!strncmp(serial + 4, ua_serial_table[i].prefix,
+				     4)) {
+				dev->device_type =
+					ua_serial_table[i].device_type;
+				break;
+			}
+		}
+
+		if (!dev->device_type)
+			dev_warn(&dev->pci->dev,
+				 "unknown serial prefix, type unresolved\n");
+	}
+
+	/* Look up channel counts from model table */
+	for (i = 0; i < (int)ARRAY_SIZE(ua_models); i++) {
+		if (ua_models[i].device_type == dev->device_type) {
+			dev->play_channels = ua_models[i].play_ch;
+			dev->rec_channels = ua_models[i].rec_ch;
+			goto found;
+		}
+	}
+
+	/* Fallback: safe stereo default for unknown models */
+	dev_warn(&dev->pci->dev,
+		 "unknown device type 0x%02x, using safe defaults\n",
+		 dev->device_type);
+	dev->play_channels = 3;
+	dev->rec_channels = 2;
+
+found:
+	dev->buffer_frames = uad2_compute_buffer_frames(dev->play_channels,
+							dev->rec_channels);
+	dev_info(&dev->pci->dev,
+		 "%s detected: type=0x%02x fw_%s dsp=%u "
+		 "play=%uch rec=%uch buf=%u\n",
+		 ua_device_name(dev->device_type), dev->device_type,
+		 dev->fw_v2 ? "v2" : "v1", dev->dsp_count, dev->play_channels,
+		 dev->rec_channels, dev->buffer_frames);
 }
 
 /* ============================================================
@@ -1328,12 +1547,8 @@ connect_done:
 	dev_info(&dev->pci->dev, "Connect succeeded on attempt %d (retry %d)\n",
 		 chan, retry);
 
-	/* After successful connect, compute buffer frame size */
-	if (dev->play_channels == 0)
-		dev->play_channels = UAD2_OUT_CHANNELS;
-	if (dev->rec_channels == 0)
-		dev->rec_channels = UAD2_IN_CHANNELS;
-
+	/* Recompute buffer frame size (channels set by uad2_detect_device()
+	 * in probe, or updated from IO descriptor notifications above) */
 	dev->buffer_frames = uad2_compute_buffer_frames(dev->play_channels,
 							dev->rec_channels);
 
@@ -1709,13 +1924,12 @@ static const struct snd_pcm_hardware uad2_pcm_hw_playback = {
 		 SNDRV_PCM_RATE_176400 | SNDRV_PCM_RATE_192000,
 	.rate_min = 44100,
 	.rate_max = 192000,
-	.channels_min = UAD2_OUT_CHANNELS,
-	.channels_max = UAD2_OUT_CHANNELS,
-	.buffer_bytes_max = UAD2_MAX_BUFFER_FRAMES * UAD2_OUT_CHANNELS *
+	.channels_min = 2,
+	.channels_max = UAD2_MAX_CHANNELS,
+	.buffer_bytes_max = UAD2_MAX_BUFFER_FRAMES * UAD2_MAX_CHANNELS *
 			    UAD2_BYTES_PER_SAMPLE,
-	.period_bytes_min = UAD2_PERIOD_FRAMES_1X * UAD2_OUT_CHANNELS *
-			    UAD2_BYTES_PER_SAMPLE,
-	.period_bytes_max = UAD2_PERIOD_FRAMES_4X * UAD2_OUT_CHANNELS *
+	.period_bytes_min = UAD2_PERIOD_FRAMES_1X * 2 * UAD2_BYTES_PER_SAMPLE,
+	.period_bytes_max = UAD2_PERIOD_FRAMES_4X * UAD2_MAX_CHANNELS *
 			    UAD2_BYTES_PER_SAMPLE,
 	.periods_min = UAD2_MAX_BUFFER_FRAMES / UAD2_PERIOD_FRAMES_4X,
 	.periods_max = UAD2_MAX_BUFFER_FRAMES / UAD2_PERIOD_FRAMES_1X,
@@ -1731,13 +1945,12 @@ static const struct snd_pcm_hardware uad2_pcm_hw_capture = {
 		 SNDRV_PCM_RATE_176400 | SNDRV_PCM_RATE_192000,
 	.rate_min = 44100,
 	.rate_max = 192000,
-	.channels_min = UAD2_IN_CHANNELS,
-	.channels_max = UAD2_IN_CHANNELS,
-	.buffer_bytes_max = UAD2_MAX_BUFFER_FRAMES * UAD2_IN_CHANNELS *
+	.channels_min = 2,
+	.channels_max = UAD2_MAX_CHANNELS,
+	.buffer_bytes_max = UAD2_MAX_BUFFER_FRAMES * UAD2_MAX_CHANNELS *
 			    UAD2_BYTES_PER_SAMPLE,
-	.period_bytes_min = UAD2_PERIOD_FRAMES_1X * UAD2_IN_CHANNELS *
-			    UAD2_BYTES_PER_SAMPLE,
-	.period_bytes_max = UAD2_PERIOD_FRAMES_4X * UAD2_IN_CHANNELS *
+	.period_bytes_min = UAD2_PERIOD_FRAMES_1X * 2 * UAD2_BYTES_PER_SAMPLE,
+	.period_bytes_max = UAD2_PERIOD_FRAMES_4X * UAD2_MAX_CHANNELS *
 			    UAD2_BYTES_PER_SAMPLE,
 	.periods_min = UAD2_MAX_BUFFER_FRAMES / UAD2_PERIOD_FRAMES_4X,
 	.periods_max = UAD2_MAX_BUFFER_FRAMES / UAD2_PERIOD_FRAMES_1X,
@@ -1864,12 +2077,23 @@ static int uad2_pcm_open(struct snd_pcm_substream *ss)
 
 	if (ss->stream == SNDRV_PCM_STREAM_PLAYBACK) {
 		ss->runtime->hw = uad2_pcm_hw_playback;
+		/* Set actual channel count from device detection */
+		ss->runtime->hw.channels_min = dev->play_channels;
+		ss->runtime->hw.channels_max = dev->play_channels;
+		ss->runtime->hw.buffer_bytes_max = UAD2_MAX_BUFFER_FRAMES *
+						   dev->play_channels *
+						   UAD2_BYTES_PER_SAMPLE;
 		spin_lock_irqsave(&dev->lock, flags);
 		dev->playback_ss = ss;
 		dev->open_count++;
 		spin_unlock_irqrestore(&dev->lock, flags);
 	} else {
 		ss->runtime->hw = uad2_pcm_hw_capture;
+		ss->runtime->hw.channels_min = dev->rec_channels;
+		ss->runtime->hw.channels_max = dev->rec_channels;
+		ss->runtime->hw.buffer_bytes_max = UAD2_MAX_BUFFER_FRAMES *
+						   dev->rec_channels *
+						   UAD2_BYTES_PER_SAMPLE;
 		spin_lock_irqsave(&dev->lock, flags);
 		dev->capture_ss = ss;
 		dev->open_count++;
@@ -2668,17 +2892,16 @@ static int uad2_probe(struct pci_dev *pci, const struct pci_device_id *id)
 	dev_info(&pci->dev, "Device ID register: 0x%08x\n",
 		 dev->expected_device_id);
 
-	/* Apollo Solo: 1 DSP, single DMA engine
-	 * channel_base_index = 10 (from data segment @ 0x6018 in kext binary) */
-	dev->dsp_count = 1;
-	dev->has_extended_irq = true; /* all 3 vectors map to slots > 31 */
+	/* Device detection: read serial prefix, determine model, set channels.
+	 * All Apollo TB devices use channel_base_index=10 (bank_shift=0x0A). */
 	dev->channel_base_index = UAD2_CHANNEL_BASE_IDX;
 	dev->dma_ctrl_shadow = DMA_CTRL_MASTER_ENABLE;
-	dev->play_channels = UAD2_OUT_CHANNELS;
-	dev->rec_channels = UAD2_IN_CHANNELS;
-	dev->buffer_frames = UAD2_MAX_BUFFER_FRAMES;
 	dev->clock_source = 0; /* internal */
 	dev->current_rate = 48000;
+
+	uad2_detect_device(dev);
+
+	dev->has_extended_irq = dev->fw_v2; /* v2 FW uses DMA1 regs */
 
 	/* Allocate the two 4MB DMA buffers for scatter-gather */
 	err = uad2_alloc_sg_buffers(dev);
@@ -2718,9 +2941,11 @@ static int uad2_probe(struct pci_dev *pci, const struct pci_device_id *id)
 
 	/* ALSA card registration */
 	strscpy(card->driver, "uad2", sizeof(card->driver));
-	strscpy(card->shortname, "UA UAD2", sizeof(card->shortname));
-	strscpy(card->longname, "Universal Audio UAD2 Thunderbolt",
-		sizeof(card->longname));
+	snprintf(card->shortname, sizeof(card->shortname), "UA %s",
+		 ua_device_name(dev->device_type));
+	snprintf(card->longname, sizeof(card->longname),
+		 "Universal Audio %s Thunderbolt",
+		 ua_device_name(dev->device_type));
 
 	err = snd_pcm_new(card, "UAD2", 0, 1, 1, &dev->pcm);
 	if (err < 0)
@@ -2745,8 +2970,9 @@ static int uad2_probe(struct pci_dev *pci, const struct pci_device_id *id)
 
 	pci_set_drvdata(pci, dev);
 	dev_info(&pci->dev,
-		 "UAD2 initialized — play=%uch rec=%uch buf=%u frames\n",
-		 dev->play_channels, dev->rec_channels, dev->buffer_frames);
+		 "%s initialized — play=%uch rec=%uch buf=%u frames\n",
+		 ua_device_name(dev->device_type), dev->play_channels,
+		 dev->rec_channels, dev->buffer_frames);
 	return 0;
 
 err_free_irq:
@@ -2816,13 +3042,11 @@ static void uad2_remove(struct pci_dev *pci)
 }
 
 static const struct pci_device_id uad2_pci_ids[] = {
-	{ /* Apollo Solo */
-	  PCI_DEVICE_SUB(UA_VENDOR_ID, UAD2_DEVICE_ID_SOLO, UA_VENDOR_ID,
-			 UAD2_SUBSYS_ID_SOLO) },
-	/* TODO: Add other UAD2 Thunderbolt devices here:
-	 * Apollo Twin, Apollo x4, Apollo x6, Apollo x8, Apollo x8p,
-	 * Apollo x16, Apollo Twin X, Apollo Solo USB, etc.
-	 * All share vendor 0x1a00, device 0x0002; differ by subsystem ID. */
+	/* All Apollo Thunderbolt devices share the same PCI vendor/device ID.
+	 * The actual model is determined by serial prefix detection in probe.
+	 * Supports: Solo, Arrow, Twin X, x4, x6, x8, x8p, x16, x16D,
+	 * and all Gen 2 variants. */
+	{ PCI_DEVICE(UA_VENDOR_ID, UA_DEVICE_ID) },
 	{}
 };
 MODULE_DEVICE_TABLE(pci, uad2_pci_ids);
