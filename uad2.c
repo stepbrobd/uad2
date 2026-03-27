@@ -71,9 +71,18 @@
 #define UA_DEV_APOLLO_TWIN_X_GEN2 0x3A
 
 /* Serial prefix register: BAR0+0x20..0x2C, 16-byte ASCII string.
- * First 4 digits (at offset +4 into the string) identify the model. */
+ * First 4 digits (at offset +4 into the string) identify the model.
+ * NOTE: serial prefix detection is unreliable on some models (e.g.
+ * Apollo Solo serial coincidentally contains "2032" → false x16D match).
+ * PCI subsystem ID is used as primary detection where known. */
 #define UA_REG_SERIAL_BASE 0x0020
 #define UA_REG_SERIAL_LEN 16
+
+/* PCI subsystem IDs for known models.
+ * These are constant per model and more reliable than serial prefix.
+ * Only models confirmed on real hardware or from open-apollo are listed. */
+#define UA_SUBSYS_SOLO 0x000F /* Apollo Solo (confirmed via ioreg) */
+#define UA_SUBSYS_X4_QUAD 0x0011 /* Apollo x4 Quad (from open-apollo) */
 
 /* FPGA revision register — bit 31 distinguishes v1/v2 firmware */
 #define REG_FPGA_REV 0x2218
@@ -350,8 +359,12 @@ struct ua_model_info {
 };
 
 static const struct ua_model_info ua_models[] = {
-	{ UA_DEV_APOLLO_SOLO, 3, 2, 1, 0 },
-	{ UA_DEV_ARROW, 3, 2, 1, 0 },
+	/* Solo/Arrow: open-apollo has 3/2 but those are physical I/O counts.
+	 * DMA channel counts from macOS ioreg: play=42 rec=32 for Solo.
+	 * Arrow likely same (same chipset). Firmware IO descriptors will
+	 * override these after connect if different. */
+	{ UA_DEV_APOLLO_SOLO, 42, 32, 1, 0 },
+	{ UA_DEV_ARROW, 42, 32, 1, 0 },
 	{ UA_DEV_APOLLO_TWIN_X, 8, 8, 2, 2 },
 	{ UA_DEV_APOLLO_TWIN_X_GEN2, 8, 8, 2, 2 },
 	{ UA_DEV_APOLLO_X4, 24, 22, 4, 2 },
@@ -904,10 +917,31 @@ static void uad2_detect_device(struct uad2_dev *dev)
 	char serial[UA_REG_SERIAL_LEN + 1];
 	u32 regs[4];
 	u32 ext_caps;
+	u16 subsys;
 	int i;
 
 	/* Cache FPGA revision and detect firmware version */
 	dev->fpga_rev = uad2_read32(dev, REG_FPGA_REV);
+
+	/* Try PCI subsystem ID first — most reliable for known models.
+	 * Serial prefix detection is unreliable on some models (see
+	 * Apollo Solo false-match to x16D). */
+	subsys = dev->pci->subsystem_device;
+	switch (subsys) {
+	case UA_SUBSYS_SOLO:
+		dev->device_type = UA_DEV_APOLLO_SOLO;
+		dev_info(&dev->pci->dev, "subsystem 0x%04x → Apollo Solo\n",
+			 subsys);
+		break;
+	case UA_SUBSYS_X4_QUAD:
+		dev->device_type = UA_DEV_APOLLO_X4;
+		dev_info(&dev->pci->dev, "subsystem 0x%04x → Apollo x4\n",
+			 subsys);
+		break;
+	default:
+		dev->device_type = 0; /* will try serial prefix below */
+		break;
+	}
 
 	if ((s32)dev->fpga_rev >= 0) {
 		/* v1 firmware: device type from FPGA rev bits[31:28] - 1 */
@@ -915,35 +949,40 @@ static void uad2_detect_device(struct uad2_dev *dev)
 		dev->device_type = (dev->fpga_rev >> 28) - 1;
 		dev->dsp_count = 1; /* v1 default, refine from subsys ID */
 	} else {
-		/* v2 firmware: DSP count from ext_caps, type from serial */
+		/* v2 firmware: DSP count from ext_caps */
 		dev->fw_v2 = true;
 		ext_caps = uad2_read32(dev, REG_EXT_CAPS);
 		dev->dsp_count = (ext_caps >> 8) & 0xFF;
 		if (dev->dsp_count > UAD2_MAX_DSPS)
 			dev->dsp_count = UAD2_MAX_DSPS;
 
-		/* Read 16-byte serial string from BAR0+0x20..0x2C */
+		dev_info(&dev->pci->dev, "ext_caps=0x%08x dsp=%u\n", ext_caps,
+			 dev->dsp_count);
+
+		/* Read serial for logging */
 		for (i = 0; i < 4; i++)
 			regs[i] = uad2_read32(dev, UA_REG_SERIAL_BASE + i * 4);
 		memcpy(serial, regs, UA_REG_SERIAL_LEN);
 		serial[UA_REG_SERIAL_LEN] = '\0';
-
 		dev_info(&dev->pci->dev, "serial: %.16s\n", serial);
 
-		/* Match 4-char prefix (at offset 4) against lookup table */
-		dev->device_type = 0;
-		for (i = 0; i < (int)ARRAY_SIZE(ua_serial_table); i++) {
-			if (!strncmp(serial + 4, ua_serial_table[i].prefix,
-				     4)) {
-				dev->device_type =
-					ua_serial_table[i].device_type;
-				break;
+		/* Serial prefix lookup only if subsystem ID didn't match.
+		 * Serial prefix is unreliable on some models (Apollo Solo
+		 * serial contains "2032" at offset 4 → false x16D match). */
+		if (!dev->device_type) {
+			for (i = 0; i < (int)ARRAY_SIZE(ua_serial_table); i++) {
+				if (!strncmp(serial + 4,
+					     ua_serial_table[i].prefix, 4)) {
+					dev->device_type =
+						ua_serial_table[i].device_type;
+					dev_info(&dev->pci->dev,
+						 "serial prefix → %s\n",
+						 ua_device_name(
+							 dev->device_type));
+					break;
+				}
 			}
 		}
-
-		if (!dev->device_type)
-			dev_warn(&dev->pci->dev,
-				 "unknown serial prefix, type unresolved\n");
 	}
 
 	/* Look up channel counts from model table */
