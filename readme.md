@@ -21,10 +21,77 @@
 > at 48kHz. DSP plugins and recording are not tested and I'm certain they will
 > not work.
 
+## Acknowledgments
+
+This driver incorporates findings and code patterns from
+**[open-apollo](https://github.com/rolotrealanis98/open-apollo)** by
+rolotrealanis98, a GPL-2.0 open-source Linux driver for Apollo Thunderbolt
+interfaces built through clean-room reverse engineering. Key contributions taken
+from open-apollo:
+
+- Serial prefix device detection and per-model channel count tables
+- v1/v2 firmware detection via FPGA revision register
+- DSP mixer batch write protocol (38-setting cache, SEQ handshake, flush)
+- Capture routing activation (settings[1-37]=0x20/0xFF)
+- DSP service loop (readback drain + mixer flush as host liveness signal)
+- Post-transport clock write for DSP active processing mode
+- Extended mode transport start (0x20F) for v2 firmware
+- P2P_ROUTE write in PrepareTransport
+- Bank-shifted notification register reads (rate_info, xport_info, clock_info)
+
+## Supported Devices
+
+All Apollo Thunderbolt 3/4 devices share PCI vendor `0x1A00`, device `0x0002`.
+The driver detects the model at probe time via serial prefix (BAR0+0x20..0x2C).
+
+| Device              | Type ID | Play Ch | Rec Ch | Preamps | Status                   |
+| ------------------- | ------- | ------- | ------ | ------- | ------------------------ |
+| Apollo Solo         | `0x27`  | 3       | 2      | 1       | Tested (stereo playback) |
+| Arrow               | `0x28`  | 3       | 2      | 1       | Untested                 |
+| Apollo Twin X       | `0x23`  | 8       | 8      | 2       | Untested                 |
+| Apollo Twin X Gen 2 | `0x3A`  | 8       | 8      | 2       | Untested                 |
+| Apollo x4           | `0x1F`  | 24      | 22     | 4       | Untested                 |
+| Apollo x4 Gen 2     | `0x36`  | 24      | 22     | 4       | Untested                 |
+| Apollo x6           | `0x1E`  | 24      | 22     | 4       | Untested                 |
+| Apollo x6 Gen 2     | `0x35`  | 24      | 22     | 4       | Untested                 |
+| Apollo x8           | `0x22`  | 26      | 26     | 4       | Untested                 |
+| Apollo x8 Gen 2     | `0x37`  | 26      | 26     | 4       | Untested                 |
+| Apollo x8p          | `0x20`  | 26      | 26     | 8       | Untested                 |
+| Apollo x8p Gen 2    | `0x38`  | 26      | 26     | 8       | Untested                 |
+| Apollo x16          | `0x21`  | 34      | 34     | 8       | Untested                 |
+| Apollo x16 Gen 2    | `0x39`  | 34      | 34     | 8       | Untested                 |
+| Apollo x16D         | `0x2A`  | 34      | 34     | 0       | Untested                 |
+
+Thunderbolt 2 devices (original Apollo Twin, Apollo 8, Apollo 16, Duo, Quad) are
+**not supported** — Linux generally does not enumerate TB2 PCIe devices.
+
+## Changelog
+
+### 2026-03-27: Multi-device support + bug fixes
+
+- **Multi-device support**: serial prefix detection for all 15 Apollo TB models
+  with per-model channel count tables. PCI ID table opened to match all devices.
+- **Fix: sample rate switching**: stop transport before rate change, full
+  re-prepare with rate-correct parameters (IRQ period, periodic timer), then
+  post-transport clock write to enable DSP active processing. Previously the
+  transport kept running with stale parameters after a rate change.
+- **Fix: extended transport mode**: v2 firmware devices now use `0x20F` start
+  value (BIT 9 = EXT_MODE). Previously hardcoded to `0xF`.
+- **Mixer batch protocol**: 38-setting val/mask cache with SEQ handshake. DSP
+  reads all settings atomically per SEQ_WR advance.
+- **Capture routing init**: settings[1-37] armed with 0x20/0xFF after connect to
+  activate DSP capture channels.
+- **DSP service loop**: 100Hz delayed_work that drains readback data, clears
+  notification status, and flushes mixer settings. Acts as host liveness signal.
+- **Notification reads**: rate_info, xport_info, clock_info reads on events and
+  after connect (firmware expects these as acknowledgment).
+- **Sample Rate control**: changed from read-only integer to read-write enum
+  with all 6 rates (44.1k–192k).
+
 ## Overview
 
-This is a Linux kernel ALSA/PCIe driver for the **Universal Audio Apollo Solo
-Thunderbolt** audio interface, reverse-engineered from the macOS kext
+This is a Linux kernel ALSA/PCIe driver for **Universal Audio Apollo
+Thunderbolt** audio interfaces, reverse-engineered from the macOS kext
 `com.uaudio.driver.UAD2System` (arm64e, v11.7.0 build 2).
 
 ### Reverse Engineering Sources
