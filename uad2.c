@@ -638,6 +638,27 @@ struct uad2_dev {
 	bool mixer_ready;
 	u32 mixer_rb_data[MIXER_RB_WORDS];
 
+	/* Monitor state cache (from ALSA kcontrols → DSP mixer setting[2]) */
+	struct {
+		int level; /* 0-192 raw (192 + dB*2; 0=-96dB, 192=0dB) */
+		int mute; /* 0=unmuted, 2=muted (UA_MON_MUTE encoding) */
+		bool dim;
+		int source; /* 0=MIX, 1=CUE1, 2=CUE2 */
+	} monitor;
+
+	/* Preamp state cache (from ALSA kcontrols → DSP mixer settings) */
+	struct {
+		int gain; /* dB value (-144..+65) */
+		bool phantom; /* 48V phantom power */
+		bool pad;
+		bool lowcut;
+		bool phase; /* true=inverted */
+		bool mic_line; /* false=Mic, true=Line */
+	} preamp[UAD2_MAX_DSPS]; /* indexed by preamp channel */
+
+	/* Number of preamp channels for this model */
+	unsigned int num_preamps;
+
 	/* PCIe setup state */
 	bool pcie_setup_done;
 
@@ -921,6 +942,118 @@ static void uad2_dsp_service_stop(struct uad2_dev *dev)
 }
 
 /* ============================================================
+ * Monitor parameter → DSP mixer setting routing
+ *
+ * Monitor params all write to setting[2] (monitor core) with per-param
+ * bitmasks so they don't clobber each other.  The mask-based merge in
+ * uad2_mixer_write_setting() handles concurrent updates.
+ *
+ * From open-apollo ua_core.c ua_monitor_set_param() and ua_apollo.h
+ * UA_MON_PARAM_* defines.
+ * ============================================================ */
+#define MON_PARAM_LEVEL 0x01 /* Monitor volume: setting[2] bits[7:0] */
+#define MON_PARAM_MUTE 0x03 /* Mute: setting[2] bits[17:16] */
+#define MON_PARAM_SOURCE 0x04 /* Source: setting[2] bits[19:18]+[29] */
+#define MON_PARAM_DIM 0x44 /* Dim: setting[2] bit 31 */
+#define MON_MUTE_ON 2
+#define MON_MUTE_OFF 0
+
+static void uad2_monitor_set_param(struct uad2_dev *dev, u32 param_id,
+				   u32 value)
+{
+	u32 hw_val, hw_mask;
+
+	switch (param_id) {
+	case MON_PARAM_LEVEL: /* bits[7:0] */
+		hw_val = value & 0xFF;
+		hw_mask = 0x000000FF;
+		dev->monitor.level = value & 0xFF;
+		break;
+	case MON_PARAM_MUTE: /* bits[17:16]: 0=unmuted, 2=muted */
+		if (value == MON_MUTE_ON)
+			hw_val = 0x00010000; /* bit 16 = mute */
+		else
+			hw_val = 0; /* unmuted */
+		hw_mask = 0x00030000;
+		dev->monitor.mute = value;
+		break;
+	case MON_PARAM_SOURCE: /* bits[19:18] + bit[29] */
+		hw_val = ((value & 3) << 18) | (((value >> 2) & 1) << 29);
+		hw_mask = 0x200C0000;
+		dev->monitor.source = value;
+		break;
+	case MON_PARAM_DIM: /* bit 31 */
+		hw_val = value ? BIT(31) : 0;
+		hw_mask = BIT(31);
+		dev->monitor.dim = !!value;
+		break;
+	default:
+		return;
+	}
+
+	uad2_mixer_write_setting(dev, 2, hw_val, hw_mask);
+}
+
+/* ============================================================
+ * Preamp parameter → DSP mixer setting routing
+ *
+ * Preamp params route to mixer setting[param_id + 7].  Each param
+ * gets its own dedicated setting index, so the mask is 0xFFFFFFFF.
+ * From open-apollo hardware.py and kext SetMixerParam ch_type=1.
+ * ============================================================ */
+#define PREAMP_PARAM_MIC_LINE 0x00 /* 0=Mic, 1=Line */
+#define PREAMP_PARAM_PAD 0x01
+#define PREAMP_PARAM_48V 0x03
+#define PREAMP_PARAM_LOWCUT 0x04
+#define PREAMP_PARAM_PHASE 0x05 /* IEEE 754: +1.0f / -1.0f */
+#define PREAMP_PARAM_GAIN_A 0x06 /* First gain param (dB value) */
+#define PREAMP_SETTING_OFFSET 7 /* setting index = param_id + 7 */
+
+/* IEEE 754 float constants for phase invert */
+#define PHASE_NORMAL 0x3F800000 /* +1.0f */
+#define PHASE_INVERT 0xBF800000 /* -1.0f */
+
+static void uad2_preamp_set_param(struct uad2_dev *dev, unsigned int ch,
+				  u32 param_id, u32 value)
+{
+	unsigned int setting_idx;
+
+	if (ch >= dev->num_preamps)
+		return;
+
+	setting_idx = param_id + PREAMP_SETTING_OFFSET;
+	if (setting_idx >= MIXER_BATCH_COUNT)
+		return;
+
+	/* Update state cache */
+	switch (param_id) {
+	case PREAMP_PARAM_MIC_LINE:
+		dev->preamp[ch].mic_line = !!value;
+		break;
+	case PREAMP_PARAM_PAD:
+		dev->preamp[ch].pad = !!value;
+		break;
+	case PREAMP_PARAM_48V:
+		dev->preamp[ch].phantom = !!value;
+		break;
+	case PREAMP_PARAM_LOWCUT:
+		dev->preamp[ch].lowcut = !!value;
+		break;
+	case PREAMP_PARAM_PHASE:
+		dev->preamp[ch].phase = !!value;
+		value = value ? PHASE_INVERT : PHASE_NORMAL;
+		break;
+	case PREAMP_PARAM_GAIN_A:
+		dev->preamp[ch].gain = (int)value;
+		break;
+	default:
+		return;
+	}
+
+	uad2_mixer_write_setting(dev, setting_idx, value, 0xFFFFFFFF);
+}
+
+/* ============================================================
  * Device detection — read serial prefix, look up model, set channels
  *
  * All Apollo Thunderbolt devices share PCI vendor 0x1A00, device 0x0002.
@@ -1010,6 +1143,7 @@ static void uad2_detect_device(struct uad2_dev *dev)
 		if (ua_models[i].device_type == dev->device_type) {
 			dev->play_channels = ua_models[i].play_ch;
 			dev->rec_channels = ua_models[i].rec_ch;
+			dev->num_preamps = ua_models[i].num_preamps;
 			goto found;
 		}
 	}
