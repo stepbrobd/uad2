@@ -3545,9 +3545,296 @@ static const struct snd_kcontrol_new uad2_sample_rate_ctl = {
 	.put = uad2_sample_rate_put,
 };
 
+/* ============================================================
+ * Monitor ALSA kcontrols
+ * ============================================================ */
+
+/* Monitor Playback Volume: 0-192 raw (192 + dB*2) */
+static int uad2_monitor_vol_info(struct snd_kcontrol *kctl,
+				 struct snd_ctl_elem_info *info)
+{
+	info->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
+	info->count = 1;
+	info->value.integer.min = 0;
+	info->value.integer.max = 192;
+	info->value.integer.step = 1;
+	return 0;
+}
+
+static int uad2_monitor_vol_get(struct snd_kcontrol *kctl,
+				struct snd_ctl_elem_value *val)
+{
+	struct uad2_dev *dev = snd_kcontrol_chip(kctl);
+
+	val->value.integer.value[0] = dev->monitor.level;
+	return 0;
+}
+
+static int uad2_monitor_vol_put(struct snd_kcontrol *kctl,
+				struct snd_ctl_elem_value *val)
+{
+	struct uad2_dev *dev = snd_kcontrol_chip(kctl);
+	int new_val = val->value.integer.value[0];
+
+	if (new_val < 0 || new_val > 192)
+		return -EINVAL;
+	if (new_val == dev->monitor.level)
+		return 0;
+
+	uad2_monitor_set_param(dev, MON_PARAM_LEVEL, new_val);
+	return 1;
+}
+
+static const struct snd_kcontrol_new uad2_monitor_vol_ctl = {
+	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+	.name = "Monitor Playback Volume",
+	.info = uad2_monitor_vol_info,
+	.get = uad2_monitor_vol_get,
+	.put = uad2_monitor_vol_put,
+};
+
+/* Monitor Playback Switch (mute): BOOLEAN, 1=unmuted 0=muted */
+static int uad2_monitor_mute_info(struct snd_kcontrol *kctl,
+				  struct snd_ctl_elem_info *info)
+{
+	info->type = SNDRV_CTL_ELEM_TYPE_BOOLEAN;
+	info->count = 1;
+	info->value.integer.min = 0;
+	info->value.integer.max = 1;
+	return 0;
+}
+
+static int uad2_monitor_mute_get(struct snd_kcontrol *kctl,
+				 struct snd_ctl_elem_value *val)
+{
+	struct uad2_dev *dev = snd_kcontrol_chip(kctl);
+
+	/* ALSA convention: 1=on (playing), 0=muted */
+	val->value.integer.value[0] = (dev->monitor.mute == MON_MUTE_OFF) ? 1 :
+									    0;
+	return 0;
+}
+
+static int uad2_monitor_mute_put(struct snd_kcontrol *kctl,
+				 struct snd_ctl_elem_value *val)
+{
+	struct uad2_dev *dev = snd_kcontrol_chip(kctl);
+	int hw_mute = val->value.integer.value[0] ? MON_MUTE_OFF : MON_MUTE_ON;
+
+	if (hw_mute == dev->monitor.mute)
+		return 0;
+
+	uad2_monitor_set_param(dev, MON_PARAM_MUTE, hw_mute);
+	return 1;
+}
+
+static const struct snd_kcontrol_new uad2_monitor_mute_ctl = {
+	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+	.name = "Monitor Playback Switch",
+	.info = uad2_monitor_mute_info,
+	.get = uad2_monitor_mute_get,
+	.put = uad2_monitor_mute_put,
+};
+
+/* Monitor Dim Switch: BOOLEAN */
+static int uad2_monitor_dim_get(struct snd_kcontrol *kctl,
+				struct snd_ctl_elem_value *val)
+{
+	struct uad2_dev *dev = snd_kcontrol_chip(kctl);
+
+	val->value.integer.value[0] = dev->monitor.dim ? 1 : 0;
+	return 0;
+}
+
+static int uad2_monitor_dim_put(struct snd_kcontrol *kctl,
+				struct snd_ctl_elem_value *val)
+{
+	struct uad2_dev *dev = snd_kcontrol_chip(kctl);
+	bool new_dim = !!val->value.integer.value[0];
+
+	if (new_dim == dev->monitor.dim)
+		return 0;
+
+	uad2_monitor_set_param(dev, MON_PARAM_DIM, new_dim ? 1 : 0);
+	return 1;
+}
+
+static const struct snd_kcontrol_new uad2_monitor_dim_ctl = {
+	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+	.name = "Monitor Dim Switch",
+	.info = uad2_monitor_mute_info, /* reuse boolean info */
+	.get = uad2_monitor_dim_get,
+	.put = uad2_monitor_dim_put,
+};
+
+/* Monitor Source: ENUM "MIX", "CUE 1", "CUE 2" */
+static const char *const uad2_monitor_source_names[] = { "MIX", "CUE 1",
+							 "CUE 2" };
+
+static int uad2_monitor_source_info(struct snd_kcontrol *kctl,
+				    struct snd_ctl_elem_info *info)
+{
+	return snd_ctl_enum_info(info, 1, 3, uad2_monitor_source_names);
+}
+
+static int uad2_monitor_source_get(struct snd_kcontrol *kctl,
+				   struct snd_ctl_elem_value *val)
+{
+	struct uad2_dev *dev = snd_kcontrol_chip(kctl);
+
+	val->value.enumerated.item[0] = dev->monitor.source;
+	return 0;
+}
+
+static int uad2_monitor_source_put(struct snd_kcontrol *kctl,
+				   struct snd_ctl_elem_value *val)
+{
+	struct uad2_dev *dev = snd_kcontrol_chip(kctl);
+	unsigned int idx = val->value.enumerated.item[0];
+
+	if (idx > 2)
+		return -EINVAL;
+	if ((int)idx == dev->monitor.source)
+		return 0;
+
+	uad2_monitor_set_param(dev, MON_PARAM_SOURCE, idx);
+	return 1;
+}
+
+static const struct snd_kcontrol_new uad2_monitor_source_ctl = {
+	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+	.name = "Monitor Source",
+	.info = uad2_monitor_source_info,
+	.get = uad2_monitor_source_get,
+	.put = uad2_monitor_source_put,
+};
+
+/* ============================================================
+ * Preamp ALSA kcontrols (per-channel, dynamic registration)
+ *
+ * private_value packs channel index and param_id:
+ *   bits[7:0]  = channel index
+ *   bits[15:8] = param_id
+ * ============================================================ */
+#define UA_CTL_PACK(ch, param) (((param) << 8) | (ch))
+#define UA_CTL_CH(pv) ((pv) & 0xFF)
+#define UA_CTL_PARAM(pv) (((pv) >> 8) & 0xFF)
+
+/* Preamp Capture Volume: INTEGER -144..+65 dB */
+static int uad2_preamp_gain_info(struct snd_kcontrol *kctl,
+				 struct snd_ctl_elem_info *info)
+{
+	info->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
+	info->count = 1;
+	info->value.integer.min = -144;
+	info->value.integer.max = 65;
+	info->value.integer.step = 1;
+	return 0;
+}
+
+static int uad2_preamp_gain_get(struct snd_kcontrol *kctl,
+				struct snd_ctl_elem_value *val)
+{
+	struct uad2_dev *dev = snd_kcontrol_chip(kctl);
+	unsigned int ch = UA_CTL_CH(kctl->private_value);
+
+	val->value.integer.value[0] = dev->preamp[ch].gain;
+	return 0;
+}
+
+static int uad2_preamp_gain_put(struct snd_kcontrol *kctl,
+				struct snd_ctl_elem_value *val)
+{
+	struct uad2_dev *dev = snd_kcontrol_chip(kctl);
+	unsigned int ch = UA_CTL_CH(kctl->private_value);
+	int new_gain = val->value.integer.value[0];
+
+	if (new_gain < -144 || new_gain > 65)
+		return -EINVAL;
+	if (new_gain == dev->preamp[ch].gain)
+		return 0;
+
+	uad2_preamp_set_param(dev, ch, PREAMP_PARAM_GAIN_A, (u32)new_gain);
+	return 1;
+}
+
+/* Preamp boolean switch: generic for pad/48V/lowcut/phase */
+static int uad2_preamp_switch_get(struct snd_kcontrol *kctl,
+				  struct snd_ctl_elem_value *val)
+{
+	struct uad2_dev *dev = snd_kcontrol_chip(kctl);
+	unsigned int ch = UA_CTL_CH(kctl->private_value);
+	unsigned int param = UA_CTL_PARAM(kctl->private_value);
+
+	switch (param) {
+	case PREAMP_PARAM_48V:
+		val->value.integer.value[0] = dev->preamp[ch].phantom;
+		break;
+	case PREAMP_PARAM_PAD:
+		val->value.integer.value[0] = dev->preamp[ch].pad;
+		break;
+	case PREAMP_PARAM_LOWCUT:
+		val->value.integer.value[0] = dev->preamp[ch].lowcut;
+		break;
+	case PREAMP_PARAM_PHASE:
+		val->value.integer.value[0] = dev->preamp[ch].phase;
+		break;
+	default:
+		return -EINVAL;
+	}
+	return 0;
+}
+
+static int uad2_preamp_switch_put(struct snd_kcontrol *kctl,
+				  struct snd_ctl_elem_value *val)
+{
+	struct uad2_dev *dev = snd_kcontrol_chip(kctl);
+	unsigned int ch = UA_CTL_CH(kctl->private_value);
+	unsigned int param = UA_CTL_PARAM(kctl->private_value);
+	bool new_val = !!val->value.integer.value[0];
+
+	uad2_preamp_set_param(dev, ch, param, new_val ? 1 : 0);
+	return 1;
+}
+
+/* Preamp Input Select: ENUM "Mic", "Line" */
+static const char *const uad2_input_select_names[] = { "Mic", "Line" };
+
+static int uad2_input_select_info(struct snd_kcontrol *kctl,
+				  struct snd_ctl_elem_info *info)
+{
+	return snd_ctl_enum_info(info, 1, 2, uad2_input_select_names);
+}
+
+static int uad2_input_select_get(struct snd_kcontrol *kctl,
+				 struct snd_ctl_elem_value *val)
+{
+	struct uad2_dev *dev = snd_kcontrol_chip(kctl);
+	unsigned int ch = UA_CTL_CH(kctl->private_value);
+
+	val->value.enumerated.item[0] = dev->preamp[ch].mic_line ? 1 : 0;
+	return 0;
+}
+
+static int uad2_input_select_put(struct snd_kcontrol *kctl,
+				 struct snd_ctl_elem_value *val)
+{
+	struct uad2_dev *dev = snd_kcontrol_chip(kctl);
+	unsigned int ch = UA_CTL_CH(kctl->private_value);
+	unsigned int idx = val->value.enumerated.item[0];
+
+	if (idx > 1)
+		return -EINVAL;
+
+	uad2_preamp_set_param(dev, ch, PREAMP_PARAM_MIC_LINE, idx);
+	return 1;
+}
+
 static int uad2_create_mixer(struct uad2_dev *dev)
 {
 	struct snd_card *card = dev->card;
+	struct snd_kcontrol_new ctl;
+	unsigned int ch;
 	int err;
 
 	err = snd_ctl_add(card, snd_ctl_new1(&uad2_clock_source_ctl, dev));
@@ -3557,6 +3844,81 @@ static int uad2_create_mixer(struct uad2_dev *dev)
 	err = snd_ctl_add(card, snd_ctl_new1(&uad2_sample_rate_ctl, dev));
 	if (err < 0)
 		return err;
+
+	/* Monitor controls */
+	err = snd_ctl_add(card, snd_ctl_new1(&uad2_monitor_vol_ctl, dev));
+	if (err < 0)
+		return err;
+	err = snd_ctl_add(card, snd_ctl_new1(&uad2_monitor_mute_ctl, dev));
+	if (err < 0)
+		return err;
+	err = snd_ctl_add(card, snd_ctl_new1(&uad2_monitor_dim_ctl, dev));
+	if (err < 0)
+		return err;
+	err = snd_ctl_add(card, snd_ctl_new1(&uad2_monitor_source_ctl, dev));
+	if (err < 0)
+		return err;
+
+	/* Per-channel preamp controls */
+	for (ch = 0; ch < dev->num_preamps; ch++) {
+		char name[44];
+
+		/* Capture Volume (gain) */
+		memset(&ctl, 0, sizeof(ctl));
+		snprintf(name, sizeof(name), "Mic %u Capture Volume", ch + 1);
+		ctl.iface = SNDRV_CTL_ELEM_IFACE_MIXER;
+		ctl.name = name;
+		ctl.info = uad2_preamp_gain_info;
+		ctl.get = uad2_preamp_gain_get;
+		ctl.put = uad2_preamp_gain_put;
+		ctl.private_value = UA_CTL_PACK(ch, PREAMP_PARAM_GAIN_A);
+		err = snd_ctl_add(card, snd_ctl_new1(&ctl, dev));
+		if (err < 0)
+			return err;
+
+		/* 48V Phantom Power Switch */
+		snprintf(name, sizeof(name), "Mic %u 48V Phantom Power Switch",
+			 ch + 1);
+		ctl.info = uad2_monitor_mute_info; /* boolean */
+		ctl.get = uad2_preamp_switch_get;
+		ctl.put = uad2_preamp_switch_put;
+		ctl.private_value = UA_CTL_PACK(ch, PREAMP_PARAM_48V);
+		err = snd_ctl_add(card, snd_ctl_new1(&ctl, dev));
+		if (err < 0)
+			return err;
+
+		/* Pad Switch */
+		snprintf(name, sizeof(name), "Mic %u Pad Switch", ch + 1);
+		ctl.private_value = UA_CTL_PACK(ch, PREAMP_PARAM_PAD);
+		err = snd_ctl_add(card, snd_ctl_new1(&ctl, dev));
+		if (err < 0)
+			return err;
+
+		/* Low Cut Switch */
+		snprintf(name, sizeof(name), "Mic %u Low Cut Switch", ch + 1);
+		ctl.private_value = UA_CTL_PACK(ch, PREAMP_PARAM_LOWCUT);
+		err = snd_ctl_add(card, snd_ctl_new1(&ctl, dev));
+		if (err < 0)
+			return err;
+
+		/* Phase Invert Switch */
+		snprintf(name, sizeof(name), "Mic %u Phase Invert Switch",
+			 ch + 1);
+		ctl.private_value = UA_CTL_PACK(ch, PREAMP_PARAM_PHASE);
+		err = snd_ctl_add(card, snd_ctl_new1(&ctl, dev));
+		if (err < 0)
+			return err;
+
+		/* Input Select (Mic/Line) */
+		snprintf(name, sizeof(name), "Mic %u Input Select", ch + 1);
+		ctl.info = uad2_input_select_info;
+		ctl.get = uad2_input_select_get;
+		ctl.put = uad2_input_select_put;
+		ctl.private_value = UA_CTL_PACK(ch, PREAMP_PARAM_MIC_LINE);
+		err = snd_ctl_add(card, snd_ctl_new1(&ctl, dev));
+		if (err < 0)
+			return err;
+	}
 
 	return 0;
 }
