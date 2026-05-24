@@ -64,10 +64,83 @@ Thunderbolt 2 devices (original Apollo Twin, Apollo 8, Apollo 16, Duo, Quad) are
 
 ## Changelog
 
+### 2026-05-24: rate-switch + freeze fix, ASCII-only sources
+
+**Rate switching (the "no output for osu" bug):**
+
+osu! starts a fresh 44.1 kHz stream while the device sits at 48 kHz default. The
+driver was calling `uad2_set_sample_rate()` which waited on a completion that
+the notification ISR was expected to signal from bit 5 (CONNECT_ACK). On
+Apollo's Thunderbolt-tunneled PCIe, MSI delivery is unreliable (verified via
+/proc/interrupts: only a handful of IRQs arrive across an entire test session).
+The completion always timed out at 2 seconds; the driver proceeded anyway, but
+the firmware DSP routing never fully committed and audio stayed silent.
+
+Replaced the completion wait with a direct 10 ms poll on `REG_FW_NOTIFY_STATUS`,
+accepting bits 22 (RATE_CHANGE), 4 (DMA_READY) or 5 (CONNECT_ACK) as ack.
+Matches what open-apollo does in `ua_audio_set_clock` and brings the latency
+from 2 seconds down to a small multiple of 10 ms.
+
+**Freeze on drain (the system hang the first test triggered):**
+
+ALSA's `snd_pcm_drain_done` calls `snd_pcm_do_stop` from inside
+`snd_pcm_period_elapsed`. Our `uad2_pcm_trigger(STOP)` was then calling
+`hrtimer_cancel()` on the period timer. But trigger STOP was running inside the
+period timer's own callback (via period_elapsed), and `hrtimer_cancel()` spins
+until the callback returns. That is an infinite spin: the only escape was the
+NMI watchdog. Replaced the call in trigger STOP with a plain
+`WRITE_ONCE(period_timer_running,
+false)`; the callback's own early-return check
+picks up the flag on the next tick (within 1 ms) and returns HRTIMER_NORESTART.
+
+**Other fixes from the same review pass:**
+
+- `uad2_sample_rate_put` ALSA kcontrol now returns -EBUSY when the transport is
+  running. Bypassing pcm_prepare would have left the IRQ period and periodic
+  timer stale.
+- `uad2_pcm_trigger` START captures `first_stream` under `dev->lock` instead of
+  READ_ONCE outside the lock. Concurrent open of playback
+  - capture could otherwise miss or double-fire the post-transport clock write.
+- `uad2_pcm_trigger` STOP snapshots `streams_running` under the lock for the
+  period_timer stop decision.
+- The hrtimer period callback now reads a cached `period_size` from `dev`
+  instead of dereferencing `snd_pcm_runtime->period_size`. ALSA can free the
+  runtime between two timer ticks; the cached field is safe.
+- `pcm_prepare` rate change clears `playback_running` and `capture_running`
+  before stopping the transport so the hrtimer and IRQ paths don't fire
+  `snd_pcm_period_elapsed` on a stream whose DMA is being torn down.
+- Per-direction `play_prepared` / `rec_prepared` flags replace the shared
+  `rt->private_data` marker. The shared marker mis-accounted `streams_prepared`
+  under JOINT_DUPLEX.
+- `pcm_open` rolls back `open_count` and the substream pointer if
+  `snd_pcm_hw_rule_add` fails after they were set.
+- Notification handler bit 5 routes only to `connect_event`; rate change ack
+  uses the polling path in `set_sample_rate`.
+
+**Verified on live Apollo Solo:**
+
+- Six back-to-back playback tests survived the rate-change cycle that previously
+  hung the system.
+- Audio confirmed audible at 44.1 kHz, 48 kHz, 88.2 kHz, 96 kHz on MON L
+  (channel 0).
+- 176.4 kHz and 192 kHz still distort. The periodic timer interval and IRQ
+  period values match the kext tables exactly, so the distortion is from a
+  different cause (probably the rate-change ack timing or PCIe completion delay
+  at the higher data rate).
+
+**Source style:**
+
+Both `uad2.c` and `readme.md` are now pure ASCII. Em-dashes were rewritten as
+periods, commas, or parentheses (never replaced with hyphen variants). Verbose
+multi-paragraph block comments in `uad2.c` trimmed where the code is
+self-explanatory; comments that explain WHY a non-obvious choice was made (kext
+line references, lock ordering, the hrtimer self-cancel constraint) kept. Net
+322 lines removed from `uad2.c`.
+
 ### 2026-03-28: ALSA mixer controls for monitor + preamp
 
-Added 12 ALSA mixer controls that work with `alsamixer`, `pavucontrol`,
-`wpctl`, and `amixer` out of the box:
+Added 12 ALSA mixer controls that work with `alsamixer`, `pavucontrol`, `wpctl`,
+and `amixer` out of the box:
 
 - **Monitor**: Playback Volume (0-192), Playback Switch (mute), Dim Switch,
   Source (MIX/CUE1/CUE2)
@@ -84,8 +157,8 @@ DSP service loop.
 
 - Serial prefix detection for all 15 Apollo TB models with per-model channel
   count tables. PCI ID table opened to match all devices.
-- PCI subsystem ID used as primary device detection (serial prefix unreliable
-  on some models, since the Apollo Solo serial coincidentally matches the x16D
+- PCI subsystem ID used as primary device detection (serial prefix unreliable on
+  some models, since the Apollo Solo serial coincidentally matches the x16D
   prefix).
 - Dynamic ALSA card name from detected model ("UA Apollo Solo").
 
@@ -102,8 +175,7 @@ DSP service loop.
   2. Transport started in pcm_prepare instead of trigger (caused XRUN before
      first read)
   3. Hardware periodic timer IRQ (vector 0x46) never fires on Apollo Solo
-     (replaced with hrtimer at 1ms polling, the same approach as
-     snd-usb-audio)
+     (replaced with hrtimer at 1ms polling, the same approach as snd-usb-audio)
 - **Fix: device detection**. PCI subsystem ID preferred over serial prefix
   (Apollo Solo serial "2032" falsely matched x16D).
 - **Fix: PCIe ASPM**. Disable Active State Power Management on the Thunderbolt
@@ -241,9 +313,9 @@ bear -- make
 The module compiles cleanly with zero warnings against kernel 6.19+.
 
 > **Note:** LSP errors about `-mpreferred-stack-boundary=3`,
-> `-mindirect-branch=thunk-extern`, etc. are **false positives**. Clang does
-> not understand GCC-specific kernel flags from `compile_commands.json`. These
-> can be safely ignored.
+> `-mindirect-branch=thunk-extern`, etc. are **false positives**. Clang does not
+> understand GCC-specific kernel flags from `compile_commands.json`. These can
+> be safely ignored.
 
 ### Loading
 
@@ -285,7 +357,7 @@ All registers are BAR-relative offsets, 32-bit MMIO.
 | `0x2240` | Buffer Frame Size             | W      | Write `bufferFrameSize - 1` (hardware mask)                                                                                                                                                                 |
 | `0x2244` | DMA Position Counter          | R/W    | Read: current frame position (wrapping counter, not byte offset). Write `0` to clear. If `pos > bufferFrameSize`, clamp to 0                                                                                |
 | `0x2248` | Transport Control             | R/W    | State machine: `0x000`=stop/reset, `0x001`=armed/prepared, `0x00F`=running (normal), `0x20F`=running (extended, device variants `0xA`/`0x9`). Read status bits: bit5=running, bit7=overflow, bit8=underflow |
-| `0x224C` | Playback Monitor Config       | W      | Write `(totalPlayChans - 1) \| 0x100`, **only when `diagnostic_flags & 0x2`** (Apollo Solo: skipped, flags=1)                                                                                              |
+| `0x224C` | Playback Monitor Config       | W      | Write `(totalPlayChans - 1) \| 0x100`, **only when `diagnostic_flags & 0x2`** (Apollo Solo: skipped, flags=1)                                                                                               |
 | `0x2250` | Playback Channel Count        | W      | Total playback channels                                                                                                                                                                                     |
 | `0x2254` | Poll Status                   | R      | Poll for DMA ready (compare vs `irq_period`). Read-only; firmware populates after arm.                                                                                                                      |
 | `0x2258` | Interrupt Period              | W      | IRQ period value from rate lookup table: 8 (44.1/48k), 16 (88.2/96k), 32 (176.4/192k). **Not** buffer_frames/N.                                                                                             |
@@ -318,8 +390,8 @@ Note: register roles are swapped relative to DMA0 (confirmed from kext
 
 ### Scatter-Gather DMA Tables (`CPcieAudioExtension::ProgramRegisters` @ `0x4BAC0`)
 
-| Range            | Description                                                                                                                                                                              |
-| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Range            | Description                                                                                                                                                                               |
+| ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `0x8000..0x9FFF` | **Buffer A (Playback)** SG table: 1024 entries of 8 bytes = 8192 bytes. Entry format: `[low32 phys_addr][high32 phys_addr]` per 4 KB page. Covers 1024 of 4 KB = 4 MB playback DMA buffer |
 | `0xA000..0xBFFF` | **Buffer B (Capture)** SG table, same layout, offset = Buffer A + `0x2000`. Covers 4 MB capture DMA buffer                                                                                |
 
@@ -380,8 +452,8 @@ do {
 These use **flat BAR offsets** with no `channel_base_index` shift applied
 (confirmed by cross-check against kext disassembly):
 
-| Offset   | Description                                                                    |
-| -------- | ------------------------------------------------------------------------------ |
+| Offset   | Description                                                                   |
+| -------- | ----------------------------------------------------------------------------- |
 | `0xC1A4` | Record IO descriptors: 72 DWORDs (`0x120` bytes) of record channel config     |
 | `0xC2C4` | Playback IO descriptors: 72 DWORDs (`0x120` bytes) of playback channel config |
 
@@ -476,8 +548,8 @@ From `CPcieDevice::ProgramRegisters` @ `0xDF48`, exact order:
 
 1. **Read** `BAR+0x2218` (device ID)
 2. **Verify** == `expected_device_id` (stored at `CPcieDevice+0xCC8`)
-3. **Write** `BAR+0x2220 = 0` (handshake ack; kext `WriteRegEjj` always writes
-   0 to 0x2220, ignoring its arguments)
+3. **Write** `BAR+0x2220 = 0` (handshake ack; kext `WriteRegEjj` always writes 0
+   to 0x2220, ignoring its arguments)
 4. **`CPcieIntrManager::ProgramRegisters`:**
    - Write `BAR+0x2204 = 0x0`
    - Write `BAR+0x2208 = 0x0`
@@ -502,7 +574,8 @@ From `CPcieDevice::ProgramRegisters` @ `0xDF48`, exact order:
        - `bit = 1 << (dsp_index + 1)`
        - `shadow |= bit`
        - Write `BAR+0x2200 = shadow`
-8. **`CPcieAudioExtension::ProgramRegisters`** (@ `0x4BAC0`, lines 70401 to 70631):
+8. **`CPcieAudioExtension::ProgramRegisters`** (@ `0x4BAC0`, lines 70401 to
+   70631):
    - Read `BAR+0x2248`, if bit5: Read `BAR+0x2244` (ack)
    - Write `BAR+0x2248 = 0x0` (clear)
    - Program SG tables: 1024-entry loop writing `BAR+0x8000..0xBFFF`
@@ -514,8 +587,8 @@ From `CPcieDevice::ProgramRegisters` @ `0xDF48`, exact order:
    - 20-channel doorbell loop: write `0x0ACEFACE`, write `0x1` to `BAR+0x2260`
    - Wait on `notifyEvent` (100 ms x 10 retries per channel)
    - Firmware responds: bit 5 (connect ack), bit 21 (channel config)
-   - Bit 21 forces bits 0+1, which copies IO descriptors and recomputes
-     buffer size
+   - Bit 21 forces bits 0+1, which copies IO descriptors and recomputes buffer
+     size
    - `notifyEvent` signaled by second bit 21 check, which wakes `Connect()`
 
 ## Notification Interrupt Handler
@@ -529,18 +602,18 @@ From `CPcieDevice::ProgramRegisters` @ `0xDF48`, exact order:
 3. Read `BAR+(channel_base_index<<2)+0xC008` to get the notification bitmask
 4. **Dispatch:**
 
-| Bit  | Event                       | Action                                                                                                                                                                                                                                                                       |
-| ---- | --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 5    | Connect ack                 | Signal `connectEvent` (`this+0x2838`)                                                                                                                                                                                                                                        |
+| Bit  | Event                       | Action                                                                                                                                                                                                                                                                         |
+| ---- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 5    | Connect ack                 | Signal `connectEvent` (`this+0x2838`)                                                                                                                                                                                                                                          |
 | 21   | Channel config (first pass) | Lock `this+0x10`, write 10 DWORDs from `this+0x24` to `BAR+0xC000` (cached config to device), copy up to `0x5F` DWORDs from `BAR+(idx<<2)+0xC000` to `this+0x4C` (device to cache), unlock, parse channel names. **Forces bits 0, 1, and 22 on** (`orr w20, w20, #0x00400003`) |
-| 0    | Playback IO ready           | Lock, copy 72 DWORDs from `BAR+0xC2C4` to `this+0x2E8`, unlock, parse IO names, call `_recomputeBufferFrameSize()`, `Callback(this, 0x66, 0, context)`                                                                                                                       |
-| 1    | Record IO ready             | Lock, copy 72 DWORDs from `BAR+0xC1A4` to `this+0x1C8`, unlock, parse IO names, call `_recomputeBufferFrameSize()`, `Callback(this, 0x65, 0, context)`                                                                                                                       |
-| 22   | Rate change                 | Read `BAR+0xC05C` and `BAR+0xC054`, `callback(0x67)`                                                                                                                                                                                                                         |
-| 4    | DMA ready                   | Read `BAR+0xC054/0xC058/0xC05C`, `callback(0x64)`                                                                                                                                                                                                                            |
-| 6    | Error                       | Log only                                                                                                                                                                                                                                                                     |
-| 21   | (second pass)               | Signal `notifyEvent` (`this+0x2830`), which **wakes `Connect()`**                                                                                                                                                                                                            |
-| 7    | End buffer                  | Signal `endBufferEvent` (`this+0x2840`)                                                                                                                                                                                                                                      |
-| 0\|1 | Combined IO ready           | `callback(0x6E)`                                                                                                                                                                                                                                                             |
+| 0    | Playback IO ready           | Lock, copy 72 DWORDs from `BAR+0xC2C4` to `this+0x2E8`, unlock, parse IO names, call `_recomputeBufferFrameSize()`, `Callback(this, 0x66, 0, context)`                                                                                                                         |
+| 1    | Record IO ready             | Lock, copy 72 DWORDs from `BAR+0xC1A4` to `this+0x1C8`, unlock, parse IO names, call `_recomputeBufferFrameSize()`, `Callback(this, 0x65, 0, context)`                                                                                                                         |
+| 22   | Rate change                 | Read `BAR+0xC05C` and `BAR+0xC054`, `callback(0x67)`                                                                                                                                                                                                                           |
+| 4    | DMA ready                   | Read `BAR+0xC054/0xC058/0xC05C`, `callback(0x64)`                                                                                                                                                                                                                              |
+| 6    | Error                       | Log only                                                                                                                                                                                                                                                                       |
+| 21   | (second pass)               | Signal `notifyEvent` (`this+0x2830`), which **wakes `Connect()`**                                                                                                                                                                                                              |
+| 7    | End buffer                  | Signal `endBufferEvent` (`this+0x2840`)                                                                                                                                                                                                                                        |
+| 0\|1 | Combined IO ready           | `callback(0x6E)`                                                                                                                                                                                                                                                               |
 
 5. Write `0` to `BAR+(channel_base_index<<2)+0xC008` (clear/ack)
 6. Unlock notification spinlock
@@ -742,8 +815,8 @@ determine the DMA notification interval.
 
 **Critical:** The firmware expects these specific small values, NOT computed
 values like `buffer_frames / 8` (= 1024). Writing 1024 causes the DMA engine to
-never start, so `REG_POLL_STATUS` (`0x2254`) stays at 0, and the transport
-never enters the running state.
+never start, so `REG_POLL_STATUS` (`0x2254`) stays at 0, and the transport never
+enters the running state.
 
 ### StartTransport (@ line 71904)
 
@@ -817,8 +890,8 @@ For Apollo Solo, **all three audio vectors map to slots > 31**, so
 1. `slot = vector_to_slot[vec]` (from `IntrManager+0x4D0`)
 2. `bit_mask = 1ULL << slot`
 3. `intr_enable_shadow |= bit_mask`
-4. Determine register pair: slot < 32 uses DMA0 (0x2204/0x2208); slot >= 32
-   uses DMA1 (0x2268/0x2264)
+4. Determine register pair: slot < 32 uses DMA0 (0x2204/0x2208); slot >= 32 uses
+   DMA1 (0x2268/0x2264)
 5. If `arm`: write `(u32)(bit_mask >> shift)` to status register (re-arm)
 6. Write `(u32)(intr_enable_shadow >> shift)` to ctrl register (enable mask)
 
@@ -901,15 +974,15 @@ From kext binary @ `0x60368`:
 
 **Playback (42 channels):**
 
-| Channels | Type                                              |
-| -------- | ------------------------------------------------- |
+| Channels | Type                                               |
+| -------- | -------------------------------------------------- |
 | 0 to 1   | MON L/R (headphone/monitor; the main audio output) |
-| 2 to 3   | LINE L/R                                          |
-| 4 to 11  | ADAT 1 to 8                                       |
-| 12 to 13 | S/PDIF L/R                                        |
-| 14 to 23 | VIRTUAL 1 to 10                                   |
-| 24 to 27 | CUE 1 to 4                                        |
-| 28 to 41 | RESERVED                                          |
+| 2 to 3   | LINE L/R                                           |
+| 4 to 11  | ADAT 1 to 8                                        |
+| 12 to 13 | S/PDIF L/R                                         |
+| 14 to 23 | VIRTUAL 1 to 10                                    |
+| 24 to 27 | CUE 1 to 4                                         |
+| 28 to 41 | RESERVED                                           |
 
 **Record (32 channels):**
 
@@ -940,23 +1013,23 @@ From kext binary @ `0x60368`:
 
 Full object layout (0x5F0 bytes total, from arm64 analysis):
 
-| Offset   | Size  | Field                      | Description                             |
-| -------- | ----- | -------------------------- | --------------------------------------- |
-| `+0x00`  | 8     | lock object pointer        | PAC-authenticated vtable                |
-| `+0x08`  | 8     | BAR base pointer           |                                         |
-| `+0x10`  | 8     | parent context             |                                         |
-| `+0x18`  | 4     | `interrupts_enabled` flag  | `bool`                                  |
-| `+0x20`  | 8     | `intr_enable_shadow`       | u64 bitmask (slots 0-63)                |
-| `+0x28`  | 8     | `priority_mask`            | u64, priority dispatch slots            |
-| `+0x30`  | 8     | `deferred_pending`         | u64, accumulated deferred slots         |
-| `+0x38`  | 0x240 | `callback_ptrs[72]`        | Function pointers per slot              |
-| `+0x278` | 0x240 | `callback_ctx[72]`         | Context pointers per slot               |
-| `+0x4B8` | 4     | (padding/reserved)         |                                         |
-| `+0x4BC` | 4     | `dma_ctrl_shadow`          | Shadow register for `BAR+0x2200`        |
-| `+0x4C0` | 4     | `hw_version / is_extended` |                                         |
-| `+0x4C4` | 4     | `has_extended_irq`         | Uses DMA1 registers for upper 32 slots  |
-| `+0x4C8` | 4     | `oneshot_mask_lo`          |                                         |
-| `+0x4CC` | 4     | `num_slots`                | 25 default, 64 extended                 |
+| Offset   | Size  | Field                      | Description                              |
+| -------- | ----- | -------------------------- | ---------------------------------------- |
+| `+0x00`  | 8     | lock object pointer        | PAC-authenticated vtable                 |
+| `+0x08`  | 8     | BAR base pointer           |                                          |
+| `+0x10`  | 8     | parent context             |                                          |
+| `+0x18`  | 4     | `interrupts_enabled` flag  | `bool`                                   |
+| `+0x20`  | 8     | `intr_enable_shadow`       | u64 bitmask (slots 0-63)                 |
+| `+0x28`  | 8     | `priority_mask`            | u64, priority dispatch slots             |
+| `+0x30`  | 8     | `deferred_pending`         | u64, accumulated deferred slots          |
+| `+0x38`  | 0x240 | `callback_ptrs[72]`        | Function pointers per slot               |
+| `+0x278` | 0x240 | `callback_ctx[72]`         | Context pointers per slot                |
+| `+0x4B8` | 4     | (padding/reserved)         |                                          |
+| `+0x4BC` | 4     | `dma_ctrl_shadow`          | Shadow register for `BAR+0x2200`         |
+| `+0x4C0` | 4     | `hw_version / is_extended` |                                          |
+| `+0x4C4` | 4     | `has_extended_irq`         | Uses DMA1 registers for upper 32 slots   |
+| `+0x4C8` | 4     | `oneshot_mask_lo`          |                                          |
+| `+0x4CC` | 4     | `num_slots`                | 25 default, 64 extended                  |
 | `+0x4D0` | 0x120 | `vector_to_slot[72]`       | Maps logical vector ID to bit slot index |
 
 ### `CPcieRingBuffer`
@@ -1028,10 +1101,10 @@ Full object layout (0x5F0 bytes total, from arm64 analysis):
 - **Notification handlers partially implemented**. The kext dispatches
   notification bits 4 (DMA ready, callback 0x64), 7 (end buffer event), 22 (rate
   change readback, callback 0x67), and a combined 0|1 handler (callback 0x6E).
-  The Linux driver omits all four and only handles bits 0, 1, 5, 6, and 21.
-  This is intentional: the driver does not need DMA-ready or end-buffer
-  signaling, rate change is not enabled, and the combined IO callback is
-  redundant with individual bit 0/1 handling.
+  The Linux driver omits all four and only handles bits 0, 1, 5, 6, and 21. This
+  is intentional: the driver does not need DMA-ready or end-buffer signaling,
+  rate change is not enabled, and the combined IO callback is redundant with
+  individual bit 0/1 handling.
 - **Channel mapping predicted but NOT verified** on live hardware
 - **No rate change while running**. Sample rate switching has been
   reverse-engineered and tested (see "Sample Rate Switching" below) but is not
@@ -1047,8 +1120,8 @@ Full object layout (0x5F0 bytes total, from arm64 analysis):
 - **No capture testing**. Only playback has been tested; capture streams are
   exposed but untested.
 - **`speaker-test` crashes at 42 channels**. `speaker-test` allocates channel
-  map arrays for up to 16 channels only, causing SIGSEGV at channel 16+. This
-  is a bug in `speaker-test`, not the driver. Use PipeWire or direct `aplay`
+  map arrays for up to 16 channels only, causing SIGSEGV at channel 16+. This is
+  a bug in `speaker-test`, not the driver. Use PipeWire or direct `aplay`
   instead.
 
 ### DMA Position Behavior
@@ -1068,20 +1141,19 @@ current DMA position as `dma_pos_offset` at prepare time, and the `.pointer()`
 callback returns `(hw_pos - dma_pos_offset) % buffer_frames`. This gives ALSA a
 0-relative position matching its reset `hw_ptr=0`, while the hardware transport
 continues uninterrupted. Stopping and re-preparing the transport is
-fundamentally broken on this hardware: `REG_POLL_STATUS` never converges after
-a stop+re-prepare cycle.
+fundamentally broken on this hardware: `REG_POLL_STATUS` never converges after a
+stop+re-prepare cycle.
 
 ### Thunderbolt Hot-Unplug Safety
 
 The driver handles surprise removal (Thunderbolt cable pull) safely through
 three mechanisms:
 
-1. **`card->sync_irq`** is set to the MSI vector after `request_threaded_irq`
-   in probe. This tells `snd_card_disconnect()` to synchronize against
-   in-flight hardirq handlers before transitioning PCM substreams to
-   DISCONNECTED state, closing a race where the hardirq could call
-   `snd_pcm_period_elapsed()` on a substream that was just moved to
-   DISCONNECTED.
+1. **`card->sync_irq`** is set to the MSI vector after `request_threaded_irq` in
+   probe. This tells `snd_card_disconnect()` to synchronize against in-flight
+   hardirq handlers before transitioning PCM substreams to DISCONNECTED state,
+   closing a race where the hardirq could call `snd_pcm_period_elapsed()` on a
+   substream that was just moved to DISCONNECTED.
 
 2. **PCI error handlers** (`pci_error_handlers`) provide an `.error_detected`
    callback that immediately sets `dev->disconnecting = true` when the PCI
@@ -1152,8 +1224,8 @@ Tested: 48kHz to 96kHz to 48kHz via both `amixer` control and direct ALSA
 
 ### Completed (Previously Future)
 
-- ~~Mixer controls~~: 12 ALSA kcontrols for monitor + preamp (volume, mute,
-  dim, gain, phantom, pad, lowcut, phase, mic/line, source)
+- ~~Mixer controls~~: 12 ALSA kcontrols for monitor + preamp (volume, mute, dim,
+  gain, phantom, pad, lowcut, phase, mic/line, source)
 - ~~Sample rate switching~~: fully working with transport stop/re-prepare cycle
 - ~~Capture~~: working with hrtimer polling, condenser mic verified at -42 dBFS
 
@@ -1171,8 +1243,8 @@ named inputs (Mic 1, Line In, etc.) instead of raw 32-channel device. Can port
 from open-apollo `configs/ucm2/` and `configs/wireplumber/`.
 
 **Hardware readback parsing**: the 40-word readback from `BAR+0x3814` contains
-preamp flags, monitor state, and gain values. Parsing these would let the
-driver reflect actual hardware state in ALSA kcontrols.
+preamp flags, monitor state, and gain values. Parsing these would let the driver
+reflect actual hardware state in ALSA kcontrols.
 
 #### Hardware Mixer Register Map (`CPcieDeviceMixer`)
 
@@ -1181,12 +1253,12 @@ The mixer uses 38 settings (indices 0x00 to 0x25), each occupying 8 bytes (two
 
 **Control registers:**
 
-| Offset  | R/W | Description                                         |
-| ------- | --- | --------------------------------------------------- |
-| `+0x08` | W   | Version/commit: write incremented counter to apply  |
-| `+0x0C` | R   | Firmware version counter (must match before write)  |
-| `+0x10` | R/W | Readback ready (1=data available, write 0 to ack)   |
-| `+0x14` | R   | Readback data base: 40 uint32 metering values       |
+| Offset  | R/W | Description                                        |
+| ------- | --- | -------------------------------------------------- |
+| `+0x08` | W   | Version/commit: write incremented counter to apply |
+| `+0x0C` | R   | Firmware version counter (must match before write) |
+| `+0x10` | R/W | Readback ready (1=data available, write 0 to ack)  |
+| `+0x14` | R   | Readback data base: 40 uint32 metering values      |
 
 **Mixer setting register offsets (relative to BAR+0x3800):**
 
@@ -1221,17 +1293,17 @@ opportunistically flushes deferred settings.
 
 #### Kext Mixer Functions (Analyzed)
 
-| Function                                 | Dump Line | Description                                 |
-| ---------------------------------------- | --------- | ------------------------------------------- |
-| `CPcieDeviceMixer::Initialize`           | 68750     | Sets BAR base, syncs version counter        |
-| `CPcieDeviceMixer::_writeSetting`        | 69047     | Writes one setting to hardware              |
-| `CPcieDeviceMixer::_flushCachedSettings` | 69013     | Writes all 38 settings + commit             |
-| `CPcieDeviceMixer::WriteSetting`         | 69222     | Public API: update cache + write + commit   |
-| `CPcieDeviceMixer::GetReadback`          | 68921     | Reads 40 metering values + deferred flush   |
+| Function                                 | Dump Line | Description                                  |
+| ---------------------------------------- | --------- | -------------------------------------------- |
+| `CPcieDeviceMixer::Initialize`           | 68750     | Sets BAR base, syncs version counter         |
+| `CPcieDeviceMixer::_writeSetting`        | 69047     | Writes one setting to hardware               |
+| `CPcieDeviceMixer::_flushCachedSettings` | 69013     | Writes all 38 settings + commit              |
+| `CPcieDeviceMixer::WriteSetting`         | 69222     | Public API: update cache + write + commit    |
+| `CPcieDeviceMixer::GetReadback`          | 68921     | Reads 40 metering values + deferred flush    |
 | `CUAD2DeviceMixer::SetOtherParam`        | 67693     | Maps param IDs to setting indices + bitmasks |
-| `CUAD2DeviceMixer::AckSampleRateChange`  | 65455     | DMA command 0x1A0002 to firmware            |
-| `CMessenger::DispatchSetMixerParam`      | 52910     | Userspace to kernel mixer param dispatch    |
-| `CMessenger::DispatchSetMixerBusParam`   | 52794     | Batch mixer bus param dispatch              |
+| `CUAD2DeviceMixer::AckSampleRateChange`  | 65455     | DMA command 0x1A0002 to firmware             |
+| `CMessenger::DispatchSetMixerParam`      | 52910     | Userspace to kernel mixer param dispatch     |
+| `CMessenger::DispatchSetMixerBusParam`   | 52794     | Batch mixer bus param dispatch               |
 
 #### Current Implementation
 
@@ -1240,8 +1312,8 @@ mixer settings via the batch protocol. Monitor params route to setting[2] with
 per-param bitmasks. Preamp params route to setting[param_id + 7]. The DSP
 service loop flushes all pending changes every 10ms.
 
-Sample rate switching is fully working. The driver stops the transport, sets
-the clock, and does a full re-prepare with correct parameters.
+Sample rate switching is fully working. The driver stops the transport, sets the
+clock, and does a full re-prepare with correct parameters.
 
 ## Disassembly Reference
 
@@ -1295,28 +1367,27 @@ otool -v -s __TEXT_EXEC __text bin/aarch64-darwin/uad2.kext > bin/aarch64-darwin
 
 - Multi-vector MSI setup (register multiple MSI vectors for `0x28`, `0x46`,
   `0x47`)
-- `SetOtherParam` switch table: full mapping of param IDs 0x01 to 0x8A to
-  mixer setting indices and bitmasks (required for userspace mixer
-  implementation)
+- `SetOtherParam` switch table: full mapping of param IDs 0x01 to 0x8A to mixer
+  setting indices and bitmasks (required for userspace mixer implementation)
 - `SetMixerBusParam`: bus/channel/group/value parameter format
 - `CUAD2AudioMixer::HandleNotification`: notification dispatch table for IDs
-  0x67 to 0x6F (partially analyzed: 0x68 = rate change ack, 0x6E/0x6F =
-  routing table rebuild)
+  0x67 to 0x6F (partially analyzed: 0x68 = rate change ack, 0x6E/0x6F = routing
+  table rebuild)
 
 ## Project Files
 
-| File                                | Description                                                                                                                                 |
-| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| `uad2.c`                            | Main driver source (~2900 lines): PCI probe/remove, ALSA PCM ops, interrupt handling, DMA, firmware connect, transport, mixer, channel map  |
-| `Makefile`                          | Standard out-of-tree kernel module Makefile (uses `KDIR` from env)                                                                          |
-| `Kbuild`                            | `obj-m := uad2.o`                                                                                                                           |
-| `flake.nix`                         | Nix flake providing build environment                                                                                                       |
-| `.clang-format`                     | Linux kernel coding style                                                                                                                   |
-| `compile_commands.json`             | LSP compilation database (generated via `bear -- make`)                                                                                     |
-| `bin/aarch64-darwin/uad2.kext`      | arm64e kext binary (primary RE source)                                                                                                      |
-| `bin/aarch64-darwin/uad2.kext.dump` | arm64e disassembly                                                                                                                          |
-| `bin/x86_64-darwin/uad2.kext`       | x86_64 kext binary (2017 symbols incl. 1228 defined text with mangled C++ names)                                                            |
-| `bin/x86_64-darwin/uad2.kext.dump`  | x86_64 disassembly (65,463 lines, cross-reference source)                                                                                   |
+| File                                | Description                                                                                                                                |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `uad2.c`                            | Main driver source (~2900 lines): PCI probe/remove, ALSA PCM ops, interrupt handling, DMA, firmware connect, transport, mixer, channel map |
+| `Makefile`                          | Standard out-of-tree kernel module Makefile (uses `KDIR` from env)                                                                         |
+| `Kbuild`                            | `obj-m := uad2.o`                                                                                                                          |
+| `flake.nix`                         | Nix flake providing build environment                                                                                                      |
+| `.clang-format`                     | Linux kernel coding style                                                                                                                  |
+| `compile_commands.json`             | LSP compilation database (generated via `bear -- make`)                                                                                    |
+| `bin/aarch64-darwin/uad2.kext`      | arm64e kext binary (primary RE source)                                                                                                     |
+| `bin/aarch64-darwin/uad2.kext.dump` | arm64e disassembly                                                                                                                         |
+| `bin/x86_64-darwin/uad2.kext`       | x86_64 kext binary (2017 symbols incl. 1228 defined text with mangled C++ names)                                                           |
+| `bin/x86_64-darwin/uad2.kext.dump`  | x86_64 disassembly (65,463 lines, cross-reference source)                                                                                  |
 
 ## License
 
