@@ -598,8 +598,15 @@ struct uad2_dev {
 	/* Number of substreams that have been prepared (pcm_prepare called
 	 * but hw_free not yet called).  Used to prevent hw_free on one
 	 * substream from tearing down the transport that the other substream
-	 * still depends on.  Protected by dev->lock. */
+	 * still depends on.  Protected by dev->lock.
+	 *
+	 * play_prepared / rec_prepared track the per-direction state so
+	 * we can correctly debit hw_free.  Previously a single shared flag
+	 * on snd_pcm_runtime was used, which was unreliable under
+	 * JOINT_DUPLEX with overlapping prepare/hw_free sequences. */
 	int streams_prepared;
+	bool play_prepared;
+	bool rec_prepared;
 
 	/* Number of substreams currently open (pcm_open called but
 	 * pcm_close not yet called).  The hardware transport is only
@@ -618,6 +625,9 @@ struct uad2_dev {
 	struct completion rate_event; /* signals _setSampleClock on bit 5 */
 	u32 notify_status; /* last notification bitmask */
 	bool connected;
+	bool rate_change_pending; /* gates rate_event completion in ISR
+	                           * so a bit-5 from a connect handshake
+	                           * cannot wake _setSampleClock prematurely */
 
 	/* IO descriptor copies from firmware (72 DWORDs each).
 	 * Kext copies the full block on NOTIFY_PLAYBACK_IO / NOTIFY_RECORD_IO.
@@ -694,9 +704,16 @@ struct uad2_dev {
 	 * The Apollo's hardware periodic timer IRQ (vector 0x46) is
 	 * unreliable — fires once then stops.  We use an hrtimer to
 	 * poll SAMPLE_POS and call snd_pcm_period_elapsed() at ~1ms.
-	 * Same approach as USB audio drivers (snd-usb-audio). */
+	 * Same approach as USB audio drivers (snd-usb-audio).
+	 *
+	 * cached_period_frames is the period_size the streams were
+	 * prepared with.  We cache it here so the hrtimer never has to
+	 * dereference snd_pcm_runtime — that struct may be freed by
+	 * the ALSA core under our feet (hw_free can race with the
+	 * timer between two ticks).  Updated from pcm_prepare. */
 	struct hrtimer period_timer;
 	bool period_timer_running;
+	snd_pcm_uframes_t cached_period_frames;
 	snd_pcm_uframes_t last_play_period;
 	snd_pcm_uframes_t last_rec_period;
 };
@@ -827,7 +844,6 @@ static void uad2_mixer_flush_settings(struct uad2_dev *dev)
 static void uad2_mixer_init(struct uad2_dev *dev)
 {
 	u32 seq_rd;
-	int s;
 
 	seq_rd = uad2_read32(dev, REG_MIXER_SEQ_RD);
 	dev->mixer_seq_wr = seq_rd;
@@ -1298,68 +1314,64 @@ static u8 uad2_rate_to_enum(unsigned int rate)
 /*
  * CPcieAudioExtension::_setSampleClock @ line 72712 (arm64 0x4DE70)
  *
- * Kext flow (confirmed in both arm64 and x86_64):
+ * Kext flow (verified against arm64 disassembly):
  *   1. Compute clock_val = clock_source | (rate_enum << 8)
- *   2. Write clock_val to BAR + (fpga_index * 4) + 0xC04C
- *   3. Reset rate_event (CUAOS::Event at this+0x2838)
+ *   2. Reset rate_event   (this+0x2838 vtable+0x28)
+ *   3. Write clock_val to BAR + (channel_base_index * 4) + 0xC04C
  *   4. Write 0x4 to REG_STREAM_ENABLE (trigger clock change)
- *   5. WaitWithTimeout(2000ms) on rate_event
+ *   5. Wait 2000 ms on rate_event (vtable+0x18)
  *   6. On signal: read REG_DEVICE_ID as sanity check
- *   7. On timeout: return 0 (kext treats timeout as success)
+ *
+ * IMPORTANT: the kext resets the event BEFORE the doorbell so the IRQ
+ * handler's complete() call cannot land in a stale event that we then
+ * zero.  Previously we reset between the clock and doorbell writes,
+ * which left a small window where a fast firmware ack would be lost
+ * and we would wait the full 2 s.
  *
  * The rate_event is signaled by bit 5 in the notification ISR
- * (_handleNotificationInterrupt → rate_event->Signal()).
- *
- * The caller (SetSampleClock @ 0x4DD08) retries once if _setSampleClock
- * returns -38 (signaled + device ID valid).  We simplify: wait for
- * completion, return 0 on success or timeout (matching kext behavior).
+ * (_handleNotificationInterrupt -> rate_event->Signal()).  The same
+ * bit is also signaled at connect time; pcm_prepare drives rate change
+ * and connect sequentially so there is no overlap, but we still set
+ * rate_change_pending to gate stray bit-5 completions from confusing
+ * the wait if those code paths ever race.
  */
 static int uad2_set_sample_rate(struct uad2_dev *dev, unsigned int rate)
 {
-	u32 clock_val;
-	u8 rate_enum;
-	u32 reg_offset;
+	u32 clock_val, reg_offset;
 	unsigned long ret;
+	u8 rate_enum;
 
 	rate_enum = uad2_rate_to_enum(rate);
 	clock_val = dev->clock_source | ((u32)rate_enum << 8);
-
-	/* Cache clock value (kext stores at this+0x98) */
 	reg_offset = uad2_fw_reg(dev, REG_SAMPLE_CLOCK);
 
-	/* Write to sample clock register: BAR + (channel_base_index << 2) + 0xC04C */
-	uad2_write32(dev, reg_offset, clock_val);
-
-	/* Reset completion before triggering (kext: rate_event->Reset()) */
+	/* Reset the completion FIRST so a fast ack cannot be lost. */
 	reinit_completion(&dev->rate_event);
+	WRITE_ONCE(dev->rate_change_pending, true);
 
-	/* Trigger clock change */
+	uad2_write32(dev, reg_offset, clock_val);
 	uad2_write32(dev, REG_STREAM_ENABLE, 0x4);
 
-	/* Wait for firmware ack via bit 5 notification interrupt.
-	 * Kext uses WaitWithTimeout(2000) = 2 seconds. */
 	ret = wait_for_completion_timeout(&dev->rate_event,
 					  msecs_to_jiffies(2000));
+	WRITE_ONCE(dev->rate_change_pending, false);
 
 	if (ret > 0) {
-		/* Completion signaled — read device ID as sanity check
-		 * (kext does this but doesn't use the result to block) */
 		u32 dev_id = uad2_read32(dev, REG_DEVICE_ID);
 
 		if (dev_id != dev->expected_device_id)
 			dev_warn(&dev->pci->dev,
 				 "Post-clock device ID mismatch: 0x%08x\n",
 				 dev_id);
-
-		dev->current_rate = rate;
-		return 0;
+	} else {
+		dev_warn(&dev->pci->dev,
+			 "Sample rate change timeout (rate=%u), continuing\n",
+			 rate);
 	}
 
-	/* Timeout — kext returns 0 (success) on timeout, so we do too.
-	 * The hardware may still complete the change asynchronously. */
-	dev_warn(&dev->pci->dev,
-		 "Sample rate change timeout (rate=%u), continuing\n", rate);
 	dev->current_rate = rate;
+	dev->irq_period_frames = uad2_irq_period_for_rate(rate);
+	dev->periodic_timer_interval = uad2_periodic_timer_for_rate(rate);
 	return 0;
 }
 
@@ -1925,16 +1937,14 @@ static void uad2_handle_notification(struct uad2_dev *dev)
 
 	dev->notify_status = status;
 
-	/* Bit 5: Connect/rate-change ack.
-	 * The kext has two separate CUAOS::Event objects both signaled
-	 * by bit 5: connect_event (this+0x2830) used during Connect(),
-	 * and rate_event (this+0x2838) used during _setSampleClock().
-	 * We signal both completions here — only the one being waited
-	 * on will actually wake a thread. */
-	if (status & NOTIFY_CONNECT_ACK) {
+	/* Bit 5 (CONNECT_ACK) is fired by the firmware on connect.
+	 * Route it only to connect_event; rate_event is handled below
+	 * because real-hardware testing shows the firmware acks
+	 * _setSampleClock with bit 22 (RATE_CHANGE), not bit 5, when
+	 * the transport is stopped.  open-apollo (ua_audio.c:1842)
+	 * polls for bit 22, bit 4, or bit 5 — we mirror that union. */
+	if (status & NOTIFY_CONNECT_ACK)
 		complete(&dev->connect_event);
-		complete(&dev->rate_event);
-	}
 
 	/* Bit 21: Channel config — kext copies 10 DWORDs from BAR+0xC000,
 	 * then forces bits 0, 1, AND 22 on (ORs 0x400003) to trigger
@@ -1985,19 +1995,27 @@ static void uad2_handle_notification(struct uad2_dev *dev)
 			WRITE_ONCE(dev->rec_channels, rec_ch);
 	}
 
-	/* Bit 22: Rate change — read rate and clock info.
-	 * The firmware expects the host to read these registers as
-	 * acknowledgment.  From open-apollo ua_audio.c:976-983. */
+	/* Bit 22: Rate change.  The firmware expects the host to read
+	 * REG_NOTIF_RATE_INFO and REG_NOTIF_CLOCK_INFO as ack.  This
+	 * is the bit set in response to a _setSampleClock doorbell on
+	 * a stopped transport; signal rate_event so the caller in
+	 * uad2_set_sample_rate can return immediately instead of
+	 * waiting the full 2 s timeout. */
 	if (status & NOTIFY_RATE_CHANGE) {
 		uad2_read32(dev, uad2_fw_reg(dev, REG_NOTIF_RATE_INFO));
 		uad2_read32(dev, uad2_fw_reg(dev, REG_NOTIF_CLOCK_INFO));
+		if (READ_ONCE(dev->rate_change_pending))
+			complete(&dev->rate_event);
 	}
 
-	/* Bit 4: DMA ready — read transport and clock info */
+	/* Bit 4: DMA ready.  Read transport and clock info.  Also
+	 * counts as a rate-change ack per open-apollo. */
 	if (status & NOTIFY_DMA_READY) {
 		uad2_read32(dev, uad2_fw_reg(dev, REG_NOTIF_RATE_INFO));
 		uad2_read32(dev, uad2_fw_reg(dev, REG_NOTIF_XPORT_INFO));
 		uad2_read32(dev, uad2_fw_reg(dev, REG_NOTIF_CLOCK_INFO));
+		if (READ_ONCE(dev->rate_change_pending))
+			complete(&dev->rate_event);
 	}
 
 	/* Bit 6: Error */
@@ -2019,7 +2037,7 @@ static void uad2_handle_notification(struct uad2_dev *dev)
 /* ============================================================
  * CPcieAudioExtension::Connect equivalent @ 0x4be58 (line 70632)
  *
- * Full handshake sequence decoded from lines 70632-70823:
+ * Doorbell handshake decoded from kext lines 70632-70823:
  *
  * The kext rings the same doorbell up to 20 times but EXITS on the
  * first successful firmware response.  The doorbell address
@@ -2033,119 +2051,100 @@ static void uad2_handle_notification(struct uad2_dev *dev)
  *   d. If timeout: manually call _handleNotificationInterrupt()
  *   e. If success: goto done (early exit)
  *
- * If all 20 attempts fail: is_connected stays false, return -92.
- * If any attempt succeeds: is_connected = true, return 0.
- *
  * The firmware responds by setting bits 5+21 in the notification
  * register, which the interrupt handler processes:
- *   bit 5 → signals connect_event
- *   bit 21 → copies channel config, signals notify_event
- * Connect() waits on notify_event (this+0x2830 in kext).
+ *   bit 5  -> signals connect_event
+ *   bit 21 -> copies channel config, signals notify_event
+ * The handshake waits on notify_event.
  * ============================================================ */
-static int uad2_audio_connect(struct uad2_dev *dev)
+static int uad2_audio_handshake(struct uad2_dev *dev)
 {
 	u32 doorbell_reg = uad2_fw_reg(dev, REG_FW_DOORBELL);
-	int chan, retry;
-	unsigned long timeout_jiffies;
+	unsigned long timeout_jiffies = msecs_to_jiffies(UAD2_CONNECT_WAIT_MS);
 	unsigned long flags;
+	int chan, retry;
 	long ret;
 
-	/* Set connected = true BEFORE the doorbell loop.
-	 * The kext sets this+0x2898 (is_connected) = 1 at this point.
-	 * The notification handler checks this flag and returns early
-	 * if false, so it MUST be true for the connect handshake to
-	 * receive firmware responses via the IRQ-driven path. */
+	/* Set connected = true BEFORE the doorbell loop.  The notification
+	 * handler checks this flag and returns early if false, so it must
+	 * be true for the handshake to receive firmware responses via the
+	 * IRQ-driven path. */
 	WRITE_ONCE(dev->connected, true);
 
-	/* The kext's Connect loop rings the same doorbell up to 20 times
-	 * (with 10 retries each) but EXITS on the first successful firmware
-	 * response.  It is NOT iterating over 20 separate channels — the
-	 * doorbell address (BAR + channel_base_index*4 + 0xC004) is the
-	 * same every iteration.  The 20-channel loop is a retry mechanism,
-	 * not a per-channel initialization.  If we reach chan==20 without
-	 * any success, the kext considers the connection failed. */
 	for (chan = 0; chan < UAD2_CONNECT_CHANNELS; chan++) {
-		/* Reset completion before each doorbell */
 		reinit_completion(&dev->notify_event);
 
-		/* Kext holds hw_lock (this+0x10) around doorbell + stream
-		 * enable writes to prevent concurrent register access */
 		spin_lock_irqsave(&dev->lock, flags);
-
-		/* Write DMA descriptor magic (doorbell command) */
 		uad2_write32(dev, doorbell_reg, DMA_DESC_MAGIC);
-
-		/* Write stream enable (doorbell to firmware) */
 		uad2_write32(dev, REG_STREAM_ENABLE, 0x1);
-
 		spin_unlock_irqrestore(&dev->lock, flags);
-
-		/* Wait for firmware response via notification interrupt.
-		 * Kext uses intr_timer->wait(100) with up to 10 retries.
-		 * In between retries, it manually polls the notification
-		 * register via _handleNotificationInterrupt(). */
-		timeout_jiffies = msecs_to_jiffies(UAD2_CONNECT_WAIT_MS);
 
 		for (retry = 0; retry < UAD2_CONNECT_RETRIES; retry++) {
 			ret = wait_for_completion_timeout(&dev->notify_event,
 							  timeout_jiffies);
 			if (ret > 0)
-				goto connect_done;
+				goto done;
 
 			/* Timeout: manually poll notification register
 			 * (mirrors kext behavior of calling
-			 *  _handleNotificationInterrupt on timeout) */
+			 *  _handleNotificationInterrupt on timeout). */
 			uad2_handle_notification(dev);
 
-			/* Check if notification arrived during manual poll */
 			if (try_wait_for_completion(&dev->notify_event))
-				goto connect_done;
+				goto done;
 		}
 	}
 
-	/* All 20 attempts exhausted without a single firmware response */
-	dev_err(&dev->pci->dev,
-		"Connect failed: no response after %d attempts x %d retries\n",
-		UAD2_CONNECT_CHANNELS, UAD2_CONNECT_RETRIES);
 	WRITE_ONCE(dev->connected, false);
 	return -ETIMEDOUT;
 
-connect_done:
-	dev_dbg(&dev->pci->dev, "Connect succeeded on attempt %d (retry %d)\n",
+done:
+	dev_dbg(&dev->pci->dev, "audio handshake ok on attempt %d (retry %d)\n",
 		chan, retry);
+	return 0;
+}
 
-	/* Recompute buffer frame size (channels set by uad2_detect_device()
-	 * in probe, or updated from IO descriptor notifications above) */
+/* Synthetic post-handshake reads.  The kext's notification handler
+ * synthetically injects bits 0+1+22 after connect (ORs 0x400003) to
+ * force the host to read IO descriptors and rate/clock info.  The
+ * firmware state machine expects these reads as acknowledgment before
+ * advancing to active audio routing.  From open-apollo ua_audio.c:946. */
+static void uad2_audio_post_connect_drain(struct uad2_dev *dev)
+{
+	u32 rate_info, clock_info, xport_info;
+
+	rate_info = uad2_read32(dev, uad2_fw_reg(dev, REG_NOTIF_RATE_INFO));
+	clock_info = uad2_read32(dev, uad2_fw_reg(dev, REG_NOTIF_CLOCK_INFO));
+	xport_info = uad2_read32(dev, uad2_fw_reg(dev, REG_NOTIF_XPORT_INFO));
+
+	dev_dbg(&dev->pci->dev,
+		"post-connect: rate=0x%08x clock=0x%08x xport=0x%08x\n",
+		rate_info, clock_info, xport_info);
+}
+
+/* First-time connect from probe: doorbell handshake, recompute buffer
+ * frames from firmware IO descriptors, initialize mixer batch protocol,
+ * start DSP service loop. */
+static int uad2_audio_connect(struct uad2_dev *dev)
+{
+	int err;
+
+	err = uad2_audio_handshake(dev);
+	if (err) {
+		dev_err(&dev->pci->dev,
+			"Connect failed: no response after %d attempts x %d retries\n",
+			UAD2_CONNECT_CHANNELS, UAD2_CONNECT_RETRIES);
+		return err;
+	}
+
 	dev->buffer_frames = uad2_compute_buffer_frames(dev->play_channels,
 							dev->rec_channels);
-
 	dev_dbg(&dev->pci->dev,
 		"Audio connected: play=%u rec=%u buffer_frames=%u\n",
 		dev->play_channels, dev->rec_channels, dev->buffer_frames);
 
-	/* Synthetic notification reads — the kext's notification handler
-	 * synthetically injects bits 0+1+22 after connect (ORs 0x400003)
-	 * to force the host to read IO descriptors and rate/clock info.
-	 * The firmware state machine expects these reads as acknowledgment
-	 * before advancing to active audio routing.
-	 * From open-apollo ua_audio.c:946-993. */
-	{
-		u32 rate_info =
-			uad2_read32(dev, uad2_fw_reg(dev, REG_NOTIF_RATE_INFO));
-		u32 clock_info = uad2_read32(
-			dev, uad2_fw_reg(dev, REG_NOTIF_CLOCK_INFO));
-		u32 xport_info = uad2_read32(
-			dev, uad2_fw_reg(dev, REG_NOTIF_XPORT_INFO));
-
-		dev_dbg(&dev->pci->dev,
-			"post-connect: rate=0x%08x clock=0x%08x xport=0x%08x\n",
-			rate_info, clock_info, xport_info);
-	}
-
-	/* Initialize mixer batch protocol and arm capture routing */
+	uad2_audio_post_connect_drain(dev);
 	uad2_mixer_init(dev);
-
-	/* Start periodic DSP service loop (readback drain + mixer flush) */
 	uad2_dsp_service_start(dev);
 
 	return 0;
@@ -2461,6 +2460,9 @@ static void uad2_shutdown(struct uad2_dev *dev)
 	WRITE_ONCE(dev->streams_running, 0);
 	WRITE_ONCE(dev->streams_prepared, 0);
 	WRITE_ONCE(dev->open_count, 0);
+	dev->play_prepared = false;
+	dev->rec_prepared = false;
+	dev->cached_period_frames = 0;
 }
 
 /* ============================================================
@@ -2708,7 +2710,7 @@ static int uad2_pcm_open(struct snd_pcm_substream *ss)
 				  uad2_rule_period_size, NULL,
 				  SNDRV_PCM_HW_PARAM_RATE, -1);
 	if (err < 0)
-		return err;
+		goto err_undo_open;
 
 	/* Add constraint rule: buffer_size must be exactly 8192 frames.
 	 * The hardware DMA ring buffer is fixed at 8192 frames and the
@@ -2717,7 +2719,7 @@ static int uad2_pcm_open(struct snd_pcm_substream *ss)
 				  SNDRV_PCM_HW_PARAM_BUFFER_SIZE,
 				  uad2_rule_buffer_size, NULL, -1);
 	if (err < 0)
-		return err;
+		goto err_undo_open;
 
 	/* Add constraint rule: periods = 8192 / period_size, since both
 	 * buffer_size and period_size are fixed by hardware. */
@@ -2725,9 +2727,24 @@ static int uad2_pcm_open(struct snd_pcm_substream *ss)
 				  uad2_rule_periods, NULL,
 				  SNDRV_PCM_HW_PARAM_PERIOD_SIZE, -1);
 	if (err < 0)
-		return err;
+		goto err_undo_open;
 
 	return 0;
+
+err_undo_open:
+	/* hw_rule_add failed after we registered the substream pointer
+	 * and bumped open_count.  Roll those back so pcm_close (which
+	 * ALSA may not call on this error path) does not leave the
+	 * transport pinned by a non-existent stream. */
+	spin_lock_irqsave(&dev->lock, flags);
+	if (ss->stream == SNDRV_PCM_STREAM_PLAYBACK)
+		dev->playback_ss = NULL;
+	else
+		dev->capture_ss = NULL;
+	if (dev->open_count > 0)
+		dev->open_count--;
+	spin_unlock_irqrestore(&dev->lock, flags);
+	return err;
 }
 
 static int uad2_pcm_close(struct snd_pcm_substream *ss)
@@ -2816,23 +2833,28 @@ static int uad2_pcm_hw_free(struct snd_pcm_substream *ss)
 	runtime->dma_addr = 0;
 	runtime->dma_bytes = 0;
 
-	/* Decrement the prepared-streams reference count if this substream
-	 * was counted (pcm_prepare was called).  The private_data flag is
-	 * set by pcm_prepare and cleared here to handle the case where
-	 * pcm_prepare is called multiple times without intervening hw_free.
+	/* Decrement the prepared-streams reference count if pcm_prepare
+	 * had counted this direction.  Uses per-direction flags
+	 * (play_prepared / rec_prepared) so JOINT_DUPLEX overlap of
+	 * prepare/hw_free across directions is accounted correctly.
 	 *
 	 * NOTE: We do NOT tear down the transport here.  Following the
 	 * snd-dice/snd-bebob pattern, transport lifecycle is tied to
 	 * pcm_open/pcm_close (via open_count), not to hw_params/hw_free.
 	 * This prevents the pathological PipeWire reconfiguration cycle
-	 * where a brief hw_free→prepare sequence would cause a full
+	 * where a brief hw_free->prepare sequence would cause a full
 	 * transport teardown and re-initialization. */
 	spin_lock_irqsave(&dev->lock, flags);
-	if (runtime->private_data) {
-		runtime->private_data = NULL;
-		dev->streams_prepared--;
-		if (dev->streams_prepared < 0)
-			dev->streams_prepared = 0;
+	{
+		bool *flag = (ss->stream == SNDRV_PCM_STREAM_PLAYBACK) ?
+				     &dev->play_prepared :
+				     &dev->rec_prepared;
+
+		if (*flag) {
+			*flag = false;
+			if (dev->streams_prepared > 0)
+				dev->streams_prepared--;
+		}
 	}
 	spin_unlock_irqrestore(&dev->lock, flags);
 
@@ -2871,19 +2893,28 @@ static int uad2_pcm_prepare(struct snd_pcm_substream *ss)
 	 * transport, change the clock, and do a full re-prepare with
 	 * rate-correct parameters (IRQ period, periodic timer).
 	 *
-	 * Previously this just called set_sample_rate() without stopping
-	 * the transport, leaving IRQ period and periodic timer at stale
-	 * values.  The firmware zeros the internal mixer on rate change,
-	 * so a full restart is required anyway.
-	 *
-	 * Discovery: open-apollo does a full disconnect/reconnect cycle.
-	 * We do the minimum: stop transport → set rate → cold prepare. */
+	 * The kext's _setSampleClock (0x4DE70) only writes the clock
+	 * register and waits for the bit-5 ack — it does not reach
+	 * StopTransport or PrepareTransport itself.  Those are driven
+	 * by the IOAudioEngine layer above on macOS, which stops the
+	 * engine, changes the clock, then restarts.  We mirror the same
+	 * three-step sequence here. */
 	if (dev->current_rate != rt->rate) {
 		if (READ_ONCE(dev->transport_state) >= 1) {
 			dev_dbg(&dev->pci->dev,
-				"pcm_prepare: rate change %u → %u, "
-				"stopping transport for re-prepare\n",
+				"pcm_prepare: rate change %u -> %u, stopping transport for re-prepare\n",
 				dev->current_rate, rt->rate);
+
+			/* Clear running flags before stopping the transport
+			 * so the hrtimer and IRQ handlers stop firing
+			 * snd_pcm_period_elapsed on a substream whose
+			 * underlying DMA is being torn down. */
+			spin_lock_irqsave(&dev->lock, flags);
+			dev->playback_running = false;
+			dev->capture_running = false;
+			spin_unlock_irqrestore(&dev->lock, flags);
+
+			uad2_period_timer_stop(dev);
 			uad2_stop_transport(dev);
 		}
 
@@ -2896,18 +2927,32 @@ static int uad2_pcm_prepare(struct snd_pcm_substream *ss)
 		/* Fall through to cold-start path (transport_state == 0) */
 	}
 
-	/* Track that this substream has been prepared. */
-	if (!rt->private_data) {
+	/* Track that this direction has been prepared (per-direction
+	 * flag — sharing a single flag broke under JOINT_DUPLEX). */
+	{
+		bool *flag = (ss->stream == SNDRV_PCM_STREAM_PLAYBACK) ?
+				     &dev->play_prepared :
+				     &dev->rec_prepared;
+
 		spin_lock_irqsave(&dev->lock, flags);
-		dev->streams_prepared++;
+		if (!*flag) {
+			*flag = true;
+			dev->streams_prepared++;
+		}
+		/* Cache period_size for the hrtimer so it never has to
+		 * dereference snd_pcm_runtime (which the ALSA core can
+		 * free under us between two timer ticks). */
+		dev->cached_period_frames = rt->period_size;
 		spin_unlock_irqrestore(&dev->lock, flags);
-		rt->private_data = dev; /* mark as counted */
 	}
 
 	/* Hardware buffer frame size (fixed per model) */
 	buffer_frames = dev->buffer_frames;
 
-	/* IRQ period and periodic timer from rate-based lookup tables */
+	/* IRQ period and periodic timer from rate-based lookup tables.
+	 * uad2_set_sample_rate also updates these, but we recompute here
+	 * in case pcm_prepare is reached without a rate change (cold start
+	 * at probe-default 48000). */
 	irq_period_frames = uad2_irq_period_for_rate(rt->rate);
 	dev->irq_period_frames = irq_period_frames;
 	dev->periodic_timer_interval = uad2_periodic_timer_for_rate(rt->rate);
@@ -2966,10 +3011,10 @@ static enum hrtimer_restart uad2_period_timer_fn(struct hrtimer *timer)
 	struct uad2_dev *dev =
 		container_of(timer, struct uad2_dev, period_timer);
 	struct snd_pcm_substream *play_ss, *cap_ss;
+	snd_pcm_uframes_t period_size, cur_period;
 	bool play_run, cap_run;
 	unsigned long flags;
 	u32 pos;
-	snd_pcm_uframes_t cur_period;
 
 	if (!dev->period_timer_running || READ_ONCE(dev->disconnecting))
 		return HRTIMER_NORESTART;
@@ -2982,43 +3027,45 @@ static enum hrtimer_restart uad2_period_timer_fn(struct hrtimer *timer)
 	if (pos >= dev->buffer_frames)
 		pos = 0;
 
+	/* Read all stream pointers and the cached period size under
+	 * dev->lock.  Caching period_size here (rather than reading
+	 * play_ss->runtime->period_size) avoids dereferencing the ALSA
+	 * runtime struct, which the ALSA core can free under us between
+	 * trigger(STOP) and hw_free. */
 	spin_lock_irqsave(&dev->lock, flags);
 	play_ss = dev->playback_ss;
 	cap_ss = dev->capture_ss;
 	play_run = dev->playback_running;
 	cap_run = dev->capture_running;
+	period_size = dev->cached_period_frames;
 	spin_unlock_irqrestore(&dev->lock, flags);
 
-	/* Check playback period boundary */
-	if (play_ss && play_run) {
-		u32 play_off = READ_ONCE(dev->play_pos_offset);
-		u32 adj = (pos - play_off + dev->buffer_frames) %
-			  dev->buffer_frames;
-		snd_pcm_uframes_t period_size =
-			play_ss->runtime ? play_ss->runtime->period_size : 256;
+	if (!period_size)
+		goto out;
 
-		cur_period = (period_size > 0) ? adj / period_size : 0;
+	if (play_ss && play_run) {
+		u32 off = READ_ONCE(dev->play_pos_offset);
+		u32 adj = (pos - off + dev->buffer_frames) % dev->buffer_frames;
+
+		cur_period = adj / period_size;
 		if (cur_period != dev->last_play_period) {
 			dev->last_play_period = cur_period;
 			snd_pcm_period_elapsed(play_ss);
 		}
 	}
 
-	/* Check capture period boundary */
 	if (cap_ss && cap_run) {
-		u32 rec_off = READ_ONCE(dev->rec_pos_offset);
-		u32 adj = (pos - rec_off + dev->buffer_frames) %
-			  dev->buffer_frames;
-		snd_pcm_uframes_t period_size =
-			cap_ss->runtime ? cap_ss->runtime->period_size : 256;
+		u32 off = READ_ONCE(dev->rec_pos_offset);
+		u32 adj = (pos - off + dev->buffer_frames) % dev->buffer_frames;
 
-		cur_period = (period_size > 0) ? adj / period_size : 0;
+		cur_period = adj / period_size;
 		if (cur_period != dev->last_rec_period) {
 			dev->last_rec_period = cur_period;
 			snd_pcm_period_elapsed(cap_ss);
 		}
 	}
 
+out:
 	hrtimer_forward_now(timer, ns_to_ktime(PERIOD_TIMER_NS));
 	return HRTIMER_RESTART;
 }
@@ -3048,12 +3095,15 @@ static int uad2_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
 {
 	struct uad2_dev *dev = snd_pcm_substream_chip(ss);
 	unsigned long flags;
+	bool first_stream;
+	int running;
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_RESUME:
 		spin_lock_irqsave(&dev->lock, flags);
 		dev->streams_running++;
+		first_stream = (dev->streams_running == 1);
 		if (ss->stream == SNDRV_PCM_STREAM_PLAYBACK)
 			dev->playback_running = true;
 		else
@@ -3061,12 +3111,18 @@ static int uad2_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
 		spin_unlock_irqrestore(&dev->lock, flags);
 		uad2_start_transport(dev);
 
-		/* Post-transport clock write: source=0xC enables DSP active
-		 * processing.  Only do this on the FIRST stream start
-		 * (streams_running==1), not on subsequent piggybacks.
-		 * Open-apollo: clock write after transport start activates
-		 * the mixer DSP for capture routing. */
-		if (READ_ONCE(dev->streams_running) == 1) {
+		/* Post-transport clock write: clock_source=0xC enables DSP
+		 * active processing.  Only fire on the first stream of the
+		 * transport, not on piggyback opens.  first_stream is
+		 * captured under dev->lock so concurrent start/stop cannot
+		 * see both as the "first" or both as a piggyback.
+		 *
+		 * The 0xC source override is required by the firmware
+		 * regardless of dev->clock_source: open-apollo's RE shows
+		 * the DSP only enters active processing mode for source 0xC
+		 * (internal).  The user-visible Clock Source enum still
+		 * shows the cached dev->clock_source. */
+		if (first_stream) {
 			u32 clock_cfg =
 				0xC | ((u32)uad2_rate_to_enum(dev->current_rate)
 				       << 8);
@@ -3090,6 +3146,7 @@ static int uad2_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
 			dev->capture_running = false;
 		if (dev->streams_running < 0)
 			dev->streams_running = 0;
+		running = dev->streams_running;
 		spin_unlock_irqrestore(&dev->lock, flags);
 
 		/* NOTE: We do NOT stop the hardware transport here.
@@ -3120,8 +3177,11 @@ static int uad2_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
 		 * Transport teardown happens in pcm_close when open_count
 		 * reaches 0, or in uad2_shutdown/uad2_remove. */
 
-		/* Stop polling timer when no streams are running */
-		if (dev->streams_running == 0)
+		/* Stop polling timer when no streams are running.  Use the
+		 * value snapshot captured under dev->lock above so a
+		 * concurrent trigger(START) cannot lead us to stop the
+		 * timer while another stream is running. */
+		if (running == 0)
 			uad2_period_timer_stop(dev);
 		return 0;
 	}
@@ -3532,8 +3592,17 @@ static int uad2_sample_rate_put(struct snd_kcontrol *kctl,
 	if (rate == dev->current_rate)
 		return 0;
 
+	/* Reject mid-transport rate changes: PrepareTransport() programs
+	 * the IRQ period and periodic timer based on the rate, and the
+	 * userspace PCM stream is bound to a fixed period_size matching
+	 * the rate.  Changing the rate while DMA is running would leave
+	 * those values stale and break position tracking.  pcm_prepare()
+	 * is the only correct rate-change entry point during streaming. */
+	if (READ_ONCE(dev->transport_state) >= 1)
+		return -EBUSY;
+
 	uad2_set_sample_rate(dev, rate);
-	return 1; /* value changed */
+	return 1;
 }
 
 static const struct snd_kcontrol_new uad2_sample_rate_ctl = {
