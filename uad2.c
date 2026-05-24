@@ -622,12 +622,13 @@ struct uad2_dev {
 	/* Notification interrupt handling */
 	struct completion notify_event; /* signals Connect() on bit 21 */
 	struct completion connect_event; /* signals on bit 5 (connect ack) */
-	struct completion rate_event; /* signals _setSampleClock on bit 5 */
-	u32 notify_status; /* last notification bitmask */
+	u32 notify_status; /* last notification bitmask read by the
+	                    * handler.  Set under notify_lock, read by
+	                    * the rate-change poll loop in
+	                    * uad2_set_sample_rate.  Apollo's TB-tunneled
+	                    * MSI delivery is unreliable, so the rate
+	                    * loop polls this field as a fallback. */
 	bool connected;
-	bool rate_change_pending; /* gates rate_event completion in ISR
-	                           * so a bit-5 from a connect handshake
-	                           * cannot wake _setSampleClock prematurely */
 
 	/* IO descriptor copies from firmware (72 DWORDs each).
 	 * Kext copies the full block on NOTIFY_PLAYBACK_IO / NOTIFY_RECORD_IO.
@@ -722,6 +723,7 @@ struct uad2_dev {
 static unsigned int uad2_compute_buffer_frames(unsigned int play_ch,
 					       unsigned int rec_ch);
 static void uad2_period_timer_stop(struct uad2_dev *dev);
+static void uad2_handle_notification(struct uad2_dev *dev);
 
 /* ============================================================
  * Low-level register accessors
@@ -1316,58 +1318,81 @@ static u8 uad2_rate_to_enum(unsigned int rate)
  *
  * Kext flow (verified against arm64 disassembly):
  *   1. Compute clock_val = clock_source | (rate_enum << 8)
- *   2. Reset rate_event   (this+0x2838 vtable+0x28)
- *   3. Write clock_val to BAR + (channel_base_index * 4) + 0xC04C
- *   4. Write 0x4 to REG_STREAM_ENABLE (trigger clock change)
- *   5. Wait 2000 ms on rate_event (vtable+0x18)
- *   6. On signal: read REG_DEVICE_ID as sanity check
+ *   2. Write clock_val to BAR + (channel_base_index * 4) + 0xC04C
+ *   3. Write 0x4 to REG_STREAM_ENABLE (trigger clock change)
+ *   4. Wait 2000 ms on this+0x2838 (signaled by notification ISR
+ *      from bit 5)
  *
- * IMPORTANT: the kext resets the event BEFORE the doorbell so the IRQ
- * handler's complete() call cannot land in a stale event that we then
- * zero.  Previously we reset between the clock and doorbell writes,
- * which left a small window where a fast firmware ack would be lost
- * and we would wait the full 2 s.
- *
- * The rate_event is signaled by bit 5 in the notification ISR
- * (_handleNotificationInterrupt -> rate_event->Signal()).  The same
- * bit is also signaled at connect time; pcm_prepare drives rate change
- * and connect sequentially so there is no overlap, but we still set
- * rate_change_pending to gate stray bit-5 completions from confusing
- * the wait if those code paths ever race.
+ * On Apollo's Thunderbolt-tunneled PCIe, MSI delivery is unreliable
+ * (verified empirically: /proc/interrupts shows ~7 IRQs per session
+ * even during active playback that streams continuously).  Waiting on
+ * a completion signaled from the notification ISR therefore times out
+ * almost every time.  Instead, poll the notification register directly
+ * every 10 ms for the rate-change ack (bits 22, 4 or 5), exactly like
+ * open-apollo's ua_audio_set_clock (ua_audio.c:1835).
  */
+#define UAD2_RATE_ACK_BITS \
+	(NOTIFY_RATE_CHANGE | NOTIFY_DMA_READY | NOTIFY_CONNECT_ACK)
+#define UAD2_RATE_POLL_TIMEOUT_MS 2000
+#define UAD2_RATE_POLL_INTERVAL_MS 10
+
 static int uad2_set_sample_rate(struct uad2_dev *dev, unsigned int rate)
 {
-	u32 clock_val, reg_offset;
-	unsigned long ret;
+	u32 clock_val, reg_offset, notify_reg;
+	int waited_ms;
 	u8 rate_enum;
+	u32 status;
 
 	rate_enum = uad2_rate_to_enum(rate);
 	clock_val = dev->clock_source | ((u32)rate_enum << 8);
 	reg_offset = uad2_fw_reg(dev, REG_SAMPLE_CLOCK);
+	notify_reg = uad2_fw_reg(dev, REG_FW_NOTIFY_STATUS);
 
-	/* Reset the completion FIRST so a fast ack cannot be lost. */
-	reinit_completion(&dev->rate_event);
-	WRITE_ONCE(dev->rate_change_pending, true);
+	/* Drain any pending notification bits left from a previous
+	 * operation, then clear the cached status, so the poll below
+	 * cannot mistake a stale ack for our new doorbell's response. */
+	uad2_handle_notification(dev);
+	WRITE_ONCE(dev->notify_status, 0);
 
 	uad2_write32(dev, reg_offset, clock_val);
 	uad2_write32(dev, REG_STREAM_ENABLE, 0x4);
 
-	ret = wait_for_completion_timeout(&dev->rate_event,
-					  msecs_to_jiffies(2000));
-	WRITE_ONCE(dev->rate_change_pending, false);
+	for (waited_ms = 0; waited_ms < UAD2_RATE_POLL_TIMEOUT_MS;
+	     waited_ms += UAD2_RATE_POLL_INTERVAL_MS) {
+		/* uad2_handle_notification takes notify_lock, processes
+		 * any pending bits, then clears the register.  Calling
+		 * it here drains the same bits the IRQ thread would,
+		 * so the IRQ thread (if it ever runs) just sees zero
+		 * and returns. */
+		uad2_handle_notification(dev);
+		status = READ_ONCE(dev->notify_status);
+		if (status == 0xFFFFFFFF)
+			return -ENODEV;
+		if (status & UAD2_RATE_ACK_BITS)
+			break;
+		msleep(UAD2_RATE_POLL_INTERVAL_MS);
+	}
 
-	if (ret > 0) {
+	if (!(status & UAD2_RATE_ACK_BITS)) {
+		dev_warn(
+			&dev->pci->dev,
+			"Sample rate change ack missing after %d ms (rate=%u), continuing\n",
+			waited_ms, rate);
+	} else {
 		u32 dev_id = uad2_read32(dev, REG_DEVICE_ID);
 
 		if (dev_id != dev->expected_device_id)
 			dev_warn(&dev->pci->dev,
 				 "Post-clock device ID mismatch: 0x%08x\n",
 				 dev_id);
-	} else {
-		dev_warn(&dev->pci->dev,
-			 "Sample rate change timeout (rate=%u), continuing\n",
-			 rate);
+		dev_dbg(&dev->pci->dev,
+			"rate ack 0x%08x after %d ms (rate=%u)\n", status,
+			waited_ms, rate);
 	}
+
+	/* Suppress the stale notify_status snapshot so the next caller
+	 * doesn't see an old ack from this rate change. */
+	WRITE_ONCE(dev->notify_status, 0);
 
 	dev->current_rate = rate;
 	dev->irq_period_frames = uad2_irq_period_for_rate(rate);
@@ -1937,12 +1962,10 @@ static void uad2_handle_notification(struct uad2_dev *dev)
 
 	dev->notify_status = status;
 
-	/* Bit 5 (CONNECT_ACK) is fired by the firmware on connect.
-	 * Route it only to connect_event; rate_event is handled below
-	 * because real-hardware testing shows the firmware acks
-	 * _setSampleClock with bit 22 (RATE_CHANGE), not bit 5, when
-	 * the transport is stopped.  open-apollo (ua_audio.c:1842)
-	 * polls for bit 22, bit 4, or bit 5 — we mirror that union. */
+	/* Bit 5 (CONNECT_ACK): fired by the firmware on connect.  The
+	 * rate-change path does not wait on this; it polls notify_status
+	 * directly because TB-tunneled MSI is unreliable.  See
+	 * uad2_set_sample_rate. */
 	if (status & NOTIFY_CONNECT_ACK)
 		complete(&dev->connect_event);
 
@@ -1996,26 +2019,17 @@ static void uad2_handle_notification(struct uad2_dev *dev)
 	}
 
 	/* Bit 22: Rate change.  The firmware expects the host to read
-	 * REG_NOTIF_RATE_INFO and REG_NOTIF_CLOCK_INFO as ack.  This
-	 * is the bit set in response to a _setSampleClock doorbell on
-	 * a stopped transport; signal rate_event so the caller in
-	 * uad2_set_sample_rate can return immediately instead of
-	 * waiting the full 2 s timeout. */
+	 * REG_NOTIF_RATE_INFO and REG_NOTIF_CLOCK_INFO as ack. */
 	if (status & NOTIFY_RATE_CHANGE) {
 		uad2_read32(dev, uad2_fw_reg(dev, REG_NOTIF_RATE_INFO));
 		uad2_read32(dev, uad2_fw_reg(dev, REG_NOTIF_CLOCK_INFO));
-		if (READ_ONCE(dev->rate_change_pending))
-			complete(&dev->rate_event);
 	}
 
-	/* Bit 4: DMA ready.  Read transport and clock info.  Also
-	 * counts as a rate-change ack per open-apollo. */
+	/* Bit 4: DMA ready.  Read transport and clock info. */
 	if (status & NOTIFY_DMA_READY) {
 		uad2_read32(dev, uad2_fw_reg(dev, REG_NOTIF_RATE_INFO));
 		uad2_read32(dev, uad2_fw_reg(dev, REG_NOTIF_XPORT_INFO));
 		uad2_read32(dev, uad2_fw_reg(dev, REG_NOTIF_CLOCK_INFO));
-		if (READ_ONCE(dev->rate_change_pending))
-			complete(&dev->rate_event);
 	}
 
 	/* Bit 6: Error */
@@ -3016,12 +3030,13 @@ static enum hrtimer_restart uad2_period_timer_fn(struct hrtimer *timer)
 	unsigned long flags;
 	u32 pos;
 
-	if (!dev->period_timer_running || READ_ONCE(dev->disconnecting))
+	if (!READ_ONCE(dev->period_timer_running) ||
+	    READ_ONCE(dev->disconnecting))
 		return HRTIMER_NORESTART;
 
 	pos = uad2_read32(dev, REG_DMA_POSITION);
 	if (pos == 0xFFFFFFFF) {
-		dev->period_timer_running = false;
+		WRITE_ONCE(dev->period_timer_running, false);
 		return HRTIMER_NORESTART;
 	}
 	if (pos >= dev->buffer_frames)
@@ -3072,22 +3087,32 @@ out:
 
 static void uad2_period_timer_start(struct uad2_dev *dev)
 {
-	if (dev->period_timer_running)
+	if (READ_ONCE(dev->period_timer_running))
 		return;
 
-	dev->period_timer_running = true;
 	dev->last_play_period = 0;
 	dev->last_rec_period = 0;
+	WRITE_ONCE(dev->period_timer_running, true);
 	hrtimer_start(&dev->period_timer, ns_to_ktime(PERIOD_TIMER_NS),
 		      HRTIMER_MODE_REL);
 }
 
+/*
+ * Stop and drain the period timer.  CALLER MUST be in process context
+ * — hrtimer_cancel() spins until the callback returns, so calling it
+ * from the callback itself (or from any atomic context the callback
+ * can call into) deadlocks.  ALSA's snd_pcm_drain_done path triggers
+ * SNDRV_PCM_TRIGGER_STOP from inside snd_pcm_period_elapsed(), which
+ * is one such forbidden caller — that path must use the lighter
+ * WRITE_ONCE(period_timer_running, false) instead and let the next
+ * tick of the callback notice the flag and self-cancel.
+ */
 static void uad2_period_timer_stop(struct uad2_dev *dev)
 {
-	if (!dev->period_timer_running)
+	if (!READ_ONCE(dev->period_timer_running))
 		return;
 
-	dev->period_timer_running = false;
+	WRITE_ONCE(dev->period_timer_running, false);
 	hrtimer_cancel(&dev->period_timer);
 }
 
@@ -3177,12 +3202,21 @@ static int uad2_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
 		 * Transport teardown happens in pcm_close when open_count
 		 * reaches 0, or in uad2_shutdown/uad2_remove. */
 
-		/* Stop polling timer when no streams are running.  Use the
-		 * value snapshot captured under dev->lock above so a
-		 * concurrent trigger(START) cannot lead us to stop the
-		 * timer while another stream is running. */
+		/* Stop the polling timer when no streams are running.
+		 * We MUST NOT call uad2_period_timer_stop() here —
+		 * trigger() can be invoked from inside our hrtimer
+		 * callback (snd_pcm_period_elapsed -> snd_pcm_drain_done
+		 * -> snd_pcm_do_stop), and hrtimer_cancel() spins waiting
+		 * for the callback to finish, deadlocking against itself.
+		 * Just clear the flag; the next tick (within 1 ms) sees
+		 * it and returns HRTIMER_NORESTART, taking the timer off
+		 * the wheel naturally.
+		 *
+		 * The running snapshot was captured under dev->lock above
+		 * so a concurrent trigger(START) cannot make us clear the
+		 * flag while another stream is still running. */
 		if (running == 0)
-			uad2_period_timer_stop(dev);
+			WRITE_ONCE(dev->period_timer_running, false);
 		return 0;
 	}
 	return -EINVAL;
@@ -4012,7 +4046,6 @@ static int uad2_probe(struct pci_dev *pci, const struct pci_device_id *id)
 	spin_lock_init(&dev->notify_lock);
 	init_completion(&dev->notify_event);
 	init_completion(&dev->connect_event);
-	init_completion(&dev->rate_event);
 	INIT_DELAYED_WORK(&dev->dsp_service_work, uad2_dsp_service_handler);
 	hrtimer_setup(&dev->period_timer, uad2_period_timer_fn, CLOCK_MONOTONIC,
 		      HRTIMER_MODE_REL);
