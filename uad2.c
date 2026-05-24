@@ -40,22 +40,13 @@
 #include <sound/control.h>
 #include <sound/initval.h>
 
-/* ============================================================
- * PCI identity
- * All Apollo Thunderbolt devices share vendor 0x1A00, device 0x0002.
- * Device model is determined by serial prefix (BAR0+0x20..0x2C),
- * not by PCI subsystem ID.
- * ============================================================ */
+/* All Apollo Thunderbolt devices share this vendor/device ID;
+ * model identified later by serial prefix and subsystem ID. */
 #define UA_VENDOR_ID 0x1a00
 #define UA_DEVICE_ID 0x0002
 
-/* ============================================================
- * Device type IDs (from open-apollo ua_apollo.h, reconstructed
- * from kext CPcieDevice::Name() and _deviceTypeFromSerialNumber())
- *
- * v2 devices: type from ext_caps register (0x2234) bits[25:20]-1,
- *             then refined via serial number prefix lookup.
- * ============================================================ */
+/* Device type IDs from open-apollo ua_apollo.h, reconstructed from
+ * kext CPcieDevice::Name() and _deviceTypeFromSerialNumber(). */
 #define UA_DEV_APOLLO_X6 0x1E
 #define UA_DEV_APOLLO_X4 0x1F
 #define UA_DEV_APOLLO_X8P 0x20
@@ -72,231 +63,165 @@
 #define UA_DEV_APOLLO_X16_GEN2 0x39
 #define UA_DEV_APOLLO_TWIN_X_GEN2 0x3A
 
-/* Serial prefix register: BAR0+0x20..0x2C, 16-byte ASCII string.
- * First 4 digits (at offset +4 into the string) identify the model.
- * NOTE: serial prefix detection is unreliable on some models (e.g.
- * Apollo Solo serial coincidentally contains "2032" → false x16D match).
- * PCI subsystem ID is used as primary detection where known. */
+/* Serial prefix at BAR0+0x20..0x2C: 16-byte ASCII string, model digits
+ * at offset +4.  Apollo Solo's serial contains "2032" which falsely
+ * matches x16D, so PCI subsystem ID is preferred for known models. */
 #define UA_REG_SERIAL_BASE 0x0020
 #define UA_REG_SERIAL_LEN 16
 
-/* PCI subsystem IDs for known models.
- * These are constant per model and more reliable than serial prefix.
- * Only models confirmed on real hardware or from open-apollo are listed. */
+/* PCI subsystem IDs (constant per model, more reliable than serial prefix) */
 #define UA_SUBSYS_SOLO 0x000F /* Apollo Solo (confirmed via ioreg) */
 #define UA_SUBSYS_X4_QUAD 0x0011 /* Apollo x4 Quad (from open-apollo) */
 
-/* FPGA revision register — bit 31 distinguishes v1/v2 firmware */
+/* FPGA revision; bit 31 distinguishes v1 (clear) from v2 (set) firmware */
 #define REG_FPGA_REV 0x2218
-/* Extended capabilities (v2 firmware): bits[25:20] = device family,
- * bits[15:8] = DSP count */
+/* Extended capabilities (v2 firmware): bits[25:20] = family, bits[15:8] = DSP count */
 #define REG_EXT_CAPS 0x2234
 
-/* ============================================================
- * BAR register offsets  (all 32-bit MMIO, BAR 0 = 64 KB window)
- * ============================================================ */
+/* BAR register offsets (all 32-bit MMIO, BAR 0 = 64 KB window) */
 
-/* --- Global interrupt control --- */
-#define REG_INTR_ENABLE 0x0014 /* WRITE 0xFFFFFFFF to unmask */
+#define REG_INTR_ENABLE 0x0014 /* W 0xFFFFFFFF to unmask */
 
-/* --- Firmware base address (read after SG table programming) --- */
-#define REG_FW_BASE_LO 0x0030 /* R: firmware base low 32 bits */
-#define REG_FW_BASE_HI 0x0034 /* R: firmware base high 32 bits */
+#define REG_FW_BASE_LO 0x0030 /* R: firmware base low 32 */
+#define REG_FW_BASE_HI 0x0034 /* R: firmware base high 32 */
 
-/* --- DMA master control (CPcieIntrManager) --- */
-#define REG_DMA_MASTER_CTRL \
-	0x2200 /* R/W bitmask: per-DSP channel enable
-                                         * EnableDMA sets bit (1 << (dsp_index+1))
-                                         * bit 0 reserved (global master?)
-                                         * Uses software shadow, never read from HW */
+/* DMA master control (CPcieIntrManager).  Software shadow, never read
+ * from HW.  EnableDMA sets bit (1 << (dsp_index+1)); bit 0 reserved. */
+#define REG_DMA_MASTER_CTRL 0x2200
 #define DMA_CTRL_MASTER_ENABLE 0x0001 /* bit 0: global master enable */
 #define DMA_RESET_SINGLE 0x1e00 /* bits[12:9]: single engine reset */
 #define DMA_RESET_DUAL 0x1fe00 /* bits[16:9]: dual engine reset */
-/* Masks to clear DMA channel enable bits (preserving bit 0): */
 #define DMA_SHADOW_MASK_SINGLE 0xffffffe1 /* clears bits[4:1] */
 #define DMA_SHADOW_MASK_DUAL 0xfffffe01 /* clears bits[8:1] */
 
-/* --- DMA engine 0 (CPcieIntrManager::ProgramRegisters) --- */
-#define REG_DMA0_INTR_CTRL 0x2204 /* WRITE 0x0 to disable/clear */
-#define REG_DMA0_STATUS 0x2208 /* WRITE 0xFFFFFFFF to arm; WRITE 0x0 to clear */
+/* DMA engine 0 (CPcieIntrManager::ProgramRegisters) */
+#define REG_DMA0_INTR_CTRL 0x2204 /* W 0x0 to disable/clear */
+#define REG_DMA0_STATUS 0x2208 /* W 0xFFFFFFFF to arm; W 0x0 to clear */
 
-/* --- Device identification (CPcieDevice::ProgramRegisters) --- */
-#define REG_DEVICE_ID \
-	0x2218 /* READ to verify device identity
-                                         * Also polled after clock change (2s timeout) */
-#define REG_DEVICE_HANDSHAKE \
-	0x2220 /* WRITE 0x0 after reading device ID
-                                         * CPcieDevice::WriteRegEjj always writes 0 here */
+/* Device identification (CPcieDevice::ProgramRegisters) */
+#define REG_DEVICE_ID 0x2218 /* R to verify; polled after clock change */
+#define REG_DEVICE_HANDSHAKE 0x2220 /* W 0x0 after reading device ID */
 
-/* --- Audio transport registers (CPcieAudioExtension) --- */
+/* Audio transport registers (CPcieAudioExtension).
+ * REG_TRANSPORT_CTL values: 0x000 stop, 0x001 armed, 0x00F running,
+ * 0x20F running extended (variant 0xA/0x9).  Read status: bit5=running,
+ * bit7=overflow, bit8=underflow. */
 #define REG_BUFFER_FRAME_SIZE 0x2240 /* W: bufferFrameSize - 1 */
-#define REG_DMA_POSITION \
-	0x2244 /* R: current frame position (wrapping counter)
-                                         * W: 0 to clear */
-#define REG_TRANSPORT_CTL \
-	0x2248 /* R/W: transport state machine
-                                         * 0x000 = stop
-                                         * 0x001 = armed/prepared
-                                         * 0x00F = running (normal)
-                                         * 0x20F = running (extended, variant 0xA/0x9)
-                                         * Read status: bit5=running, bit7=overflow,
-                                         *              bit8=underflow */
-#define REG_PLAYBACK_MON_CFG \
-	0x224C /* W: (totalPlayChans-1) | 0x100 (enable+mask) */
+#define REG_DMA_POSITION 0x2244 /* R: frame position (wrapping); W 0 clears */
+#define REG_TRANSPORT_CTL 0x2248
+#define REG_PLAYBACK_MON_CFG 0x224C /* W: (totalPlayChans-1) | 0x100 */
 #define REG_PLAYBACK_CHAN_CNT 0x2250 /* W: total playback channels */
-#define REG_POLL_STATUS \
-	0x2254 /* R: poll for DMA ready (compare vs irq_period) */
+#define REG_POLL_STATUS 0x2254 /* R: poll for DMA ready vs irq_period */
 #define REG_IRQ_PERIOD 0x2258 /* W: interrupt period in frames */
 #define REG_RECORD_CHAN_CNT 0x225C /* W: record channel count */
-#define REG_STREAM_ENABLE \
-	0x2260 /* W: 0x1 = start stream, 0x10 = stop stream
-                                         * Also: 0x4 = clock change trigger */
+#define REG_STREAM_ENABLE 0x2260 /* W: 0x1 start, 0x10 stop, 0x4 clock change */
 
-/* --- DMA engine 1 (dual-engine devices only) ---
- * Note: relative to DMA0, the roles of +0 and +4 are swapped:
+/* DMA engine 1 (dual-engine devices only).
+ * Roles of +0 and +4 are swapped vs DMA0:
  *   0x2264 = arm/status (like DMA0's 0x2208)
- *   0x2268 = enable ctrl (like DMA0's 0x2204)
- */
-#define REG_DMA1_STATUS 0x2264 /* WRITE bitmask to arm; read pending */
-#define REG_DMA1_INTR_CTRL 0x2268 /* WRITE enable shadow */
+ *   0x2268 = enable ctrl (like DMA0's 0x2204) */
+#define REG_DMA1_STATUS 0x2264 /* W bitmask to arm; R pending */
+#define REG_DMA1_INTR_CTRL 0x2268 /* W enable shadow */
 
-/* --- Buffer and timer configuration --- */
 #define REG_BUFFER_SIZE_KB 0x226C /* W: (totalPlayChans * (bufSz-1)) >> 10 */
 #define REG_PERIODIC_TIMER 0x2270 /* W: periodic timer interval in frames */
 
-/* --- Playback monitor status --- */
 #define REG_PLAYBACK_MON_STAT 0x22C0 /* R: playback monitor status */
 #define REG_SECONDARY_CTL 0x22C4 /* W: 0 on Shutdown */
 
-/* --- DSP Mixer registers (BAR0 + 0x3800 window) ---
- *
- * The mixer engine uses a sequence-counter handshake to update settings:
- *   1. Read MIXER_SEQ_RD (wait for DSP idle: RD == WR)
- *   2. Write paired (value, mask) words to MIXER_SETTING[index]
- *   3. Increment and write MIXER_SEQ_WR
- *   4. DSP reads all 38 settings atomically per SEQ_WR advance
- *
- * 38 settings × 8 bytes each (two 32-bit words per setting).
- * From open-apollo ua_apollo.h / ua_core.c.
- * ============================================================ */
+/* DSP Mixer registers (BAR0 + 0x3800 window).
+ * Sequence-counter handshake: read SEQ_RD (wait DSP idle: RD == WR),
+ * write paired (value, mask) words to MIXER_SETTING[index], bump SEQ_WR.
+ * DSP then reads all 38 settings atomically.  From open-apollo. */
 #define REG_MIXER_BASE 0x3800
-#define REG_MIXER_SEQ_WR 0x3808 /* Mixer sequence counter (host → DSP) */
-#define REG_MIXER_SEQ_RD 0x380C /* Mixer sequence counter (DSP readback) */
-#define REG_MIXER_RB_STATUS 0x3810 /* Readback: 1=ready, write 0 to re-arm */
-#define REG_MIXER_RB_DATA 0x3814 /* Readback: 40 consecutive u32 words */
-#define MIXER_SETTING_STRIDE 8 /* 2 × u32 per setting */
-#define MIXER_BATCH_COUNT 38 /* Settings flushed per batch */
-#define MIXER_RB_WORDS 40 /* Readback data words */
+#define REG_MIXER_SEQ_WR 0x3808 /* host writes; DSP reads */
+#define REG_MIXER_SEQ_RD 0x380C /* DSP writes; host reads */
+#define REG_MIXER_RB_STATUS 0x3810 /* readback: 1=ready, W 0 to re-arm */
+#define REG_MIXER_RB_DATA 0x3814 /* readback: 40 consecutive u32 words */
+#define MIXER_SETTING_STRIDE 8 /* two u32 per setting */
+#define MIXER_BATCH_COUNT 38
+#define MIXER_RB_WORDS 40
 #define DSP_SERVICE_INTERVAL_MS 10 /* readback drain + mixer flush rate */
 
-/* --- Scatter-Gather DMA tables (ProgramRegisters @ 0x4bac0) ---
- *
- * Buffer A (playback): BAR+0x8000..0x9FFF = 1024 entries × 8 bytes
- *   Each entry: [low32 phys_addr] [high32 phys_addr] for one 4KB page
- *
- * Buffer B (capture):  BAR+0xA000..0xBFFF = same layout
- *   Computed as BufferA_SG_offset + 0x2000
- *
- * Loop: sg_offset = 0x8000; sg_offset += 8; until sg_offset == 0xA000
- *       dma_offset = 0; dma_offset += 0x1000
- * ============================================================ */
-#define REG_SG_TABLE_A_BASE 0x8000 /* Playback SG table start */
-#define REG_SG_TABLE_A_END 0xA000 /* Playback SG table end (exclusive) */
+/* Scatter-Gather DMA tables (ProgramRegisters @ 0x4bac0).
+ * Buffer A (playback): BAR+0x8000..0x9FFF = 1024 entries of 8 bytes
+ * (low32 phys, high32 phys) for one 4KB page each.
+ * Buffer B (capture):  BAR+0xA000..0xBFFF = same layout. */
+#define REG_SG_TABLE_A_BASE 0x8000
+#define REG_SG_TABLE_A_END 0xA000
 #define REG_SG_TABLE_B_OFFSET 0x2000 /* Capture SG table = A + 0x2000 */
-#define SG_ENTRY_SIZE 8 /* bytes per SG entry */
-#define SG_NUM_ENTRIES 1024 /* entries per table */
-#define SG_PAGE_SIZE 0x1000 /* 4KB per page */
-#define SG_BUFFER_SIZE 0x400000 /* 4MB total DMA buffer */
+#define SG_ENTRY_SIZE 8
+#define SG_NUM_ENTRIES 1024
+#define SG_PAGE_SIZE 0x1000
+#define SG_BUFFER_SIZE 0x400000 /* 4 MB total DMA buffer */
 
-/* --- Sample clock (CPcieAudioExtension::_setSampleClock) --- */
-#define REG_SAMPLE_CLOCK \
-	0xC04C /* W: clock_source | (rate_enum << 8)
-                                         * Actual offset: BAR + (dev_idx*4) + 0xC04C
-                                         * For Apollo Solo (dev_idx from this+0x24) */
+/* Sample clock (CPcieAudioExtension::_setSampleClock).
+ * W: clock_source | (rate_enum << 8) at BAR + (dev_idx*4) + 0xC04C. */
+#define REG_SAMPLE_CLOCK 0xC04C
 
-/* --- Firmware mailbox (notification/doorbell) --- */
-#define REG_FW_DOORBELL \
-	0xC004 /* W: 0x0ACEFACE as connect command
-                                         * Addr: BAR + (channel_base_index << 2) + 0xC004 */
+/* Firmware mailbox (notification/doorbell).
+ * Address = BAR + (channel_base_index << 2) + offset. */
+#define REG_FW_DOORBELL 0xC004 /* W: 0x0ACEFACE as connect command */
 #define REG_FW_NOTIFY_STATUS \
-	0xC008 /* R/W: notification bitmask register
-                                         * Addr: BAR + (channel_base_index << 2) + 0xC008
-                                         * Write 0 to acknowledge/clear */
+	0xC008 /* R/W: notification bitmask; W 0 to clear */
 #define DMA_DESC_MAGIC 0x0aceface
 
-/* --- Bank-shifted notification registers (add channel_base_index<<2) ---
- * From open-apollo ua_apollo.h.  These contain DSP state info that
- * the firmware expects the host to read after connect and on events. */
-#define REG_NOTIF_RATE_INFO 0xC054 /* rate info readback */
-#define REG_NOTIF_XPORT_INFO 0xC058 /* transport info readback */
-#define REG_NOTIF_CLOCK_INFO 0xC05C /* clock source info readback */
+/* Bank-shifted notification readback registers (add channel_base_index<<2).
+ * Firmware expects host reads after connect and on events. */
+#define REG_NOTIF_RATE_INFO 0xC054
+#define REG_NOTIF_XPORT_INFO 0xC058
+#define REG_NOTIF_CLOCK_INFO 0xC05C
 
-/* --- Firmware notification status bits (BAR+0xC008 bitmask) --- */
-#define NOTIFY_PLAYBACK_IO BIT(0) /* Playback IO descriptors ready */
-#define NOTIFY_RECORD_IO BIT(1) /* Record IO descriptors ready */
-#define NOTIFY_DMA_READY BIT(4) /* DMA engine ready */
-#define NOTIFY_CONNECT_ACK BIT(5) /* Connect handshake acknowledged */
-#define NOTIFY_ERROR BIT(6) /* Firmware error */
-#define NOTIFY_END_BUFFER BIT(7) /* End of buffer */
-#define NOTIFY_CHAN_CONFIG BIT(21) /* Channel configuration update */
-#define NOTIFY_RATE_CHANGE BIT(22) /* Sample rate change ack */
+/* Firmware notification status bits (BAR+0xC008 bitmask) */
+#define NOTIFY_PLAYBACK_IO BIT(0)
+#define NOTIFY_RECORD_IO BIT(1)
+#define NOTIFY_DMA_READY BIT(4)
+#define NOTIFY_CONNECT_ACK BIT(5)
+#define NOTIFY_ERROR BIT(6)
+#define NOTIFY_END_BUFFER BIT(7)
+#define NOTIFY_CHAN_CONFIG BIT(21)
+#define NOTIFY_RATE_CHANGE BIT(22)
 
-/* --- Playback/Record IO descriptor areas --- */
-#define REG_RECORD_IO_DESC 0xC1A4 /* R: record IO descriptors (72 DWORDs) */
-#define REG_PLAYBACK_IO_DESC 0xC2C4 /* R: playback IO descriptors (72 DWORDs) */
-#define IO_DESC_DWORDS 72 /* 0x120 bytes = 288 bytes */
+/* Playback/Record IO descriptor areas (72 DWORDs = 0x120 bytes each) */
+#define REG_RECORD_IO_DESC 0xC1A4
+#define REG_PLAYBACK_IO_DESC 0xC2C4
+#define IO_DESC_DWORDS 72
 
-/* --- Channel config area --- */
 #define REG_CHAN_CONFIG_BASE 0xC000 /* R: 10 DWORDs of channel config */
 #define CHAN_CONFIG_DWORDS 10
 
-/* IO descriptor channel type offset: uint16 descriptors start at +0x18
- * within the IO descriptor block (after header fields).
- * Each uint16: high byte = type index, low byte = sub-index */
-
-/* ============================================================
- * DSP ring buffer registers (relative to ring_base)
- *
- * For DSP index n:
- *   n < 4:  ring_base = BAR + 0x2000 + (n * 0x80)
- *   n >= 4: ring_base = BAR + 0x5e00 + (n * 0x80)
- * Second ring at ring_base + 0x40
- *
- * CPcieRingBuffer::ProgramRegisters @ 0x14c48:
- *   4 descriptor slots at ring_base+0x00..0x1C (8 bytes each)
- *   Each slot: low 32-bit phys addr, high 32-bit phys addr
- *   Pages: 0x0000, 0x1000, 0x2000, 0x3000 (4 x 4KB pages)
- *   All written and verified via read-back
- * ============================================================ */
+/* DSP ring buffer registers (relative to ring_base).
+ * For DSP index n: ring_base = BAR + (n<4 ? 0x2000 : 0x5e00) + n*0x80.
+ * Second ring at ring_base + 0x40.
+ * From CPcieRingBuffer::ProgramRegisters @ 0x14c48: 4 descriptor slots
+ * at +0x00..0x1C (8 bytes each, low/high 32-bit phys), pages
+ * 0x0000/0x1000/0x2000/0x3000.  All writes verified via read-back. */
 #define DSP_RING_BASE_LOW 0x2000
 #define DSP_RING_BASE_HIGH 0x5e00
 #define DSP_RING_STRIDE 0x80
 #define DSP_RING2_OFFSET 0x40
 
-/* Ring buffer register offsets (relative to ring_base) */
-#define DSP_RING_DESC0_LO 0x00 /* W/R: descriptor 0 phys addr low 32 */
-#define DSP_RING_DESC0_HI 0x04 /* W/R: descriptor 0 phys addr high 32 */
-#define DSP_RING_DESC1_LO 0x08 /* descriptor 1 */
+#define DSP_RING_DESC0_LO 0x00
+#define DSP_RING_DESC0_HI 0x04
+#define DSP_RING_DESC1_LO 0x08
 #define DSP_RING_DESC1_HI 0x0C
-#define DSP_RING_DESC2_LO 0x10 /* descriptor 2 */
+#define DSP_RING_DESC2_LO 0x10
 #define DSP_RING_DESC2_HI 0x14
-#define DSP_RING_DESC3_LO 0x18 /* descriptor 3 */
+#define DSP_RING_DESC3_LO 0x18
 #define DSP_RING_DESC3_HI 0x1C
-#define DSP_RING_DESC_COUNT 0x20 /* W: ring descriptor count = ring_size */
-#define DSP_RING_SIZE_REG 0x24 /* W: ring size register = ring_size */
-#define DSP_RING_CAPACITY 0x28 /* R: hardware ring capacity (cap at 0x400) */
-#define DSP_READY_POLL_OFF 0x1a4 /* R: DSP ready poll; wait for DSP_READY_SIG */
+#define DSP_RING_DESC_COUNT 0x20 /* W: descriptor count = ring_size */
+#define DSP_RING_SIZE_REG 0x24 /* W: ring size */
+#define DSP_RING_CAPACITY 0x28 /* R: HW ring capacity (cap at 0x400) */
+#define DSP_READY_POLL_OFF 0x1a4 /* R: DSP ready poll, wait for DSP_READY_SIG */
 
-#define DSP_RING_DESC_SLOTS 4 /* 4 descriptor slots per ring */
+#define DSP_RING_DESC_SLOTS 4
 #define DSP_RING_PAGE_SIZE 0x1000 /* 4 KB per descriptor page */
 #define DSP_READY_SIG 0xa8caed0f
 #define DSP_POLL_INTERVAL_MS 300
 #define DSP_POLL_MAX_PRIMARY 100 /* DSP type 0: 30s timeout */
 #define DSP_POLL_MAX_SECONDARY 10 /* others: 3s timeout */
 
-/* ============================================================
- * UAD2SampleRate enum (1-based, from _setSampleClock analysis)
- * ============================================================ */
+/* UAD2SampleRate enum (1-based, from _setSampleClock analysis) */
 #define UA_RATE_44100 1
 #define UA_RATE_48000 2
 #define UA_RATE_88200 3
@@ -304,9 +229,7 @@
 #define UA_RATE_176400 5
 #define UA_RATE_192000 6
 
-/* ============================================================
- * Audio engine parameters
- * ============================================================ */
+/* Audio engine parameters */
 #define UAD2_MAX_BUFFER_FRAMES 8192 /* max from _recomputeBufferFrameSize cap */
 #define UAD2_SAMPLE_OFFSET 16
 #define UAD2_BYTES_PER_SAMPLE 4 /* 24-bit in 32-bit container */
@@ -317,11 +240,8 @@
  * All Apollo Thunderbolt devices use 0x0A (verified on Solo, x4). */
 #define UAD2_CHANNEL_BASE_IDX 10
 
-/* ============================================================
- * Serial prefix → device type lookup table
- * From open-apollo ua_core.c (extracted from kext
- * _deviceTypeFromSerialNumber() data at offset 0x3E840)
- * ============================================================ */
+/* Serial prefix to device type lookup, from open-apollo ua_core.c
+ * (extracted from kext _deviceTypeFromSerialNumber() data @ 0x3E840) */
 struct ua_serial_entry {
 	char prefix[5]; /* 4-char ASCII serial prefix + NUL */
 	u32 device_type;
@@ -346,12 +266,9 @@ static const struct ua_serial_entry ua_serial_table[] = {
 	{ "2092", UA_DEV_APOLLO_X4_GEN2 },
 };
 
-/* ============================================================
- * Per-model channel counts and capabilities
- * From open-apollo ua_audio.c (macOS IOKit IOAudioEngine properties)
- *
- * These are PCIe DMA channel counts, not physical I/O count.
- * ============================================================ */
+/* Per-model channel counts and capabilities, from open-apollo ua_audio.c
+ * (macOS IOKit IOAudioEngine properties).  These are PCIe DMA channel
+ * counts, not physical I/O count. */
 struct ua_model_info {
 	u32 device_type;
 	unsigned int play_ch;
@@ -361,10 +278,9 @@ struct ua_model_info {
 };
 
 static const struct ua_model_info ua_models[] = {
-	/* Solo/Arrow: open-apollo has 3/2 but those are physical I/O counts.
-	 * DMA channel counts from macOS ioreg: play=42 rec=32 for Solo.
-	 * Arrow likely same (same chipset). Firmware IO descriptors will
-	 * override these after connect if different. */
+	/* Solo/Arrow: open-apollo lists 3/2 (physical I/O); macOS ioreg
+	 * shows DMA play=42 rec=32 for Solo.  Arrow assumed same (same
+	 * chipset).  Firmware IO descriptors override after connect. */
 	{ UA_DEV_APOLLO_SOLO, 42, 32, 1, 0 },
 	{ UA_DEV_ARROW, 42, 32, 1, 0 },
 	{ UA_DEV_APOLLO_TWIN_X, 8, 8, 2, 2 },
@@ -425,10 +341,8 @@ static const char *ua_device_name(u32 device_type)
 #define UAD2_CONNECT_RETRIES 10
 #define UAD2_CONNECT_WAIT_MS 100
 
-/* IRQ period lookup table from kext data segment @ 0x6020.
- * _setSampleClock loads this value into this+0x2880, which
- * PrepareTransport then writes to REG_IRQ_PERIOD (0x2258).
- * The firmware uses this to determine the DMA notification interval. */
+/* IRQ period lookup, kext data segment @ 0x6020.  _setSampleClock loads
+ * this into this+0x2880; PrepareTransport writes to REG_IRQ_PERIOD. */
 static unsigned int uad2_irq_period_for_rate(unsigned int rate)
 {
 	switch (rate) {
@@ -446,81 +360,49 @@ static unsigned int uad2_irq_period_for_rate(unsigned int rate)
 	}
 }
 
-/* Periodic timer interval lookup table from kext CUAD2AudioMixer::StartTransport.
- *
- * This determines the interrupt rate for audio processing.  The kext's mixer
- * calls SetPeriodicTimerIntervalInFrames(N-1, 0) where N comes from a rate-
- * indexed lookup table at kext data segment @ 0x5D20:
- *   44100/48000   → 256 frames → value 255
- *   88200/96000   → 512 frames → value 511
- *   176400/192000 → 1024 frames → value 1023
- *
- * This value is written to BAR+0x2270 (REG_PERIODIC_TIMER) and triggers
- * interrupt vector 0x46 (_periodicTimerCallback), which is the ACTUAL audio
- * clock that drives the kext's ProcessAudio and period advancement.
- *
- * NOTE: Vector 0x47 (end-of-buffer, _endBufferCallback) passes callback ID
- * 0x6c to the mixer, which ignores it.  Only vector 0x46 (periodic timer,
- * callback ID 0x6d) triggers ProcessAudio.  The Linux driver must use the
- * periodic timer interrupt to drive snd_pcm_period_elapsed(). */
+/* Periodic timer interval from kext CUAD2AudioMixer::StartTransport.
+ * Drives vector 0x46 (_periodicTimerCallback), the actual audio clock
+ * that triggers ProcessAudio.  Vector 0x47 (_endBufferCallback) passes
+ * callback ID 0x6c which the mixer ignores, so the Linux driver must
+ * use the periodic timer interrupt for snd_pcm_period_elapsed(). */
 static unsigned int uad2_periodic_timer_for_rate(unsigned int rate)
 {
 	switch (rate) {
 	case 44100:
 	case 48000:
-		return 255; /* 256 - 1 */
+		return 255;
 	case 88200:
 	case 96000:
-		return 511; /* 512 - 1 */
+		return 511;
 	case 176400:
 	case 192000:
-		return 1023; /* 1024 - 1 */
+		return 1023;
 	default:
 		return 255;
 	}
 }
 
-/* ============================================================
- * Interrupt vector enable bitmask management
+/* Interrupt vector enable bitmask management.
  *
  * CPcieIntrManager::EnableVector @ 0x13cd4 (line 12349):
- *   1. Lookup: slot = IntrManager[(vector_id << 2) + 0x4D0]
- *   2. bit_mask = 1 << slot
- *   3. IntrManager+0x20 |= bit_mask (enable shadow, 64-bit)
- *   4. If arm_flag: write bit_mask to BAR+0x2208 (arm DMA0)
- *   5. Write full enable shadow to BAR+0x2204 (DMA0 interrupt ctrl)
- *   6. If dual-DMA: write to BAR+0x2264/0x2268
+ *   slot = IntrManager[(vector_id << 2) + 0x4D0]
+ *   shadow |= (1 << slot)
+ *   if arm: write (1 << slot) to BAR+0x2208 (DMA0 status)
+ *   write shadow to BAR+0x2204 (DMA0 enable ctrl)
+ *   if dual-DMA: write to BAR+0x2264/0x2268
  *
- * CPcieIntrManager::DisableVector @ 0x13f34 (line 12502):
- *   1. slot = IntrManager[(vector_id << 2) + 0x4D0]
- *   2. bit_mask = 1 << slot
- *   3. IntrManager+0x20 &= ~bit_mask
- *   4. Write new enable shadow to BAR+0x2204
- *   5. If dual-DMA: write to BAR+0x2268
+ * Vector assignments from CPcieDSP::Initialize @ 0x10d60:
+ *   base = dsp_index * 5  (Apollo Solo dsp_index=0 yields base=0)
+ *   vec+0,+1 = ring callbacks  (not enabled by AudioExtension)
+ *   vec+2,+3,+4 = error callbacks (enabled immediately)
  *
- * Vector assignments (from CPcieDSP::Initialize @ 0x10d60):
- *   base = dsp_index * 5  (for Apollo Solo, dsp_index=0 → base=0)
- *   vec+0 = ring0 callback    (not enabled by AudioExtension)
- *   vec+1 = ring1 callback    (not enabled by AudioExtension)
- *   vec+2 = error callback    (enabled immediately)
- *   vec+3 = error callback    (enabled immediately)
- *   vec+4 = error callback    (enabled immediately)
+ * CPcieAudioExtension vectors:
+ *   0x28 notification, 0x46 periodic timer, 0x47 end-of-buffer.
  *
- * CPcieAudioExtension registers (from ProgramRegisters/Initialize):
- *   0x28 = notification interrupt → _notifyIntrCallback
- *   0x46 = periodic timer         → _periodicTimerCallback
- *   0x47 = end-of-buffer          → _endBufferCallback
- *
- * For Linux: we don't maintain the full vector→slot lookup table.
- * Instead we maintain a 64-bit enable shadow and compute bit positions
- * based on the known vector IDs.  The slot lookup at +0x4D0 in the kext
- * is a dense remapping; for our three vectors we use the slot values
- * directly.  We arm on enable (write bitmask to 0x2208).
- * ============================================================ */
+ * Linux skips the kext's vector_to_slot[] indirection and uses slot
+ * values directly for these three known vectors. */
 
-/* ============================================================
- * Driver private state
- * ============================================================ */
+/* Driver private state */
 struct uad2_dev {
 	struct pci_dev *pci;
 	struct snd_card *card;
@@ -529,10 +411,9 @@ struct uad2_dev {
 	void __iomem *bar; /* 64 KB MMIO window */
 	resource_size_t bar_len;
 
-	spinlock_t lock; /* protects HW register access
-	                                         * (mirrors kext hw_lock at this+0x10) */
-	spinlock_t notify_lock; /* protects notification handler
-	                                         * (mirrors kext spinlock at this+0x2890) */
+	spinlock_t lock; /* HW register access (mirrors kext hw_lock @+0x10) */
+	spinlock_t
+		notify_lock; /* notification handler (kext spinlock @+0x2890) */
 
 	u32 expected_device_id;
 	u32 device_type; /* UA_DEV_APOLLO_* enum */
@@ -543,14 +424,10 @@ struct uad2_dev {
 	unsigned int dsp_count;
 	u32 channel_base_index; /* 10 (0x0A) for all Apollo TB devices */
 
-	/* Shadow register for DMA master control (never read from HW) */
-	u32 dma_ctrl_shadow;
+	u32 dma_ctrl_shadow; /* DMA master control shadow (never read from HW) */
+	u64 intr_enable_shadow; /* interrupt enable bitmask (kext IntrManager+0x20) */
 
-	/* Shadow register for interrupt enable bitmask
-	 * (mirrors IntrManager+0x20 in kext) */
-	u64 intr_enable_shadow;
-
-	/* Accumulated active interrupt bits from hardirq top-half,
+	/* Active interrupt bits accumulated from hardirq top-half,
 	 * consumed by threaded bottom-half.  Protected by dev->lock. */
 	u64 irq_active;
 
@@ -558,90 +435,73 @@ struct uad2_dev {
 	dma_addr_t ring_dma_addr[DSP_RING_DESC_SLOTS];
 	void *ring_dma_buf[DSP_RING_DESC_SLOTS];
 
-	/* Two 4MB DMA buffers (playback + capture scatter-gather source)
-	 * Allocated as contiguous DMA memory, page addresses written to
-	 * BAR+0x8000-0x9FFF (playback) and BAR+0xA000-0xBFFF (capture).
-	 * ALSA PCM buffers are mapped directly into these. */
+	/* Two 4MB DMA buffers (playback + capture scatter-gather source).
+	 * Page addresses are written to BAR+0x8000..0x9FFF (playback) and
+	 * BAR+0xA000..0xBFFF (capture).  ALSA PCM buffers map directly here. */
 	dma_addr_t sg_dma_addr[2]; /* [0]=playback, [1]=capture */
 	void *sg_dma_buf[2];
 	size_t sg_buf_size; /* 0x400000 = 4MB */
 
-	/* Firmware base address (read from BAR+0x30/0x34 after SG programming) */
-	u64 fw_base_addr;
+	u64 fw_base_addr; /* read from BAR+0x30/0x34 after SG programming */
 
 	/* Audio parameters (computed from channel config or defaults) */
 	unsigned int buffer_frames; /* from _recomputeBufferFrameSize */
 	unsigned int irq_period_frames;
-	unsigned int periodic_timer_interval; /* from kext this+0x28C0 */
+	unsigned int periodic_timer_interval; /* kext this+0x28C0 */
 	unsigned int play_channels;
 	unsigned int rec_channels;
 	unsigned int clock_source; /* 0=internal, 1=SPDIF */
 	unsigned int current_rate; /* current sample rate in Hz */
 
-	/* Transport state (mirrors kext this+0x2878):
-	 * 0=uninit, 1=prepared, 2=running */
+	/* Transport state: 0=uninit, 1=prepared, 2=running (kext this+0x2878) */
 	int transport_state;
 
-	/* Number of active streams (playback + capture).
-	 * The hardware has a single shared transport for both directions.
-	 * We reference-count active streams so StopTransport only stops
-	 * the hardware when the LAST stream stops.  Protected by dev->lock. */
+	/* The hardware has one shared transport for both directions.  We
+	 * reference-count active streams so StopTransport only fires when
+	 * the LAST stream stops.  Protected by dev->lock. */
 	int streams_running;
 
-	/* Per-stream running flags.  Used by the IRQ thread to decide
-	 * which substreams should receive snd_pcm_period_elapsed().
-	 * Set in trigger(START), cleared in trigger(STOP).
-	 * Protected by dev->lock. */
+	/* IRQ thread uses these to decide which substream gets
+	 * snd_pcm_period_elapsed().  Protected by dev->lock. */
 	bool playback_running;
 	bool capture_running;
 
-	/* Number of substreams that have been prepared (pcm_prepare called
-	 * but hw_free not yet called).  Used to prevent hw_free on one
-	 * substream from tearing down the transport that the other substream
-	 * still depends on.  Protected by dev->lock.
-	 *
-	 * play_prepared / rec_prepared track the per-direction state so
-	 * we can correctly debit hw_free.  Previously a single shared flag
-	 * on snd_pcm_runtime was used, which was unreliable under
-	 * JOINT_DUPLEX with overlapping prepare/hw_free sequences. */
+	/* Substreams that have called pcm_prepare but not yet hw_free.
+	 * Per-direction flags are required because a single shared flag
+	 * on snd_pcm_runtime is unreliable under JOINT_DUPLEX with
+	 * overlapping prepare/hw_free across the two directions.
+	 * Protected by dev->lock. */
 	int streams_prepared;
 	bool play_prepared;
 	bool rec_prepared;
 
-	/* Number of substreams currently open (pcm_open called but
-	 * pcm_close not yet called).  The hardware transport is only
-	 * fully torn down when this reaches 0 — NOT on hw_free.
-	 * This prevents the pathological cycle where PipeWire's rapid
-	 * stop→hw_free→prepare→start reconfiguration briefly drives
-	 * streams_prepared to 0, tearing down a transport that was about
-	 * to be re-prepared immediately.  Following the snd-dice/snd-bebob
-	 * pattern: transport lifecycle is tied to open/close, not to
-	 * hw_params/hw_free.  Protected by dev->lock. */
+	/* Substreams open (between pcm_open and pcm_close).  Transport
+	 * tears down only when this reaches 0, NOT on hw_free.  Following
+	 * snd-dice/snd-bebob: lifecycle tied to open/close, not hw_params.
+	 * Without this PipeWire's rapid stop, hw_free, prepare, start
+	 * reconfiguration would briefly drive streams_prepared to 0 and
+	 * destroy a transport about to be re-prepared.  Protected by
+	 * dev->lock. */
 	int open_count;
 
 	/* Notification interrupt handling */
 	struct completion notify_event; /* signals Connect() on bit 21 */
 	struct completion connect_event; /* signals on bit 5 (connect ack) */
-	u32 notify_status; /* last notification bitmask read by the
-	                    * handler.  Set under notify_lock, read by
-	                    * the rate-change poll loop in
-	                    * uad2_set_sample_rate.  Apollo's TB-tunneled
-	                    * MSI delivery is unreliable, so the rate
-	                    * loop polls this field as a fallback. */
+	/* Last notification bitmask read by the handler.  Set under
+	 * notify_lock, polled by uad2_set_sample_rate as a fallback because
+	 * Apollo's TB-tunneled MSI delivery is unreliable. */
+	u32 notify_status;
 	bool connected;
 
-	/* IO descriptor copies from firmware (72 DWORDs each).
-	 * Kext copies the full block on NOTIFY_PLAYBACK_IO / NOTIFY_RECORD_IO.
-	 * Channel count is at DWORD[4] (offset +0x10 from desc base). */
+	/* Firmware IO descriptor copies (72 DWORDs each).  Channel count
+	 * lives at DWORD[4] (offset +0x10). */
 	u32 play_io_desc[IO_DESC_DWORDS];
 	u32 rec_io_desc[IO_DESC_DWORDS];
 
-	/* Channel config area copy (10 DWORDs from BAR+0xC000) */
-	u32 chan_config[CHAN_CONFIG_DWORDS];
+	u32 chan_config[CHAN_CONFIG_DWORDS]; /* 10 DWORDs from BAR+0xC000 */
 
-	/* Mixer batch write state (from open-apollo CPcieDeviceMixer protocol).
-	 * The DSP reads ALL 38 settings atomically on each SEQ_WR advance.
-	 * We maintain cached val/mask arrays and flush the full batch. */
+	/* Mixer batch write state (open-apollo CPcieDeviceMixer protocol).
+	 * DSP reads all 38 settings atomically per SEQ_WR advance. */
 	u32 mixer_val[MIXER_BATCH_COUNT];
 	u32 mixer_mask[MIXER_BATCH_COUNT];
 	u32 mixer_seq_wr;
@@ -649,7 +509,7 @@ struct uad2_dev {
 	bool mixer_ready;
 	u32 mixer_rb_data[MIXER_RB_WORDS];
 
-	/* Monitor state cache (from ALSA kcontrols → DSP mixer setting[2]) */
+	/* Monitor state cache, written to DSP mixer setting[2] */
 	struct {
 		int level; /* 0-192 raw (192 + dB*2; 0=-96dB, 192=0dB) */
 		int mute; /* 0=unmuted, 2=muted (UA_MON_MUTE encoding) */
@@ -657,7 +517,7 @@ struct uad2_dev {
 		int source; /* 0=MIX, 1=CUE1, 2=CUE2 */
 	} monitor;
 
-	/* Preamp state cache (from ALSA kcontrols → DSP mixer settings) */
+	/* Preamp state cache, indexed by preamp channel */
 	struct {
 		int gain; /* dB value (-144..+65) */
 		bool phantom; /* 48V phantom power */
@@ -665,18 +525,15 @@ struct uad2_dev {
 		bool lowcut;
 		bool phase; /* true=inverted */
 		bool mic_line; /* false=Mic, true=Line */
-	} preamp[UAD2_MAX_DSPS]; /* indexed by preamp channel */
+	} preamp[UAD2_MAX_DSPS];
 
-	/* Number of preamp channels for this model */
 	unsigned int num_preamps;
 
-	/* PCIe setup state */
 	bool pcie_setup_done;
 
-	/* DSP service loop — periodic readback drain + mixer flush.
-	 * The Apollo DSP firmware needs periodic "servicing" from the host.
-	 * Without this, the DSP halts and mixer settings are never processed.
-	 * Runs at 10 Hz via delayed_work. */
+	/* DSP service loop: periodic readback drain + mixer flush.  Without
+	 * this the DSP firmware halts and mixer settings never apply.
+	 * Runs at DSP_SERVICE_INTERVAL_MS via delayed_work. */
 	struct delayed_work dsp_service_work;
 	bool dsp_service_running;
 	unsigned int dsp_service_count;
@@ -685,33 +542,27 @@ struct uad2_dev {
 	struct snd_pcm_substream *playback_ss;
 	struct snd_pcm_substream *capture_ss;
 
-	/* Per-direction DMA position offsets for hw_ptr alignment.
-	 * When pcm_prepare is called while the transport is already running,
-	 * ALSA resets hw_ptr to 0 but the hardware DMA position counter is
-	 * at some arbitrary value.  We snapshot the hardware position at
-	 * prepare time and subtract it in .pointer() so that ALSA sees
-	 * positions starting from 0.
+	/* Per-direction DMA position offsets for hw_ptr alignment.  When
+	 * pcm_prepare runs while the transport is already going, ALSA
+	 * resets hw_ptr to 0 but REG_DMA_POSITION sits at some arbitrary
+	 * value.  We snapshot the HW position at prepare time and subtract
+	 * it in .pointer() so ALSA sees positions starting from 0.
 	 *
-	 * MUST be per-direction: if playback starts first (offset=0) and
-	 * capture opens later (offset=N), a shared offset would break
-	 * playback's pointer tracking → ALSA returns -EIO.
-	 *
-	 * Set to 0 on cold-start prepare (transport was stopped), set to
-	 * current REG_DMA_POSITION on hot re-prepare. */
+	 * MUST be per-direction.  A shared offset would break playback's
+	 * pointer tracking if capture opens later (capture's offset would
+	 * clobber playback's), causing ALSA to return -EIO. */
 	u32 play_pos_offset;
 	u32 rec_pos_offset;
 
-	/* Period elapsed polling timer.
-	 * The Apollo's hardware periodic timer IRQ (vector 0x46) is
-	 * unreliable — fires once then stops.  We use an hrtimer to
-	 * poll SAMPLE_POS and call snd_pcm_period_elapsed() at ~1ms.
-	 * Same approach as USB audio drivers (snd-usb-audio).
+	/* Period-elapsed polling timer.  The hardware periodic timer IRQ
+	 * (vector 0x46) is unreliable on Apollo (fires once then stops).
+	 * We poll REG_DMA_POSITION via hrtimer at ~1ms, same approach as
+	 * snd-usb-audio.
 	 *
-	 * cached_period_frames is the period_size the streams were
-	 * prepared with.  We cache it here so the hrtimer never has to
-	 * dereference snd_pcm_runtime — that struct may be freed by
-	 * the ALSA core under our feet (hw_free can race with the
-	 * timer between two ticks).  Updated from pcm_prepare. */
+	 * cached_period_frames is the period_size the streams were prepared
+	 * with.  Cached so the hrtimer never dereferences snd_pcm_runtime
+	 * (the ALSA core may free that struct between two ticks if hw_free
+	 * races with the timer). */
 	struct hrtimer period_timer;
 	bool period_timer_running;
 	snd_pcm_uframes_t cached_period_frames;
@@ -725,15 +576,9 @@ static unsigned int uad2_compute_buffer_frames(unsigned int play_ch,
 static void uad2_period_timer_stop(struct uad2_dev *dev);
 static void uad2_handle_notification(struct uad2_dev *dev);
 
-/* ============================================================
- * Low-level register accessors
- * Mirrors CUAOS::ReadReg / CUAOS::WriteReg
- *
- * When the Thunderbolt device is hot-unplugged, MMIO reads return
- * 0xFFFFFFFF.  The disconnecting flag is set early in uad2_remove()
- * so we can skip MMIO to a disappeared device.  In the IRQ handler
- * path we also check for the 0xFFFFFFFF sentinel.
- * ============================================================ */
+/* Low-level register accessors (mirror CUAOS::ReadReg / CUAOS::WriteReg).
+ * Hot-unplug yields 0xFFFFFFFF MMIO reads.  The disconnecting flag is
+ * set early in uad2_remove() so we can skip MMIO to a vanished device. */
 static inline u32 uad2_read32(struct uad2_dev *dev, u32 offset)
 {
 	if (unlikely(READ_ONCE(dev->disconnecting)))
@@ -754,15 +599,11 @@ static inline u32 uad2_fw_reg(struct uad2_dev *dev, u32 base_offset)
 	return (dev->channel_base_index << 2) + base_offset;
 }
 
-/* ============================================================
- * Mixer setting register offset (3-range formula)
- *
- * From open-apollo ua_apollo.h ua_mixer_setting_reg().
+/* Mixer setting register offset.  From open-apollo ua_apollo.h.
  * Settings live in 3 non-contiguous ranges within the 0x3800 window:
- *   Settings  0-15: base = 0x3800 + 0xB4 + index * 8
- *   Settings 16-31: base = 0x3800 + 0xBC + index * 8  (+8 gap)
- *   Settings 32-37: base = 0x3800 + 0xC0 + index * 8  (+4 more gap)
- * ============================================================ */
+ *   0..15:  base 0xB4 + index*8
+ *   16..31: base 0xBC + index*8 (8-byte gap)
+ *   32..37: base 0xC0 + index*8 (extra 4-byte gap). */
 static inline u32 uad2_mixer_setting_reg(unsigned int index)
 {
 	if (index <= 15)
@@ -773,22 +614,12 @@ static inline u32 uad2_mixer_setting_reg(unsigned int index)
 		return REG_MIXER_BASE + 0xC0 + index * MIXER_SETTING_STRIDE;
 }
 
-/* ============================================================
- * Mixer batch write protocol
- *
- * The DSP reads ALL 38 settings atomically on each SEQ_WR advance.
- * Ported from open-apollo ua_core.c ua_mixer_flush_settings().
- *
- * Protocol:
- *   1. Maintain cached val/mask arrays for all 38 settings
- *   2. On setting change: merge into cache, mark dirty
- *   3. On service tick: if dirty AND SEQ_RD == cached SEQ_WR,
- *      write ALL 38 settings to SRAM, then bump SEQ_WR once
- *
- * Word encoding per setting:
- *   wordA = (mask[15:0] << 16) | val[15:0]
- *   wordB = (mask[31:16] << 16) | val[31:16]
- * ============================================================ */
+/* Mixer batch write protocol.  Ported from open-apollo ua_core.c.
+ * Maintain cached val/mask arrays for all 38 settings; on each service
+ * tick, if dirty AND SEQ_RD == cached SEQ_WR, write all 38 settings
+ * to SRAM and bump SEQ_WR once.  The DSP reads them atomically.
+ * Per-setting encoding: wordA = (mask[15:0]<<16) | val[15:0],
+ * wordB = (mask[31:16]<<16) | val[31:16]. */
 static void __maybe_unused uad2_mixer_write_setting(struct uad2_dev *dev,
 						    unsigned int index,
 						    u32 value, u32 mask)
@@ -798,7 +629,6 @@ static void __maybe_unused uad2_mixer_write_setting(struct uad2_dev *dev,
 	if (!dev->mixer_ready)
 		return;
 
-	/* Merge into cache (read-modify-write with mask) */
 	dev->mixer_val[index] = (dev->mixer_val[index] & ~mask) |
 				(value & mask);
 	dev->mixer_mask[index] |= mask;
@@ -813,15 +643,12 @@ static void uad2_mixer_flush_settings(struct uad2_dev *dev)
 	if (!dev->mixer_ready || !dev->mixer_dirty)
 		return;
 
-	/* Check DSP idle: SEQ_RD must match our cached SEQ_WR */
 	seq_rd = uad2_read32(dev, REG_MIXER_SEQ_RD);
 	if (seq_rd != dev->mixer_seq_wr)
 		return; /* DSP still processing previous batch */
 
-	/* Write ALL 38 settings to SRAM registers.
-	 * Skip settings with no mask — preserves firmware defaults.
-	 * Val AND mask persist across flushes (DSP reads both on
-	 * every SEQ bump).  Do NOT clear mask after writing. */
+	/* Skip settings with no mask, preserving firmware defaults.
+	 * Val and mask persist across flushes; do NOT clear mask. */
 	for (i = 0; i < MIXER_BATCH_COUNT; i++) {
 		if (!dev->mixer_mask[i])
 			continue;
@@ -834,15 +661,15 @@ static void uad2_mixer_flush_settings(struct uad2_dev *dev)
 		uad2_write32(dev, reg + 4, word_b);
 	}
 
-	/* Single SEQ_WR bump for entire batch */
 	dev->mixer_seq_wr++;
 	uad2_write32(dev, REG_MIXER_SEQ_WR, dev->mixer_seq_wr);
 	dev->mixer_dirty = false;
 }
 
-/* Initialize mixer batch protocol after connect.
- * Sync SEQ counter, zero cache, activate capture routing.
- * From open-apollo ua_audio.c:1009-1072. */
+/* Initialize mixer batch protocol after connect.  From open-apollo
+ * ua_audio.c:1009-1072.  Do NOT write any settings here: the device
+ * persists all mixer/monitor/preamp/HP config across power cycles and
+ * TB reconnect, and writing would clobber user-configured values. */
 static void uad2_mixer_init(struct uad2_dev *dev)
 {
 	u32 seq_rd;
@@ -856,33 +683,18 @@ static void uad2_mixer_init(struct uad2_dev *dev)
 	dev->mixer_dirty = false;
 	dev->mixer_ready = true;
 
-	/* Don't write any mixer settings on init.
-	 *
-	 * The device persists all mixer/monitor/preamp/HP configuration
-	 * across power cycles and TB reconnect.  Writing settings here
-	 * clobbers user-configured values.
-	 *
-	 * The mixer batch protocol is ready for on-demand writes when
-	 * the user changes controls via ALSA kcontrols. */
-
 	dev_dbg(&dev->pci->dev,
 		"mixer init (SEQ=%u, device config preserved)\n", seq_rd);
 }
 
-/* ============================================================
- * DSP service loop — periodic readback drain + mixer flush
+/* DSP service loop: periodic readback drain + mixer flush.
  *
- * The Apollo DSP firmware needs periodic "servicing" from the host to
- * stay alive.  On macOS, the kext calls CDSPResourceManager::Service()
- * ~103/sec.  Without this, the DSP halts: front panel freezes, mixer
- * settings are written but never processed (SEQ_RD never advances).
- *
- * The readback drain cycle (read status→read data→write 0 to re-arm)
- * acts as the host liveness signal.  We run this at 100 Hz via
- * delayed_work.
- *
- * Ported from open-apollo ua_audio.c:434-539.
- * ============================================================ */
+ * The Apollo DSP firmware halts without periodic "servicing" from the
+ * host.  The macOS kext drives CDSPResourceManager::Service() ~103/sec;
+ * without it the front panel freezes and mixer SEQ_RD never advances.
+ * The readback drain cycle (read status, read data, write 0 to re-arm)
+ * acts as the host liveness signal.  Ported from open-apollo
+ * ua_audio.c:434-539. */
 static void uad2_dsp_service_handler(struct work_struct *work)
 {
 	struct uad2_dev *dev = container_of(to_delayed_work(work),
@@ -894,10 +706,8 @@ static void uad2_dsp_service_handler(struct work_struct *work)
 	if (READ_ONCE(dev->disconnecting) || !dev->dsp_service_running)
 		return;
 
-	/* Poll and clear notification status register.
-	 * If the DSP fires notifications and the host never clears them,
-	 * the DSP may stall.  This register is NOT write-1-to-clear;
-	 * write 0 to clear all bits. */
+	/* Notification register is NOT write-1-to-clear; write 0 to clear.
+	 * The DSP may stall if its notifications are never acknowledged. */
 	notif = uad2_read32(dev, notify_reg);
 	if (notif == 0xFFFFFFFF) {
 		/* Device gone (Thunderbolt hot-unplug) */
@@ -907,8 +717,7 @@ static void uad2_dsp_service_handler(struct work_struct *work)
 	if (notif)
 		uad2_write32(dev, notify_reg, 0x0);
 
-	/* Drain readback data (40 words from 0x3814, re-arm by writing
-	 * 0 to 0x3810).  This is the host liveness signal. */
+	/* Drain readback data and re-arm.  This is the host liveness signal. */
 	rb_status = uad2_read32(dev, REG_MIXER_RB_STATUS);
 	if (rb_status == 1) {
 		for (i = 0; i < MIXER_RB_WORDS; i++)
@@ -923,7 +732,6 @@ static void uad2_dsp_service_handler(struct work_struct *work)
 
 	dev->dsp_service_count++;
 
-	/* Reschedule */
 	if (dev->dsp_service_running)
 		schedule_delayed_work(
 			&dev->dsp_service_work,
@@ -953,16 +761,8 @@ static void uad2_dsp_service_stop(struct uad2_dev *dev)
 	cancel_delayed_work_sync(&dev->dsp_service_work);
 }
 
-/* ============================================================
- * Monitor parameter → DSP mixer setting routing
- *
- * Monitor params all write to setting[2] (monitor core) with per-param
- * bitmasks so they don't clobber each other.  The mask-based merge in
- * uad2_mixer_write_setting() handles concurrent updates.
- *
- * From open-apollo ua_core.c ua_monitor_set_param() and ua_apollo.h
- * UA_MON_PARAM_* defines.
- * ============================================================ */
+/* Monitor parameter routing.  All write to setting[2] (monitor core).
+ * From open-apollo ua_core.c ua_monitor_set_param() and ua_apollo.h. */
 #define MON_PARAM_LEVEL 0x01 /* Monitor volume: setting[2] bits[7:0] */
 #define MON_PARAM_MUTE 0x03 /* Mute: setting[2] bits[17:16] */
 #define MON_PARAM_SOURCE 0x04 /* Source: setting[2] bits[19:18]+[29] */
@@ -975,7 +775,6 @@ static void uad2_monitor_set_param(struct uad2_dev *dev, u32 param_id,
 {
 	u32 full_word;
 
-	/* Update state cache */
 	switch (param_id) {
 	case MON_PARAM_LEVEL:
 		dev->monitor.level = value & 0xFF;
@@ -993,32 +792,24 @@ static void uad2_monitor_set_param(struct uad2_dev *dev, u32 param_id,
 		return;
 	}
 
-	/* Rebuild the COMPLETE setting[2] word from cached state and
-	 * write with full mask (0xFFFFFFFF).  The DSP needs the entire
-	 * word committed to activate the monitor processing module —
-	 * partial-mask writes only update individual fields but don't
-	 * trigger the module to start processing audio. */
+	/* Rebuild the complete setting[2] word with full mask.  The DSP
+	 * activates the monitor processing module only on a full word
+	 * commit; partial-mask writes update fields but never trigger
+	 * the module to start processing audio. */
 	full_word = (dev->monitor.level & 0xFF); /* bits[7:0] */
-	/* bits[17:16]: mute encoding */
 	if (dev->monitor.mute == MON_MUTE_ON)
-		full_word |= 0x00010000;
+		full_word |= 0x00010000; /* bits[17:16]: mute encoding */
 	/* bits[19:18] + bit[29]: source */
 	full_word |= ((dev->monitor.source & 3) << 18) |
 		     (((dev->monitor.source >> 2) & 1) << 29);
-	/* bit[31]: dim */
 	if (dev->monitor.dim)
 		full_word |= BIT(31);
 
 	uad2_mixer_write_setting(dev, 2, full_word, 0xFFFFFFFF);
 }
 
-/* ============================================================
- * Preamp parameter → DSP mixer setting routing
- *
- * Preamp params route to mixer setting[param_id + 7].  Each param
- * gets its own dedicated setting index, so the mask is 0xFFFFFFFF.
- * From open-apollo hardware.py and kext SetMixerParam ch_type=1.
- * ============================================================ */
+/* Preamp parameter routing: setting[param_id + 7], full 0xFFFFFFFF mask.
+ * From open-apollo hardware.py and kext SetMixerParam ch_type=1. */
 #define PREAMP_PARAM_MIC_LINE 0x00 /* 0=Mic, 1=Line */
 #define PREAMP_PARAM_PAD 0x01
 #define PREAMP_PARAM_48V 0x03
@@ -1027,9 +818,8 @@ static void uad2_monitor_set_param(struct uad2_dev *dev, u32 param_id,
 #define PREAMP_PARAM_GAIN_A 0x06 /* First gain param (dB value) */
 #define PREAMP_SETTING_OFFSET 7 /* setting index = param_id + 7 */
 
-/* IEEE 754 float constants for phase invert */
-#define PHASE_NORMAL 0x3F800000 /* +1.0f */
-#define PHASE_INVERT 0xBF800000 /* -1.0f */
+#define PHASE_NORMAL 0x3F800000 /* IEEE 754 +1.0f */
+#define PHASE_INVERT 0xBF800000 /* IEEE 754 -1.0f */
 
 static void uad2_preamp_set_param(struct uad2_dev *dev, unsigned int ch,
 				  u32 param_id, u32 value)
@@ -1043,7 +833,6 @@ static void uad2_preamp_set_param(struct uad2_dev *dev, unsigned int ch,
 	if (setting_idx >= MIXER_BATCH_COUNT)
 		return;
 
-	/* Update state cache */
 	switch (param_id) {
 	case PREAMP_PARAM_MIC_LINE:
 		dev->preamp[ch].mic_line = !!value;
@@ -1071,18 +860,9 @@ static void uad2_preamp_set_param(struct uad2_dev *dev, unsigned int ch,
 	uad2_mixer_write_setting(dev, setting_idx, value, 0xFFFFFFFF);
 }
 
-/* ============================================================
- * Device detection — read serial prefix, look up model, set channels
- *
- * All Apollo Thunderbolt devices share PCI vendor 0x1A00, device 0x0002.
- * The model is identified by a 4-digit ASCII serial prefix read from
- * BAR0+0x20..0x2C.  The FPGA revision register (0x2218) bit 31
- * distinguishes v1 (clear) from v2 (set) firmware; v2 devices use
- * the extended capabilities register (0x2234) for DSP count.
- *
+/* Device detection: read serial prefix, look up model, set channels.
  * Ported from open-apollo ua_core.c ua_read_serial_type() and
- * ua_detect_capabilities().
- * ============================================================ */
+ * ua_detect_capabilities(). */
 static void uad2_detect_device(struct uad2_dev *dev)
 {
 	char serial[UA_REG_SERIAL_LEN + 1];
@@ -1091,22 +871,21 @@ static void uad2_detect_device(struct uad2_dev *dev)
 	u16 subsys;
 	int i;
 
-	/* Cache FPGA revision and detect firmware version */
 	dev->fpga_rev = uad2_read32(dev, REG_FPGA_REV);
 
-	/* Try PCI subsystem ID first — most reliable for known models.
-	 * Serial prefix detection is unreliable on some models (see
-	 * Apollo Solo false-match to x16D). */
+	/* Subsystem ID is the most reliable identifier for known models;
+	 * serial prefix detection mis-matches some models (Apollo Solo
+	 * contains "2032" which collides with x16D). */
 	subsys = dev->pci->subsystem_device;
 	switch (subsys) {
 	case UA_SUBSYS_SOLO:
 		dev->device_type = UA_DEV_APOLLO_SOLO;
-		dev_dbg(&dev->pci->dev, "subsystem 0x%04x → Apollo Solo\n",
+		dev_dbg(&dev->pci->dev, "subsystem 0x%04x is Apollo Solo\n",
 			subsys);
 		break;
 	case UA_SUBSYS_X4_QUAD:
 		dev->device_type = UA_DEV_APOLLO_X4;
-		dev_dbg(&dev->pci->dev, "subsystem 0x%04x → Apollo x4\n",
+		dev_dbg(&dev->pci->dev, "subsystem 0x%04x is Apollo x4\n",
 			subsys);
 		break;
 	default:
@@ -1130,16 +909,13 @@ static void uad2_detect_device(struct uad2_dev *dev)
 		dev_dbg(&dev->pci->dev, "ext_caps=0x%08x dsp=%u\n", ext_caps,
 			dev->dsp_count);
 
-		/* Read serial for logging */
 		for (i = 0; i < 4; i++)
 			regs[i] = uad2_read32(dev, UA_REG_SERIAL_BASE + i * 4);
 		memcpy(serial, regs, UA_REG_SERIAL_LEN);
 		serial[UA_REG_SERIAL_LEN] = '\0';
 		dev_dbg(&dev->pci->dev, "serial: %.16s\n", serial);
 
-		/* Serial prefix lookup only if subsystem ID didn't match.
-		 * Serial prefix is unreliable on some models (Apollo Solo
-		 * serial contains "2032" at offset 4 → false x16D match). */
+		/* Fall back to serial prefix only when subsystem ID missed */
 		if (!dev->device_type) {
 			for (i = 0; i < (int)ARRAY_SIZE(ua_serial_table); i++) {
 				if (!strncmp(serial + 4,
@@ -1147,7 +923,7 @@ static void uad2_detect_device(struct uad2_dev *dev)
 					dev->device_type =
 						ua_serial_table[i].device_type;
 					dev_dbg(&dev->pci->dev,
-						"serial prefix → %s\n",
+						"serial prefix is %s\n",
 						ua_device_name(
 							dev->device_type));
 					break;
@@ -1184,22 +960,17 @@ found:
 		 dev->rec_channels, dev->buffer_frames);
 }
 
-/* ============================================================
- * PCIe setup: disable ASPM, increase completion timeouts
+/* PCIe setup: disable ASPM, increase completion timeouts.
  *
- * The Thunderbolt bridge chain may put the PCIe link to sleep via
- * ASPM (Active State Power Management).  When the link is in L1,
- * MMIO reads stall for up to 10 seconds (PCIe completion timeout).
- * The DSP service loop reads BAR0 every 10ms — if the link sleeps,
- * these reads stall and can cascade into a system freeze.
+ * The Thunderbolt bridge chain may park the PCIe link in L1 via ASPM.
+ * MMIO reads then stall for up to 10 seconds (PCIe completion timeout).
+ * Since the DSP service loop reads BAR0 every 10ms, a sleeping link
+ * cascades into a system freeze.
  *
- * This walks the bridge chain from the device up to the root port,
- * disabling ASPM (LNKCTL bits[1:0]=0) and setting completion
- * timeout to range D (65-210ms) on each hop.
- *
- * Ported from open-apollo ua_audio.c ua_pcie_setup().
- * Called once from probe after BAR mapping.
- * ============================================================ */
+ * Walks the bridge chain from device to root port, clearing LNKCTL
+ * bits[1:0] and setting completion timeout to range D (65-210ms).
+ * Ported from open-apollo ua_audio.c ua_pcie_setup().  Called once
+ * from probe after BAR mapping. */
 static void uad2_pcie_setup(struct uad2_dev *dev)
 {
 	int pos;
@@ -1290,9 +1061,7 @@ static void uad2_pcie_setup(struct uad2_dev *dev)
 	dev_dbg(&dev->pci->dev, "PCIe ASPM/timeout setup complete\n");
 }
 
-/* ============================================================
- * Sample rate helpers
- * ============================================================ */
+/* Sample rate helpers */
 static u8 uad2_rate_to_enum(unsigned int rate)
 {
 	switch (rate) {
@@ -1313,24 +1082,19 @@ static u8 uad2_rate_to_enum(unsigned int rate)
 	}
 }
 
-/*
- * CPcieAudioExtension::_setSampleClock @ line 72712 (arm64 0x4DE70)
+/* CPcieAudioExtension::_setSampleClock @ line 72712 (arm64 0x4DE70).
  *
- * Kext flow (verified against arm64 disassembly):
- *   1. Compute clock_val = clock_source | (rate_enum << 8)
- *   2. Write clock_val to BAR + (channel_base_index * 4) + 0xC04C
- *   3. Write 0x4 to REG_STREAM_ENABLE (trigger clock change)
- *   4. Wait 2000 ms on this+0x2838 (signaled by notification ISR
- *      from bit 5)
+ * Kext flow: compute clock_val = clock_source | (rate_enum << 8), write
+ * to BAR + (channel_base_index * 4) + 0xC04C, write 0x4 to
+ * REG_STREAM_ENABLE, then wait 2000 ms on a completion signaled by the
+ * notification ISR (bit 5).
  *
- * On Apollo's Thunderbolt-tunneled PCIe, MSI delivery is unreliable
- * (verified empirically: /proc/interrupts shows ~7 IRQs per session
- * even during active playback that streams continuously).  Waiting on
- * a completion signaled from the notification ISR therefore times out
- * almost every time.  Instead, poll the notification register directly
+ * Apollo's Thunderbolt-tunneled PCIe drops MSIs (verified empirically:
+ * /proc/interrupts shows ~7 IRQs per session even during continuous
+ * playback).  Waiting on the IRQ-signaled completion therefore times
+ * out almost every time, so we poll the notification register directly
  * every 10 ms for the rate-change ack (bits 22, 4 or 5), exactly like
- * open-apollo's ua_audio_set_clock (ua_audio.c:1835).
- */
+ * open-apollo's ua_audio_set_clock (ua_audio.c:1835). */
 #define UAD2_RATE_ACK_BITS \
 	(NOTIFY_RATE_CHANGE | NOTIFY_DMA_READY | NOTIFY_CONNECT_ACK)
 #define UAD2_RATE_POLL_TIMEOUT_MS 2000
@@ -1400,17 +1164,11 @@ static int uad2_set_sample_rate(struct uad2_dev *dev, unsigned int rate)
 	return 0;
 }
 
-/* ============================================================
- * _recomputeBufferFrameSize equivalent @ 0x4d9e0 (line 72414)
- *
- * Formula: floor_pow2(0x400000 / (max(play_ch, rec_ch) * 4) / 2)
- * Capped at 0x2000 (8192 frames).
- *
- * Kext at 0x4DA1C: ubfx x8, x8, #1, #31 — divides by 2 BEFORE CLZ.
- *
- * For Apollo Solo with 42 play / 32 rec:
- *   0x400000 / (42 * 4) = 24966, /2 = 12483 → floor_pow2 = 8192
- * ============================================================ */
+/* _recomputeBufferFrameSize equivalent @ 0x4d9e0 (line 72414).
+ * floor_pow2(0x400000 / (max(play_ch, rec_ch) * 4) / 2), cap 0x2000.
+ * Kext at 0x4DA1C uses ubfx x8, x8, #1, #31 (divides by 2 before CLZ).
+ * Apollo Solo 42 play / 32 rec yields 0x400000/(42*4)=24966, /2=12483,
+ * floor_pow2 = 8192. */
 static unsigned int uad2_compute_buffer_frames(unsigned int play_ch,
 					       unsigned int rec_ch)
 {
@@ -1437,32 +1195,19 @@ static unsigned int uad2_compute_buffer_frames(unsigned int play_ch,
 	return raw_frames;
 }
 
-/* ============================================================
- * Interrupt vector enable/disable
+/* Interrupt vector enable/disable.
  *
- * The kext maintains a vector_to_slot[72] lookup table at
- * IntrManager+0x4D0 that maps logical vector IDs to bit slot indices
- * within the u64 intr_enable_shadow:
+ * Kext keeps a vector_to_slot[72] lookup at IntrManager+0x4D0 that maps
+ * logical vector IDs to bit slot indices in the u64 intr_enable_shadow.
+ * Slot assignments used here:
+ *   vector 0x28 (notify)   = slot 32 (bit 0 of DMA1)
+ *   vector 0x46 (periodic) = slot 62 (bit 30 of DMA1)
+ *   vector 0x47 (endbuf)   = slot 63 (bit 31 of DMA1)
  *
- *   vector 0x28 (notify)   → slot 32   (bit 0 of DMA1)
- *   vector 0x46 (periodic) → slot 62   (bit 30 of DMA1)
- *   vector 0x47 (endbuf)   → slot 63   (bit 31 of DMA1)
- *
- * Shadow bits  0-31 → DMA0 registers (0x2204 ctrl, 0x2208 status)
- * Shadow bits 32-63 → DMA1 registers (0x2268 ctrl, 0x2264 status)
- *
- * For Apollo Solo all three vectors map to slots > 31, so
- * has_extended_irq must be true and DMA1 registers must be accessed.
- *
- * EnableVector(slot, arm):
- *   shadow |= (1 << slot)
- *   if arm: write (1 << slot) to status register (re-arm)
- *   write shadow to ctrl register (enable mask)
- *
- * DisableVector(slot):
- *   shadow &= ~(1 << slot)
- *   write shadow to ctrl register
- * ============================================================ */
+ * Shadow bits 0-31 drive DMA0 registers (0x2204 ctrl, 0x2208 status);
+ * bits 32-63 drive DMA1 registers (0x2268 ctrl, 0x2264 status).  All
+ * three vectors on Apollo Solo map to slot > 31, so has_extended_irq
+ * must be set and DMA1 registers used. */
 /* Internal: caller must hold dev->lock */
 static void __uad2_enable_vector_locked(struct uad2_dev *dev, unsigned int slot,
 					bool arm)
@@ -1518,17 +1263,14 @@ static void uad2_disable_vector(struct uad2_dev *dev, unsigned int slot)
 	spin_unlock_irqrestore(&dev->lock, flags);
 }
 
-/* Interrupt slot indices — mapped from kext vector_to_slot[] table:
- *   vector 0x28 → slot 32,  vector 0x46 → slot 62,  vector 0x47 → slot 63 */
+/* Interrupt slot indices from kext vector_to_slot[].
+ * vector 0x28 = slot 32, 0x46 = slot 62, 0x47 = slot 63. */
 #define INTR_SLOT_NOTIFY 32 /* notification interrupt (vector 0x28) */
 #define INTR_SLOT_PERIODIC 62 /* periodic timer interrupt (vector 0x46) */
 #define INTR_SLOT_ENDBUF 63 /* end-of-buffer interrupt (vector 0x47) */
 
-/* ============================================================
- * CPcieIntrManager::ProgramRegisters equivalent
- * Clears DMA interrupt and status registers.
- * Called only during probe (sequential init), no locking needed.
- * ============================================================ */
+/* CPcieIntrManager::ProgramRegisters equivalent.  Clears DMA interrupt
+ * and status registers.  Called only from probe; no locking needed. */
 static void uad2_intr_program(struct uad2_dev *dev)
 {
 	uad2_write32(dev, REG_DMA0_INTR_CTRL, 0x0);
@@ -1542,19 +1284,13 @@ static void uad2_intr_program(struct uad2_dev *dev)
 	dev->intr_enable_shadow = 0;
 }
 
-/* ============================================================
- * CPcieIntrManager::ResetDMAEngines equivalent @ 0x134b8
+/* CPcieIntrManager::ResetDMAEngines equivalent @ 0x134b8.
  *
- * Reset pulse sequence from kext:
- *   1. AND shadow with mask to clear DMA channel enable bits
- *      (preserving bit 0 = global master enable)
- *   2. Write shadow | reset_bits  — asserts reset
- *   3. Write shadow alone        — deasserts reset
- *   4. Read-back flush
- *
- * Shadow is initialized to DMA_CTRL_MASTER_ENABLE (0x1) by
- * CPcieIntrManager::Initialize (dump line 11571: str w8,[x19,#0x4bc])
- * ============================================================ */
+ * Reset pulse: mask shadow to clear DMA channel enable bits (keep bit 0,
+ * the global master enable), write shadow | reset_bits to assert reset,
+ * write shadow alone to deassert, then read-back to flush.  Shadow is
+ * initialized to DMA_CTRL_MASTER_ENABLE (0x1) by
+ * CPcieIntrManager::Initialize (dump line 11571: str w8,[x19,#0x4bc]). */
 static void uad2_dma_reset(struct uad2_dev *dev)
 {
 	u32 reset_bits, mask;
@@ -1581,13 +1317,9 @@ static void uad2_dma_reset(struct uad2_dev *dev)
 	uad2_read32(dev, REG_DMA_MASTER_CTRL);
 }
 
-/* ============================================================
- * CPcieIntrManager::EnableDMA equivalent @ 0x13a4c
- *
- * Sets bit (1 << (dsp_index + 1)) in shadow register, writes to
- * REG_DMA_MASTER_CTRL.  Bit 0 is reserved (global master enable).
- * dsp_index must be < 64.
- * ============================================================ */
+/* CPcieIntrManager::EnableDMA equivalent @ 0x13a4c.
+ * Sets bit (1 << (dsp_index + 1)) in shadow.  Bit 0 reserved
+ * (global master enable).  dsp_index must be < 64. */
 static void uad2_enable_dma(struct uad2_dev *dev, unsigned int dsp_index)
 {
 	u32 bit;
@@ -1600,32 +1332,22 @@ static void uad2_enable_dma(struct uad2_dev *dev, unsigned int dsp_index)
 	uad2_write32(dev, REG_DMA_MASTER_CTRL, dev->dma_ctrl_shadow);
 }
 
-/* ============================================================
- * CPcieDSP::_waitFor469ToStart equivalent @ 0x1152c
+/* CPcieDSP::_waitFor469ToStart equivalent @ 0x1152c.
  *
- * Polls dsp_poll_base+0x1A4 waiting for DSP firmware to boot.
- * dsp_poll_base is a SEPARATE address from ring_base:
- *   ring_base     = BAR + {0x2000|0x5e00} + dsp_index*0x80  (DMA rings)
- *   dsp_poll_base = BAR + (dsp_index > 3 ? 0x2000 : 0) + dsp_index*0x800
+ * Polls dsp_poll_base+0x1A4 for DSP firmware boot.  dsp_poll_base is
+ * a SEPARATE address from ring_base:
+ *   ring_base     = BAR + (n<4 ? 0x2000 : 0x5e00) + n*0x80 (DMA rings)
+ *   dsp_poll_base = BAR + (n>3 ? 0x2000 : 0) + n*0x800
+ * DSP 0 polls BAR+0x1A4; DSP 1 polls BAR+0x9A4.
  *
- * For DSP 0: poll_base = BAR+0x000, polls BAR+0x1A4
- * For DSP 1: poll_base = BAR+0x800, polls BAR+0x9A4
+ * Called when dsp_type == 1 (from GetCapabilities) and this+0x18 == 0
+ * (first-time init flag).  DSP 0 gets 100 attempts, others 10.
  *
- * Condition: called when dsp_type == 1 (from GetCapabilities)
- *   and this+0x18 == 0 (first-time init flag).
- *   dsp_index == 0 gets 100 attempts, others get 10.
- *
- * CORRECTED LOGIC (from careful arm64+x86_64 trace):
- * The kext loop treats BOTH 0 AND DSP_READY_SIG as "not ready yet" —
- * it keeps polling on either.  The loop only exits early when the value
- * is non-zero AND not equal to DSP_READY_SIG.  After the loop ends
- * (either by early exit or counter exhaustion), the final success check
- * is `val & 1` — bit 0 must be set for success.
- *
- * This suggests the DSP boot sequence is:
- *   0x00000000 (not started) → 0xa8caed0f (booting) → final_val (ready)
- * where final_val has bit 0 set.
- * ============================================================ */
+ * Kext loop treats both 0 AND DSP_READY_SIG as "still booting"; it
+ * exits early only when val is non-zero AND not DSP_READY_SIG.  Final
+ * success check is `val & 1`, so the DSP boot sequence runs
+ * 0x00000000 (not started), 0xa8caed0f (booting), final_val (ready)
+ * where final_val has bit 0 set. */
 static int uad2_dsp_wait_ready(struct uad2_dev *dev,
 			       void __iomem *dsp_poll_base, int dsp_index)
 {
@@ -1636,16 +1358,12 @@ static int uad2_dsp_wait_ready(struct uad2_dev *dev,
 
 	for (i = 0; i < max_attempts; i++) {
 		val = ioread32(dsp_poll_base + DSP_READY_POLL_OFF);
-
-		/* Kext exits loop immediately on non-zero, non-DSP_READY_SIG.
-		 * Both 0 and DSP_READY_SIG mean "still booting". */
 		if (val != 0 && val != DSP_READY_SIG)
 			break;
-
 		msleep(DSP_POLL_INTERVAL_MS);
 	}
 
-	/* Kext final success check: bit 0 of last read value must be set.
+	/* Final success check: bit 0 must be set.
 	 * arm64: tbnz w20, #0x0, <success>
 	 * x86_64: testb $0x1, %r13b; jne <success> */
 	if (val & 1)
@@ -1657,19 +1375,12 @@ static int uad2_dsp_wait_ready(struct uad2_dev *dev,
 	return -ETIMEDOUT;
 }
 
-/* ============================================================
- * CPcieRingBuffer::ProgramRegisters equivalent @ 0x14c48
+/* CPcieRingBuffer::ProgramRegisters equivalent @ 0x14c48.
  *
- * Programs one ring buffer with 4 DMA descriptor pages:
- *   1. Read hardware ring capacity from ring_base+0x28, cap at 0x400
- *   2. Write ring_size to ring_base+0x24 (ring size register)
- *   3. Write ring_size to ring_base+0x20 (descriptor count register)
- *   4. For each of 4 descriptor slots:
- *      - Get physical address of page (i * 0x1000)
- *      - Write low 32 bits to ring_base + (i * 8)
- *      - Write high 32 bits to ring_base + (i * 8) + 4
- *      - Read back both and verify match
- * ============================================================ */
+ * Programs one ring buffer with 4 DMA descriptor pages: read ring
+ * capacity (cap at 0x400), write ring_size to size and count regs,
+ * then for each of 4 descriptor slots write low/high 32-bit phys
+ * addresses and read back to verify. */
 static int uad2_ring_program(struct uad2_dev *dev, void __iomem *ring_base,
 			     dma_addr_t dma_addr, int ring_idx)
 {
@@ -1722,10 +1433,8 @@ static int uad2_ring_program(struct uad2_dev *dev, void __iomem *ring_base,
 	return 0;
 }
 
-/* ============================================================
- * CPcieDSP::ProgramRegisters equivalent @ 0x1124c
- * Sets up command/response ring buffer addresses for one DSP
- * ============================================================ */
+/* CPcieDSP::ProgramRegisters equivalent @ 0x1124c.  Sets up command/
+ * response ring buffer addresses for one DSP. */
 static int uad2_dsp_program(struct uad2_dev *dev, int dsp_index)
 {
 	void __iomem *ring_base;
@@ -1734,7 +1443,6 @@ static int uad2_dsp_program(struct uad2_dev *dev, int dsp_index)
 	dma_addr_t ring_dma;
 	int err;
 
-	/* Compute ring base within BAR (for DMA ring buffer programming) */
 	if (dsp_index < 4)
 		ring_base = dev->bar + DSP_RING_BASE_LOW +
 			    (dsp_index * DSP_RING_STRIDE);
@@ -1744,27 +1452,18 @@ static int uad2_dsp_program(struct uad2_dev *dev, int dsp_index)
 
 	ring2_base = ring_base + DSP_RING2_OFFSET;
 
-	/* Compute DSP poll base (SEPARATE from ring_base):
-	 *   For dsp_index < 4:  BAR + dsp_index * 0x800
-	 *   For dsp_index >= 4: BAR + 0x2000 + dsp_index * 0x800 */
+	/* DSP poll base is a SEPARATE address from ring_base */
 	if (dsp_index < 4)
 		dsp_poll_base = dev->bar + (dsp_index * 0x800);
 	else
 		dsp_poll_base = dev->bar + 0x2000 + (dsp_index * 0x800);
 
-	/* Wait for DSP firmware.
-	 * Kext condition: dsp_type == 1 && this+0x18 == 0.
-	 * For Apollo Solo (1 DSP, dsp_index=0), dsp_type from GetCapabilities
-	 * is expected to be 1.  We always wait on first init. */
 	err = uad2_dsp_wait_ready(dev, dsp_poll_base, dsp_index);
 	if (err)
 		return err;
 
-	/*
-	 * Allocate DMA pages for ring descriptors (4 x 4KB = 16KB per ring).
-	 * In the kext, these are IOBufferMemoryDescriptor pages obtained via
-	 * getPhysicalSegment(offset) where offset = i * 0x1000.
-	 */
+	/* DMA pages for ring descriptors (4 x 4KB = 16KB per ring).  Kext
+	 * uses IOBufferMemoryDescriptor pages from getPhysicalSegment(i*0x1000). */
 	if (!dev->ring_dma_buf[0]) {
 		dev->ring_dma_buf[0] = dma_alloc_coherent(
 			&dev->pci->dev,
@@ -1775,23 +1474,19 @@ static int uad2_dsp_program(struct uad2_dev *dev, int dsp_index)
 	}
 	ring_dma = dev->ring_dma_addr[0];
 
-	/* Program ring 0 */
 	err = uad2_ring_program(dev, ring_base, ring_dma, 0);
 	if (err)
 		return err;
 
-	/* Program ring 1 (second ring at +0x40) */
 	err = uad2_ring_program(dev, ring2_base, ring_dma, 1);
 	if (err)
 		return err;
 
-	/* Enable DMA for this DSP (CPcieIntrManager::EnableDMA) */
 	uad2_enable_dma(dev, dsp_index);
 
-	/* Enable DSP interrupt vectors (CPcieDSP::Initialize @ 0x10CC0).
-	 * For dsp_index N, the kext enables vectors N*5+2, N*5+3, N*5+4
-	 * which handle message FIFO service and error callbacks.
-	 * Vectors 0-39 use identity mapping (slot = vector ID). */
+	/* Enable DSP message FIFO service + error callbacks
+	 * (CPcieDSP::Initialize @ 0x10CC0).  Vectors 0-39 use identity
+	 * mapping (slot = vector ID). */
 	uad2_enable_vector(dev, dsp_index * 5 + 2, true);
 	uad2_enable_vector(dev, dsp_index * 5 + 3, true);
 	uad2_enable_vector(dev, dsp_index * 5 + 4, true);
@@ -1799,13 +1494,9 @@ static int uad2_dsp_program(struct uad2_dev *dev, int dsp_index)
 	return 0;
 }
 
-/* ============================================================
- * Allocate the two 4MB DMA buffers for audio streaming.
- *
- * MapHardware @ 0x4ba0c (line 70355):
- *   CUAOS::AllocDMABuffer(0x400000, 2, 0, task)  -- called twice
- *   Stored at this+0x28a0 (playback) and this+0x28a8 (capture)
- * ============================================================ */
+/* Two 4MB DMA buffers for audio streaming.  MapHardware @ 0x4ba0c
+ * (line 70355) calls CUAOS::AllocDMABuffer(0x400000, 2, 0, task) twice
+ * and stores them at this+0x28a0 (playback) and this+0x28a8 (capture). */
 static int uad2_alloc_sg_buffers(struct uad2_dev *dev)
 {
 	int i;
@@ -1819,7 +1510,6 @@ static int uad2_alloc_sg_buffers(struct uad2_dev *dev)
 		if (!dev->sg_dma_buf[i]) {
 			dev_err(&dev->pci->dev,
 				"Failed to allocate 4MB DMA buffer %d\n", i);
-			/* Free already-allocated buffer */
 			if (i > 0 && dev->sg_dma_buf[0]) {
 				dma_free_coherent(&dev->pci->dev,
 						  dev->sg_buf_size,
@@ -1829,7 +1519,6 @@ static int uad2_alloc_sg_buffers(struct uad2_dev *dev)
 			}
 			return -ENOMEM;
 		}
-		/* dma_alloc_coherent returns zeroed memory */
 	}
 
 	return 0;
@@ -1849,18 +1538,12 @@ static void uad2_free_sg_buffers(struct uad2_dev *dev)
 	}
 }
 
-/* ============================================================
- * CPcieAudioExtension::ProgramRegisters equivalent @ 0x4bac0
+/* CPcieAudioExtension::ProgramRegisters equivalent @ 0x4bac0.
  *
- * Full sequence (decoded from lines 70401-70631):
- * 1. Check and clear transport status (BAR+0x2248)
- * 2. Program scatter-gather tables:
- *    - 1024 iterations (sg_offset 0x8000..0x9FF8, step 8)
- *    - Each iter: write 64-bit phys addr for playback page to BAR+sg_offset
- *    - Each iter: write 64-bit phys addr for capture page to BAR+sg_offset+0x2000
- * 3. Read firmware base from BAR+0x30/0x34
- * 4. Enable interrupt vector 0x28
- * ============================================================ */
+ * Decoded from kext lines 70401-70631: clear transport status, program
+ * scatter-gather tables (1024 iterations, sg_offset 0x8000..0x9FF8 step
+ * 8, writing 64-bit phys addrs for playback and capture pages), read
+ * firmware base from BAR+0x30/0x34, then enable interrupt vector 0x28. */
 static int uad2_audio_ext_program(struct uad2_dev *dev)
 {
 	u32 status;
@@ -1868,35 +1551,26 @@ static int uad2_audio_ext_program(struct uad2_dev *dev)
 	u32 dma_offset;
 	dma_addr_t play_page, cap_page;
 
-	/* Verify SG buffers are allocated */
 	if (!dev->sg_dma_buf[0] || !dev->sg_dma_buf[1]) {
 		dev_err(&dev->pci->dev, "SG DMA buffers not allocated\n");
 		return -EINVAL;
 	}
 
-	/* Phase 1: Check and clear transport status (exact kext sequence) */
+	/* Phase 1: clear transport status (exact kext sequence) */
 	status = uad2_read32(dev, REG_TRANSPORT_CTL);
-	if (status & BIT(5)) {
-		/* Read-to-clear the pending status latch */
-		uad2_read32(dev, REG_DMA_POSITION);
-	}
+	if (status & BIT(5))
+		uad2_read32(dev, REG_DMA_POSITION); /* read-to-clear latch */
 	uad2_write32(dev, REG_TRANSPORT_CTL, 0x0);
 
-	/* Phase 2: Program scatter-gather tables
-	 * Loop: sg_offset = 0x8000, dma_offset = 0
-	 *        sg_offset += 8,    dma_offset += 0x1000
-	 *        until sg_offset == 0xA000 (1024 iterations)
-	 */
+	/* Phase 2: program scatter-gather tables */
 	sg_offset = REG_SG_TABLE_A_BASE;
 	dma_offset = 0;
 
 	while (sg_offset != REG_SG_TABLE_A_END) {
-		/* Buffer A (playback): write to BAR + sg_offset */
 		play_page = dev->sg_dma_addr[0] + dma_offset;
 		uad2_write32(dev, sg_offset, lower_32_bits(play_page));
 		uad2_write32(dev, sg_offset + 4, upper_32_bits(play_page));
 
-		/* Buffer B (capture): write to BAR + sg_offset + 0x2000 */
 		cap_page = dev->sg_dma_addr[1] + dma_offset;
 		uad2_write32(dev, sg_offset + REG_SG_TABLE_B_OFFSET,
 			     lower_32_bits(cap_page));
@@ -1907,39 +1581,32 @@ static int uad2_audio_ext_program(struct uad2_dev *dev)
 		sg_offset += SG_ENTRY_SIZE;
 	}
 
-	/* Phase 3: Read firmware base address (BAR+0x30 lo, BAR+0x34 hi) */
+	/* Phase 3: read firmware base (BAR+0x30 lo, BAR+0x34 hi) */
 	dev->fw_base_addr = ((u64)uad2_read32(dev, REG_FW_BASE_HI) << 32) |
 			    uad2_read32(dev, REG_FW_BASE_LO);
-	/* Phase 4: Enable interrupt vector 0x28 (notification interrupt)
-	 *
-	 * In the kext, this calls CPcieIntrManager::EnableVector(0x28, 1).
-	 * This arms the vector in the DMA interrupt controller and updates
-	 * the enable shadow bitmask. */
+
+	/* Phase 4: arm notification interrupt (kext EnableVector(0x28, 1)) */
 	uad2_write32(dev, REG_INTR_ENABLE, 0xFFFFFFFF);
 	uad2_enable_vector(dev, INTR_SLOT_NOTIFY, true);
 
 	return 0;
 }
 
-/* ============================================================
- * _handleNotificationInterrupt equivalent @ 0x4c154 (line 70824)
+/* _handleNotificationInterrupt equivalent @ 0x4c154 (line 70824).
  *
  * Reads notification bitmask from BAR+(channel_base_index<<2)+0xC008,
- * dispatches events, then writes 0 to clear.
- *
- * Full event dispatch (from analysis of lines 70824-71446):
- *   bit 5:  Connect ack     → signal connect_event
- *   bit 21: Channel config  → copy config from BAR+0xC000, force bits 0+1
- *   bit 0:  Playback ready  → copy playback IO desc from BAR+0xC2C4
- *   bit 1:  Record ready    → copy record IO desc from BAR+0xC1A4
- *   bit 22: Rate change     → read BAR+0xC05C/0xC054
- *   bit 4:  DMA ready       → read BAR+0xC054/0xC058/0xC05C
- *   bit 6:  Error           → log only
- *   bit 21: (second pass)   → signal notify_event (wakes Connect())
- *   bit 7:  End buffer      → (unused for now)
- *   bit 0|1: combined       → (callback)
- *   Finally: write 0 to clear notification register
- * ============================================================ */
+ * dispatches events, then writes 0 to clear.  Event dispatch from
+ * kext lines 70824-71446:
+ *   bit 5  CONNECT_ACK    signals connect_event
+ *   bit 21 CHAN_CONFIG    copies config from BAR+0xC000, forces bits 0+1+22
+ *   bit 0  PLAYBACK_IO    copies 72 DWORDs from BAR+0xC2C4
+ *   bit 1  RECORD_IO      copies 72 DWORDs from BAR+0xC1A4
+ *   bit 22 RATE_CHANGE    reads BAR+0xC05C/0xC054
+ *   bit 4  DMA_READY      reads BAR+0xC054/0xC058/0xC05C
+ *   bit 6  ERROR          logged
+ *   bit 21 (second pass)  signals notify_event (wakes Connect())
+ *   bit 7  END_BUFFER     unused
+ * Finally write 0 to clear the notification register. */
 static void uad2_handle_notification(struct uad2_dev *dev)
 {
 	u32 status;
@@ -1948,7 +1615,7 @@ static void uad2_handle_notification(struct uad2_dev *dev)
 
 	spin_lock_irqsave(&dev->notify_lock, flags);
 
-	/* Check connected flag (mirrors kext this+0x2898 check) */
+	/* connected mirror of kext this+0x2898 check */
 	if (!READ_ONCE(dev->connected)) {
 		spin_unlock_irqrestore(&dev->notify_lock, flags);
 		return;
@@ -1962,36 +1629,29 @@ static void uad2_handle_notification(struct uad2_dev *dev)
 
 	dev->notify_status = status;
 
-	/* Bit 5 (CONNECT_ACK): fired by the firmware on connect.  The
-	 * rate-change path does not wait on this; it polls notify_status
-	 * directly because TB-tunneled MSI is unreliable.  See
-	 * uad2_set_sample_rate. */
+	/* CONNECT_ACK fires on connect.  The rate-change path polls
+	 * notify_status instead of waiting because TB-tunneled MSI is
+	 * unreliable.  See uad2_set_sample_rate. */
 	if (status & NOTIFY_CONNECT_ACK)
 		complete(&dev->connect_event);
 
-	/* Bit 21: Channel config — kext copies 10 DWORDs from BAR+0xC000,
-	 * then forces bits 0, 1, AND 22 on (ORs 0x400003) to trigger
-	 * IO descriptor re-reads and rate change handling. */
+	/* CHAN_CONFIG: kext ORs 0x400003 to force IO descriptor re-reads
+	 * and rate change handling after copying the config block. */
 	if (status & NOTIFY_CHAN_CONFIG) {
 		int i;
 
-		/* Copy 10 DWORDs of channel config from BAR+0xC000 */
 		for (i = 0; i < CHAN_CONFIG_DWORDS; i++)
 			dev->chan_config[i] = uad2_read32(
 				dev, REG_CHAN_CONFIG_BASE + (i * 4));
 
-		/* Force playback + record IO ready + rate change processing */
 		status |= NOTIFY_PLAYBACK_IO | NOTIFY_RECORD_IO |
 			  NOTIFY_RATE_CHANGE;
 	}
 
-	/* Bit 0: Playback IO ready — kext copies 72 DWORDs from BAR+0xC2C4 */
 	if (status & NOTIFY_PLAYBACK_IO) {
 		u32 play_ch;
 		int i;
 
-		/* Full IO descriptor copy (72 DWORDs = 288 bytes).
-		 * Matches kext behavior of copying the entire block. */
 		for (i = 0; i < IO_DESC_DWORDS; i++)
 			dev->play_io_desc[i] = uad2_read32(
 				dev, REG_PLAYBACK_IO_DESC + (i * 4));
@@ -2002,75 +1662,55 @@ static void uad2_handle_notification(struct uad2_dev *dev)
 			WRITE_ONCE(dev->play_channels, play_ch);
 	}
 
-	/* Bit 1: Record IO ready — kext copies 72 DWORDs from BAR+0xC1A4 */
 	if (status & NOTIFY_RECORD_IO) {
 		u32 rec_ch;
 		int i;
 
-		/* Full IO descriptor copy */
 		for (i = 0; i < IO_DESC_DWORDS; i++)
 			dev->rec_io_desc[i] =
 				uad2_read32(dev, REG_RECORD_IO_DESC + (i * 4));
 
-		/* Channel count is at DWORD[4] */
 		rec_ch = dev->rec_io_desc[4];
 		if (rec_ch > 0 && rec_ch <= 128)
 			WRITE_ONCE(dev->rec_channels, rec_ch);
 	}
 
-	/* Bit 22: Rate change.  The firmware expects the host to read
-	 * REG_NOTIF_RATE_INFO and REG_NOTIF_CLOCK_INFO as ack. */
+	/* Firmware expects ack reads on rate change and DMA ready */
 	if (status & NOTIFY_RATE_CHANGE) {
 		uad2_read32(dev, uad2_fw_reg(dev, REG_NOTIF_RATE_INFO));
 		uad2_read32(dev, uad2_fw_reg(dev, REG_NOTIF_CLOCK_INFO));
 	}
 
-	/* Bit 4: DMA ready.  Read transport and clock info. */
 	if (status & NOTIFY_DMA_READY) {
 		uad2_read32(dev, uad2_fw_reg(dev, REG_NOTIF_RATE_INFO));
 		uad2_read32(dev, uad2_fw_reg(dev, REG_NOTIF_XPORT_INFO));
 		uad2_read32(dev, uad2_fw_reg(dev, REG_NOTIF_CLOCK_INFO));
 	}
 
-	/* Bit 6: Error */
-	if (status & NOTIFY_ERROR) {
+	if (status & NOTIFY_ERROR)
 		dev_warn(&dev->pci->dev, "Firmware error notification\n");
-	}
 
-	/* Bit 21 (second pass): Signal notify_event — wakes Connect() */
-	if (status & NOTIFY_CHAN_CONFIG) {
+	/* CHAN_CONFIG second pass wakes Connect() */
+	if (status & NOTIFY_CHAN_CONFIG)
 		complete(&dev->notify_event);
-	}
 
-	/* Clear the notification register (write-to-clear) */
 	uad2_write32(dev, notify_reg, 0x0);
 
 	spin_unlock_irqrestore(&dev->notify_lock, flags);
 }
 
-/* ============================================================
- * CPcieAudioExtension::Connect equivalent @ 0x4be58 (line 70632)
+/* CPcieAudioExtension::Connect equivalent @ 0x4be58 (line 70632).
  *
- * Doorbell handshake decoded from kext lines 70632-70823:
- *
- * The kext rings the same doorbell up to 20 times but EXITS on the
- * first successful firmware response.  The doorbell address
- * (BAR + channel_base_index*4 + 0xC004) is constant — the 20-iteration
- * outer loop is a retry mechanism, not per-channel initialization.
- *
- * Per iteration:
- *   a. Write 0x0ACEFACE to BAR+(channel_base_index<<2)+0xC004
- *   b. Write 0x1 to BAR+0x2260 (stream enable doorbell)
- *   c. Wait on notify_event (100ms timeout, up to 10 retries)
- *   d. If timeout: manually call _handleNotificationInterrupt()
- *   e. If success: goto done (early exit)
- *
- * The firmware responds by setting bits 5+21 in the notification
- * register, which the interrupt handler processes:
- *   bit 5  -> signals connect_event
- *   bit 21 -> copies channel config, signals notify_event
- * The handshake waits on notify_event.
- * ============================================================ */
+ * The kext rings the same doorbell up to 20 times and exits on the
+ * first firmware response.  The 20-iteration loop is a retry mechanism,
+ * not per-channel init: the doorbell address
+ * (BAR + channel_base_index*4 + 0xC004) is constant.  Per iteration:
+ * write magic to doorbell, write 0x1 to REG_STREAM_ENABLE, wait on
+ * notify_event with a 100ms timeout (up to 10 retries) and manually
+ * call uad2_handle_notification on timeout.  The firmware responds by
+ * setting bits 5 + 21 in the notification register: bit 5 signals
+ * connect_event, bit 21 copies channel config and signals notify_event
+ * (the bit the handshake actually waits on). */
 static int uad2_audio_handshake(struct uad2_dev *dev)
 {
 	u32 doorbell_reg = uad2_fw_reg(dev, REG_FW_DOORBELL);
@@ -2079,10 +1719,8 @@ static int uad2_audio_handshake(struct uad2_dev *dev)
 	int chan, retry;
 	long ret;
 
-	/* Set connected = true BEFORE the doorbell loop.  The notification
-	 * handler checks this flag and returns early if false, so it must
-	 * be true for the handshake to receive firmware responses via the
-	 * IRQ-driven path. */
+	/* connected must be true BEFORE the doorbell so the notification
+	 * handler does not bail out and miss the firmware response. */
 	WRITE_ONCE(dev->connected, true);
 
 	for (chan = 0; chan < UAD2_CONNECT_CHANNELS; chan++) {
@@ -2099,9 +1737,8 @@ static int uad2_audio_handshake(struct uad2_dev *dev)
 			if (ret > 0)
 				goto done;
 
-			/* Timeout: manually poll notification register
-			 * (mirrors kext behavior of calling
-			 *  _handleNotificationInterrupt on timeout). */
+			/* Kext: manually poll the notification register on
+			 * timeout (calls _handleNotificationInterrupt). */
 			uad2_handle_notification(dev);
 
 			if (try_wait_for_completion(&dev->notify_event))
@@ -2164,10 +1801,8 @@ static int uad2_audio_connect(struct uad2_dev *dev)
 	return 0;
 }
 
-/* ============================================================
- * CPcieDevice::ProgramRegisters equivalent @ 0xdf48
- * Top-level hardware init sequence -- exact order from RE
- * ============================================================ */
+/* CPcieDevice::ProgramRegisters equivalent @ 0xdf48.
+ * Top-level hardware init sequence; exact order from RE. */
 static int uad2_hw_program(struct uad2_dev *dev)
 {
 	u32 device_id;
@@ -2222,37 +1857,23 @@ static int uad2_hw_program(struct uad2_dev *dev)
 	return 0;
 }
 
-/* ============================================================
- * CPcieAudioExtension::PrepareTransport equivalent
- *
- * Programs all audio transport registers before starting DMA.
- * Must be called from pcm_prepare with runtime parameters.
- *
- * Full sequence from lines 71623-71903 (refined with new analysis):
- *   1.  Check transport_state != 2 (not already running)
- *   2.  Check is_connected == 1
- *   3.  Validate bufferFrameSize < 0x10000
- *   4.  Lock hw_lock
- *   5.  Write BAR+0x2240 = bufferFrameSize - 1
- *   6.  Write BAR+0x226C = (actualPlayChans * (bufSz-1)) >> 10
- *   7.  Write BAR+0x2244 = 0  (clear position)
- *   8.  If periodic_timer_interval != 0:
- *         Write BAR+0x2270 = periodic_timer_interval
- *         EnableVector(0x46, 1)  — enable periodic timer interrupt
- *   9.  Write BAR+0x2244 = 0  (clear again)
- *   10. Read  BAR+0x2244       (flush)
- *   11. Write BAR+0x2248 = 0   (stop/reset)
- *   12. Write BAR+0x2258 = irqPeriod
- *   13. Write BAR+0x2250 = actualPlayChans
- *   14. Write BAR+0x225C = actualRecChans
- *   15. Write BAR+0x2248 = 1   (arm)
- *   16. Read  BAR+0x22C0       (monitor flush)
- *   17. If diagnostic_flags bit1: Write BAR+0x224C = (actualPlayChans-1)|0x100
- *   18. Unlock hw_lock
- *   19. Set transport_state = 1 (prepared)
- *   20. Poll  BAR+0x2254 until == irqPeriod (DMA ready, max 2 retries)
- *   21. EnableVector(0x47, 1)  — enable end-of-buffer interrupt
- * ============================================================ */
+/* CPcieAudioExtension::PrepareTransport equivalent (kext lines
+ * 71623-71903).  Programs all audio transport registers before DMA
+ * starts.  Called from pcm_prepare with runtime parameters.  Sequence:
+ *   - check state != 2, is_connected, bufferFrameSize < 0x10000
+ *   - under hw_lock:
+ *       0x2240 = bufferFrameSize - 1
+ *       0x226C = (actualPlayChans * (bufSz-1)) >> 10
+ *       0x2244 = 0 (clear position)
+ *       if periodic_timer_interval: 0x2270 = interval, EnableVector(0x46,1)
+ *       0x2244 = 0 again, then read-back flush
+ *       0x2248 = 0 (stop/reset)
+ *       0x2258 = irqPeriod
+ *       0x2250 = actualPlayChans, 0x225C = actualRecChans
+ *       0x2248 = 1 (arm), read 0x22C0 (monitor flush)
+ *       if diagnostic_flags bit1: 0x224C = (actualPlayChans-1) | 0x100
+ *   - transport_state = 1, poll 0x2254 until == irqPeriod (max 2 retries)
+ *   - EnableVector(0x47, 1) for end-of-buffer interrupt. */
 static void uad2_stop_transport(struct uad2_dev *dev);
 
 static int uad2_prepare_transport(struct uad2_dev *dev,
@@ -2287,60 +1908,42 @@ static int uad2_prepare_transport(struct uad2_dev *dev,
 
 	spin_lock_irqsave(&dev->lock, flags);
 
-	/* 5. Buffer frame size (hardware uses size-1 as mask) */
 	uad2_write32(dev, REG_BUFFER_FRAME_SIZE, buffer_frames - 1);
 
-	/* 6. Buffer size in KB */
 	buf_size_kb = (play_channels * (buffer_frames - 1)) >> 10;
 	uad2_write32(dev, REG_BUFFER_SIZE_KB, buf_size_kb);
 
-	/* 7. Clear DMA position counter */
 	uad2_write32(dev, REG_DMA_POSITION, 0);
 	dev->play_pos_offset = 0;
 	dev->rec_pos_offset = 0;
 
-	/* 8. Periodic timer (if configured) */
 	if (dev->periodic_timer_interval) {
 		uad2_write32(dev, REG_PERIODIC_TIMER,
 			     dev->periodic_timer_interval);
 		__uad2_enable_vector_locked(dev, INTR_SLOT_PERIODIC, true);
 	}
 
-	/* 9-10. Clear position again + read-back flush */
+	/* Clear position again and read-back flush */
 	uad2_write32(dev, REG_DMA_POSITION, 0);
 	uad2_read32(dev, REG_DMA_POSITION);
 
-	/* 11. Stop/reset transport */
-	uad2_write32(dev, REG_TRANSPORT_CTL, 0);
-
-	/* 12. Interrupt period */
+	uad2_write32(dev, REG_TRANSPORT_CTL, 0); /* stop/reset */
 	uad2_write32(dev, REG_IRQ_PERIOD, irq_period_frames);
-
-	/* 13. Playback channel count */
 	uad2_write32(dev, REG_PLAYBACK_CHAN_CNT, play_channels);
-
-	/* 14. Record channel count */
 	uad2_write32(dev, REG_RECORD_CHAN_CNT, rec_channels);
+	uad2_write32(dev, REG_TRANSPORT_CTL, 0x1); /* arm */
+	uad2_read32(dev, REG_PLAYBACK_MON_STAT); /* fence */
 
-	/* 15. Arm transport (prepared state) */
-	uad2_write32(dev, REG_TRANSPORT_CTL, 0x1);
-
-	/* 16. Read playback monitor status (fence read) */
-	uad2_read32(dev, REG_PLAYBACK_MON_STAT);
-
-	/* 17. P2P_ROUTE — tells FPGA how to route audio between DSP and DMA.
-	 * Open-apollo writes this for all models AFTER DMA enable + fence.
-	 * Value: 0x100 | (play_channels - 1).
-	 * Previous code skipped this; open-apollo proved it's needed. */
+	/* P2P_ROUTE tells the FPGA how to route audio between DSP and DMA.
+	 * open-apollo writes this for all models after DMA enable + fence;
+	 * previous code skipped it and was wrong. */
 	uad2_write32(dev, REG_PLAYBACK_MON_CFG, 0x100 | (play_channels - 1));
 
 	spin_unlock_irqrestore(&dev->lock, flags);
 
-	/* 19. Mark transport as prepared */
 	WRITE_ONCE(dev->transport_state, 1);
 
-	/* 20. Poll BAR+0x2254 until DMA is ready (compare vs irq_period)
-	 * Kext does max 2 iterations with 1ms sleep between */
+	/* Poll until DMA is ready (kext does max 2 retries, 1ms sleeps) */
 	for (i = 0; i < 3; i++) {
 		u32 poll_val = uad2_read32(dev, REG_POLL_STATUS);
 
@@ -2349,30 +1952,22 @@ static int uad2_prepare_transport(struct uad2_dev *dev,
 		usleep_range(1000, 2000);
 	}
 
-	/* 21. Enable end-of-buffer interrupt vector */
 	uad2_enable_vector(dev, INTR_SLOT_ENDBUF, true);
 
 	return 0;
 }
 
-/* ============================================================
- * CPcieAudioExtension::StartTransport equivalent @ line 71904
+/* CPcieAudioExtension::StartTransport equivalent (kext lines 71904-71986).
  *
- * Sequence (from disasm lines 71904-71986):
- *   1. Check transport_state == 1 (prepared)
- *   2. Check is_connected
- *   3. Lock hw_lock
- *   4. Check device variant (this+0x28B0):
- *      - variant 0xA → always use 0x20F
- *      - variant 0x9 → use 0x20F if extended_mode_flag (this+0x22EF4) is zero (cbz)
- *      - otherwise   → use 0xF
- *   5. Write BAR+0x2248 = start_value
- *   6. Unlock hw_lock
- *   7. Set transport_state = 2 (running)
+ * Verify state == 1 and is_connected, pick start_val by device variant
+ * (this+0x28B0): variant 0xA always uses 0x20F; variant 0x9 uses 0x20F
+ * when the extended_mode_flag at this+0x22EF4 is zero; everything else
+ * uses 0xF.  Write start_val to REG_TRANSPORT_CTL and set state = 2.
  *
- * v2 firmware devices use extended mode (0x20F, BIT 9 = EXT_MODE).
- * v1 firmware uses normal start (0xF).
- * ============================================================ */
+ * v2 firmware (all current Apollo TB devices) requires extended mode
+ * (0x20F, BIT 9 = EXT_MODE), without which the DSP may not activate.
+ * v1 firmware starts at 0xF.  From open-apollo: 0x20F = DMA + play +
+ * rec + IRQ + extended mode. */
 static void uad2_start_transport(struct uad2_dev *dev)
 {
 	unsigned long flags;
@@ -2391,9 +1986,6 @@ static void uad2_start_transport(struct uad2_dev *dev)
 		return;
 	}
 
-	/* v2 firmware (all current Apollo TB devices) requires extended
-	 * mode bit 9 set.  Without it, DSP processing may not activate.
-	 * From open-apollo: 0x20F = DMA+play+rec+IRQ+extended mode. */
 	start_val = dev->fw_v2 ? 0x20F : 0xF;
 
 	spin_lock_irqsave(&dev->lock, flags);
@@ -2402,26 +1994,15 @@ static void uad2_start_transport(struct uad2_dev *dev)
 	spin_unlock_irqrestore(&dev->lock, flags);
 }
 
-/* ============================================================
- * CPcieAudioExtension::StopTransport equivalent @ line 71987
- *
- * Sequence (from disasm lines 71987-72056):
- *   1. Check is_connected
- *   2. DisableVector(0x47)  — disable end-of-buffer interrupt
- *   3. Lock hw_lock
- *   4. Write BAR+0x2248 = 0 (stop transport)
- *   5. Unlock hw_lock
- *   6. Set transport_state = 0
- * ============================================================ */
+/* CPcieAudioExtension::StopTransport equivalent (kext lines 71987-72056).
+ * Disables vector 0x47, writes 0 to REG_TRANSPORT_CTL under hw_lock,
+ * sets state to 0.  We also disable the periodic timer vector here so
+ * no more period-elapsed callbacks fire after the transport stops. */
 static void uad2_stop_transport(struct uad2_dev *dev)
 {
 	unsigned long flags;
 
-	/* Disable end-of-buffer interrupt before stopping (kext behavior) */
 	uad2_disable_vector(dev, INTR_SLOT_ENDBUF);
-
-	/* Disable periodic timer interrupt — no more period-elapsed callbacks
-	 * should fire after the transport is stopped. */
 	uad2_disable_vector(dev, INTR_SLOT_PERIODIC);
 
 	spin_lock_irqsave(&dev->lock, flags);
@@ -2486,7 +2067,7 @@ static void uad2_shutdown(struct uad2_dev *dev)
  *   Format: 32-bit container, 24-bit depth, signed int, LE
  *   (IOAudioStreamByteOrder=1 on macOS = little-endian)
  *
- * Buffer structure: interleaved, all channels × buffer_frames × 4 bytes
+ * Buffer structure: interleaved, all channels x buffer_frames x 4 bytes
  * The ALSA PCM buffer is mapped directly into the 4MB hardware DMA buffer.
  * ============================================================ */
 /* The hardware DMA is completely rigid:
@@ -2507,10 +2088,10 @@ static void uad2_shutdown(struct uad2_dev *dev)
  * Period sizes: 256 (1x rates), 512 (2x rates), 1024 (4x rates)
  * Periods:      32, 16, 8 respectively (8192 / period_size)
  *
- * Playback: 256 frames × 42ch × 4B = 43008 bytes/period (min)
- *           1024 frames × 42ch × 4B = 172032 bytes/period (max)
- * Capture:  256 frames × 32ch × 4B = 32768 bytes/period (min)
- *           1024 frames × 32ch × 4B = 131072 bytes/period (max)
+ * Playback: 256 frames x 42ch x 4B = 43008 bytes/period (min)
+ *           1024 frames x 42ch x 4B = 172032 bytes/period (max)
+ * Capture:  256 frames x 32ch x 4B = 32768 bytes/period (min)
+ *           1024 frames x 32ch x 4B = 131072 bytes/period (max)
  *
  * SNDRV_PCM_INFO_BATCH: The hardware DMA position register only updates
  * at period boundaries (every 256 frames at 48kHz = 5.33ms).  Between
@@ -2580,9 +2161,9 @@ static const struct snd_pcm_hardware uad2_pcm_hw_capture = {
  * Constraint rule: tie ALSA period_size to sample rate.
  *
  * The hardware's periodic timer fires at rate-dependent intervals:
- *   44100/48000 Hz   → every 256 frames
- *   88200/96000 Hz   → every 512 frames
- *   176400/192000 Hz → every 1024 frames
+ *   44100/48000 Hz:   every 256 frames
+ *   88200/96000 Hz:   every 512 frames
+ *   176400/192000 Hz: every 1024 frames
  *
  * ALSA must use the matching period_size so that snd_pcm_period_elapsed()
  * accounting stays in sync with the hardware interrupt cadence.
@@ -2653,9 +2234,9 @@ static int uad2_rule_buffer_size(struct snd_pcm_hw_params *params,
  *
  * Since buffer_size is fixed at 8192 and period_size depends on rate,
  * the number of periods must adjust accordingly:
- *   44100/48000 Hz  → period=256  → periods=32
- *   88200/96000 Hz  → period=512  → periods=16
- *   176400/192000 Hz → period=1024 → periods=8
+ *   44100/48000 Hz:   period=256,  periods=32
+ *   88200/96000 Hz:   period=512,  periods=16
+ *   176400/192000 Hz: period=1024, periods=8
  */
 static int uad2_rule_periods(struct snd_pcm_hw_params *params,
 			     struct snd_pcm_hw_rule *rule)
@@ -2792,7 +2373,7 @@ static int uad2_pcm_close(struct snd_pcm_substream *ss)
 	 *
 	 * Now the transport stays alive as long as any substream is open.
 	 * PipeWire keeps substreams open during reconfiguration, so the
-	 * transport persists through stop→hw_free→prepare→start cycles. */
+	 * transport persists through stop, hw_free, prepare, start cycles. */
 	if (open_count == 0) {
 		int state = READ_ONCE(dev->transport_state);
 
@@ -2841,7 +2422,7 @@ static int uad2_pcm_hw_free(struct snd_pcm_substream *ss)
 	struct snd_pcm_runtime *runtime = ss->runtime;
 	unsigned long flags;
 
-	/* Don't actually free — the DMA buffer belongs to the device.
+	/* Don't actually free the DMA buffer, it belongs to the device.
 	 * Just clear the runtime pointers. */
 	runtime->dma_area = NULL;
 	runtime->dma_addr = 0;
@@ -2884,7 +2465,7 @@ static int uad2_pcm_hw_free(struct snd_pcm_substream *ss)
  *
  * IMPORTANT: The hardware has a single shared transport for both playback
  * and capture.  The DMA buffer layout is fixed at:
- *   buffer_frames × max(play_channels, rec_channels) × 4 bytes
+ *   buffer_frames x max(play_channels, rec_channels) x 4 bytes
  * and is always fully interleaved.  Transport registers must be programmed
  * with the hardware's buffer_frames (8192 for Apollo Solo), NOT the ALSA
  * runtime's buffer_size (which is in frames from ALSA's perspective and
@@ -2908,7 +2489,7 @@ static int uad2_pcm_prepare(struct snd_pcm_substream *ss)
 	 * rate-correct parameters (IRQ period, periodic timer).
 	 *
 	 * The kext's _setSampleClock (0x4DE70) only writes the clock
-	 * register and waits for the bit-5 ack — it does not reach
+	 * register and waits for the bit-5 ack. It does not reach
 	 * StopTransport or PrepareTransport itself.  Those are driven
 	 * by the IOAudioEngine layer above on macOS, which stops the
 	 * engine, changes the clock, then restarts.  We mirror the same
@@ -2941,8 +2522,8 @@ static int uad2_pcm_prepare(struct snd_pcm_substream *ss)
 		/* Fall through to cold-start path (transport_state == 0) */
 	}
 
-	/* Track that this direction has been prepared (per-direction
-	 * flag — sharing a single flag broke under JOINT_DUPLEX). */
+	/* Track that this direction has been prepared. Uses per-direction
+	 * flags because a single shared flag broke under JOINT_DUPLEX. */
 	{
 		bool *flag = (ss->stream == SNDRV_PCM_STREAM_PLAYBACK) ?
 				     &dev->play_prepared :
@@ -2980,7 +2561,7 @@ static int uad2_pcm_prepare(struct snd_pcm_substream *ss)
 	 * Rate change or cold-start (transport_state == 0): do the full
 	 * prepare_transport sequence which resets DMA position to 0. */
 	if (READ_ONCE(dev->transport_state) >= 1) {
-		/* Transport already running at correct rate — fast path.
+		/* Transport already running at correct rate (fast path).
 		 * Set per-direction offset so this stream's .pointer()
 		 * returns 0-relative without affecting the other direction. */
 		u32 cur_pos = uad2_read32(dev, REG_DMA_POSITION);
@@ -2994,16 +2575,16 @@ static int uad2_pcm_prepare(struct snd_pcm_substream *ss)
 		return 0;
 	}
 
-	/* Cold start (or post-rate-change) — full transport preparation.
-	 * Always program the full hardware channel counts — the DMA
-	 * layout is fixed at all channels interleaved. */
+	/* Cold start (or post-rate-change): full transport preparation.
+	 * Always program the full hardware channel counts because the
+	 * DMA layout is fixed at all channels interleaved. */
 	dev->play_pos_offset = 0;
 	dev->rec_pos_offset = 0;
-	/* Prepare transport only — do NOT start it here.
-	 * ALSA expects transport to start in trigger(START).
-	 * Starting here causes the DMA position to advance before
-	 * ALSA's hw_ptr is initialized, resulting in XRUN on first read.
-	 * The post-transport clock write also moves to trigger. */
+	/* Prepare transport only. Do NOT start it here: ALSA expects
+	 * trigger(START) to start the transport. Starting here would
+	 * cause the DMA position to advance before ALSA's hw_ptr is
+	 * initialized, resulting in XRUN on first read. The post-transport
+	 * clock write also lives in trigger. */
 	return uad2_prepare_transport(dev, buffer_frames, irq_period_frames,
 				      READ_ONCE(dev->play_channels),
 				      READ_ONCE(dev->rec_channels));
@@ -3013,9 +2594,9 @@ static int uad2_pcm_prepare(struct snd_pcm_substream *ss)
  * Period elapsed polling timer (hrtimer)
  *
  * The Apollo's hardware periodic timer IRQ (vector 0x46) is unreliable
- * on most models — fires once then stops.  We use an hrtimer at ~1ms
+ * on most models: it fires once then stops. We use an hrtimer at ~1ms
  * to poll REG_DMA_POSITION and call snd_pcm_period_elapsed() when a
- * period boundary is crossed.  Same approach as snd-usb-audio and
+ * period boundary is crossed. Same approach as snd-usb-audio and
  * open-apollo's period_timer.
  * ============================================================ */
 #define PERIOD_TIMER_NS 1000000 /* 1 ms polling interval */
@@ -3098,12 +2679,12 @@ static void uad2_period_timer_start(struct uad2_dev *dev)
 }
 
 /*
- * Stop and drain the period timer.  CALLER MUST be in process context
- * — hrtimer_cancel() spins until the callback returns, so calling it
+ * Stop and drain the period timer. CALLER MUST be in process context.
+ * hrtimer_cancel() spins until the callback returns, so calling it
  * from the callback itself (or from any atomic context the callback
- * can call into) deadlocks.  ALSA's snd_pcm_drain_done path triggers
+ * can call into) deadlocks. ALSA's snd_pcm_drain_done path triggers
  * SNDRV_PCM_TRIGGER_STOP from inside snd_pcm_period_elapsed(), which
- * is one such forbidden caller — that path must use the lighter
+ * is one such forbidden caller; that path must use the lighter
  * WRITE_ONCE(period_timer_running, false) instead and let the next
  * tick of the callback notice the flag and self-cancel.
  */
@@ -3156,7 +2737,7 @@ static int uad2_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
 			uad2_write32(dev, REG_STREAM_ENABLE, 0x4);
 		}
 
-		/* Start period-elapsed polling timer — the hardware
+		/* Start period-elapsed polling timer. The hardware
 		 * periodic timer IRQ is unreliable on Apollo devices. */
 		uad2_period_timer_start(dev);
 		return 0;
@@ -3180,7 +2761,7 @@ static int uad2_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
 		 * transport runs continuously once started and only stops
 		 * when the last substream closes (pcm_close).  This is
 		 * critical for PipeWire which rapidly cycles through
-		 * stop→hw_free→prepare→start during graph reconfiguration.
+		 * stop, hw_free, prepare, start during graph reconfiguration.
 		 *
 		 * Stopping the transport here caused:
 		 *   1. transport_state reset to 0
@@ -3203,7 +2784,7 @@ static int uad2_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
 		 * reaches 0, or in uad2_shutdown/uad2_remove. */
 
 		/* Stop the polling timer when no streams are running.
-		 * We MUST NOT call uad2_period_timer_stop() here —
+		 * We MUST NOT call uad2_period_timer_stop() here.
 		 * trigger() can be invoked from inside our hrtimer
 		 * callback (snd_pcm_period_elapsed -> snd_pcm_drain_done
 		 * -> snd_pcm_do_stop), and hrtimer_cancel() spins waiting
@@ -3311,21 +2892,20 @@ static const struct snd_pcm_ops uad2_pcm_ops = {
 };
 
 /* ============================================================
- * Interrupt handler — split into hardirq top half + threaded bottom half.
- *
- * Mirrors CPcieIntrManager::ServiceInterrupt @ 0x14330.
+ * Interrupt handler. Split into hardirq top half + threaded bottom
+ * half. Mirrors CPcieIntrManager::ServiceInterrupt @ 0x14330.
  *
  * Kext flow:
  *   1. Read pending_lo from REG_DMA0_STATUS (0x2208)
  *   2. If has_extended_irq: read pending_hi from REG_DMA1_STATUS (0x2264)
- *   3. Combine into u64 pending, AND with intr_enable_shadow → active
+ *   3. Combine into u64 pending, AND with intr_enable_shadow for active
  *   4. Re-arm: write active bits back to 0x2208 (and 0x2264 if extended)
  *   5. Dispatch callbacks per active bit
  *
  * Slot-to-vector mapping (from kext vector_to_slot[] table):
- *   slot 32 (bit 0 of DMA1) = vector 0x28 → notification
- *   slot 62 (bit 30 of DMA1) = vector 0x46 → periodic timer
- *   slot 63 (bit 31 of DMA1) = vector 0x47 → end-of-buffer
+ *   slot 32 (bit 0 of DMA1)  = vector 0x28 (notification)
+ *   slot 62 (bit 30 of DMA1) = vector 0x46 (periodic timer)
+ *   slot 63 (bit 31 of DMA1) = vector 0x47 (end-of-buffer)
  *
  * With Linux MSI (single vector mode), all interrupts arrive on
  * vector 0, so we dispatch based on the pending bitmask.
@@ -3335,15 +2915,15 @@ static const struct snd_pcm_ops uad2_pcm_ops = {
  * manual poll) and for re-arming the one-shot periodic timer vector.
  *
  * snd_pcm_period_elapsed() is called directly from the hardirq top
- * half for minimum latency — this eliminates the variable thread
+ * half for minimum latency. This eliminates the variable thread
  * scheduling delay that caused ALSA to see multi-period position
- * jumps (manifesting as audible skips in PipeWire).  The function is
+ * jumps (manifesting as audible skips in PipeWire). The function is
  * hardirq-safe (uses snd_pcm_stream_lock_irqsave() internally).
  * ============================================================ */
 
 /*
  * Hardirq top half: read and ack interrupt status, wake thread.
- * Must be minimal — no sleeping, no complex dispatch.
+ * Must be minimal: no sleeping, no complex dispatch.
  */
 static irqreturn_t uad2_irq_hard(int irq, void *data)
 {
@@ -3411,15 +2991,15 @@ static irqreturn_t uad2_irq_hard(int irq, void *data)
 	 *
 	 * The kext filters pending through the enable shadow early on
 	 * (active = pending & enableShadow) and only writes active bits
-	 * back to the status registers — never raw pending.  This avoids
+	 * back to the status registers, never raw pending. This avoids
 	 * acking interrupts we didn't enable, which could confuse the
 	 * firmware or clear events meant for other purposes.
 	 *
 	 * With MSI, un-acked but disabled bits remain pending in the
-	 * device's internal state.  If a slot is later enabled, the
-	 * pending bit will become active on the next read — correct
+	 * device's internal state. If a slot is later enabled, the
+	 * pending bit will become active on the next read (correct
 	 * level-triggered-like behavior within the device's interrupt
-	 * controller. */
+	 * controller). */
 	uad2_write32(dev, REG_DMA0_STATUS, (u32)active);
 	if (dev->has_extended_irq && (u32)(active >> 32))
 		uad2_write32(dev, REG_DMA1_STATUS, (u32)(active >> 32));
@@ -3427,8 +3007,8 @@ static irqreturn_t uad2_irq_hard(int irq, void *data)
 	/* Periodic timer interrupt (slot 62 = vector 0x46): call
 	 * snd_pcm_period_elapsed() directly from hardirq context.
 	 *
-	 * snd_pcm_period_elapsed() is hardirq-safe — it uses
-	 * snd_pcm_stream_lock_irqsave() internally.  Many ALSA drivers
+	 * snd_pcm_period_elapsed() is hardirq-safe and uses
+	 * snd_pcm_stream_lock_irqsave() internally. Many ALSA drivers
 	 * (HDA, USB-audio, etc.) call it from hardirq.
 	 *
 	 * Moving this out of the threaded handler eliminates variable
@@ -3438,8 +3018,8 @@ static irqreturn_t uad2_irq_hard(int irq, void *data)
 	 * IMPORTANT: We must NOT hold dev->lock when calling
 	 * snd_pcm_period_elapsed(), because trigger() is called by ALSA
 	 * with the stream lock held and then takes dev->lock internally.
-	 * Lock ordering must be: stream_lock → dev->lock.  We already
-	 * released dev->lock above, so we're safe here. */
+	 * Lock ordering: stream_lock then dev->lock. We already released
+	 * dev->lock above, so we're safe here. */
 	if (active & BIT_ULL(INTR_SLOT_PERIODIC)) {
 		struct snd_pcm_substream *play_ss, *cap_ss;
 		bool play_run, cap_run;
@@ -3462,11 +3042,11 @@ static irqreturn_t uad2_irq_hard(int irq, void *data)
 
 /*
  * Threaded bottom half: dispatch deferred interrupt events.
- * Runs in process context — needed for uad2_handle_notification()
- * and re-arming the one-shot periodic timer vector.
+ * Runs in process context (needed for uad2_handle_notification()
+ * and re-arming the one-shot periodic timer vector).
  *
  * snd_pcm_period_elapsed() is now called directly from the hardirq
- * top half for lowest latency — see uad2_irq_hard().
+ * top half for lowest latency (see uad2_irq_hard()).
  */
 static irqreturn_t uad2_irq_thread(int irq, void *data)
 {
@@ -3488,13 +3068,13 @@ static irqreturn_t uad2_irq_thread(int irq, void *data)
 
 	/* Periodic timer interrupt (slot 62 = vector 0x46).
 	 *
-	 * Re-arm the one-shot periodic timer vector.  The hardirq
+	 * Re-arm the one-shot periodic timer vector. The hardirq
 	 * disabled this vector in intr_enable_shadow (kext one-shot
-	 * behavior).  We must re-enable it here so the next period's
-	 * interrupt fires.  This matches the kext's deferred handler
-	 * calling ResetPeriodicTimerInterrupt → EnableVector(0x46, 1).
+	 * behavior). We must re-enable it here so the next period's
+	 * interrupt fires. This matches the kext's deferred handler
+	 * calling ResetPeriodicTimerInterrupt then EnableVector(0x46, 1).
 	 *
-	 * Re-arm must happen regardless of streams_running — the
+	 * Re-arm must happen regardless of streams_running because the
 	 * transport may still be active and we need to keep receiving
 	 * timer interrupts until stop_transport disables the vector. */
 	if (active & BIT_ULL(INTR_SLOT_PERIODIC)) {
@@ -3556,8 +3136,8 @@ static int uad2_clock_source_put(struct snd_kcontrol *kctl,
 	if (new_source == dev->clock_source)
 		return 0;
 
-	/* Reject clock source changes while transport is running —
-	 * changing the clock mid-stream could corrupt DMA state. */
+	/* Reject clock source changes while transport is running.
+	 * Changing the clock mid-stream could corrupt DMA state. */
 	if (READ_ONCE(dev->transport_state) == 2)
 		return -EBUSY;
 
@@ -4157,8 +3737,8 @@ static int uad2_probe(struct pci_dev *pci, const struct pci_device_id *id)
 	snd_pcm_set_ops(dev->pcm, SNDRV_PCM_STREAM_PLAYBACK, &uad2_pcm_ops);
 	snd_pcm_set_ops(dev->pcm, SNDRV_PCM_STREAM_CAPTURE, &uad2_pcm_ops);
 
-	/* No snd_pcm_lib_preallocate_pages_for_all — we use our own
-	 * pre-allocated 4MB DMA buffers mapped in hw_params. */
+	/* No snd_pcm_lib_preallocate_pages_for_all needed; we use our
+	 * own pre-allocated 4MB DMA buffers mapped in hw_params. */
 
 	/* Create mixer controls (clock source, sample rate readout) */
 	err = uad2_create_mixer(dev);
@@ -4171,7 +3751,7 @@ static int uad2_probe(struct pci_dev *pci, const struct pci_device_id *id)
 
 	pci_set_drvdata(pci, dev);
 	dev_info(&pci->dev,
-		 "%s initialized — play=%uch rec=%uch buf=%u frames\n",
+		 "%s initialized: play=%uch rec=%uch buf=%u frames\n",
 		 ua_device_name(dev->device_type), dev->play_channels,
 		 dev->rec_channels, dev->buffer_frames);
 	return 0;
@@ -4197,28 +3777,27 @@ static void uad2_remove(struct pci_dev *pci)
 {
 	struct uad2_dev *dev = pci_get_drvdata(pci);
 
-	/* Mark card as disconnected first — this causes all subsequent
-	 * ALSA operations (PCM open/prepare/trigger/pointer) to return
-	 * errors immediately, preventing races where userspace still has
-	 * the device open while we tear down hardware state. */
+	/* Mark card as disconnected first. All subsequent ALSA operations
+	 * (PCM open/prepare/trigger/pointer) then return errors
+	 * immediately, preventing races where userspace still has the
+	 * device open while we tear down hardware state. */
 	snd_card_disconnect(dev->card);
 
 	/* Full shutdown sequence (mirrors kext CPcieAudioExtension::Shutdown):
 	 * stops transport, clears doorbell, disables notification vector,
-	 * sends disconnect command to firmware.
-	 * Must happen BEFORE setting disconnecting flag so MMIO writes
-	 * actually reach the hardware. */
+	 * sends disconnect command to firmware. Must happen BEFORE setting
+	 * disconnecting flag so MMIO writes actually reach the hardware. */
 	uad2_shutdown(dev);
 
 	/* Disable global interrupt enable */
 	uad2_write32(dev, REG_INTR_ENABLE, 0x0);
 
-	/* Set disconnecting flag to guard MMIO access — after this point,
+	/* Set disconnecting flag to guard MMIO access. After this point,
 	 * uad2_read32/uad2_write32 become no-ops so the IRQ handler and
 	 * any remaining ALSA callbacks won't touch disappeared hardware. */
 	WRITE_ONCE(dev->disconnecting, true);
 
-	/* Free IRQ before snd_card_free() — the card free will release
+	/* Free IRQ before snd_card_free(). The card free will release
 	 * dev (it's card->private_data), so we must stop the IRQ handler
 	 * first to prevent use-after-free. */
 	free_irq(pci_irq_vector(pci, 0), dev);
@@ -4234,8 +3813,8 @@ static void uad2_remove(struct pci_dev *pci)
 
 	pci_iounmap(pci, dev->bar);
 
-	/* snd_card_free() frees dev (card->private_data) — must be last
-	 * operation that references dev */
+	/* snd_card_free() frees dev (card->private_data). Must be the
+	 * last operation that references dev. */
 	snd_card_free(dev->card);
 
 	pci_release_regions(pci);
