@@ -64,6 +64,61 @@ Thunderbolt 2 devices (original Apollo Twin, Apollo 8, Apollo 16, Duo, Quad) are
 
 ## Changelog
 
+### 2026-05-24: clock_source 0xC for active DSP, fixes 176.4 kHz
+
+**The 0xC fix:**
+
+`set_sample_rate` was writing the user-facing `dev->clock_source` value directly
+to the firmware clock register. For internal clock that means writing 0 in the
+low byte: `0 | (rate_enum << 8)`. The kext and open-apollo both write **0xC** in
+the low byte for internal clock. open-apollo's RE notes
+(`docs/sample-rates/page.md:124`) call this out explicitly: source `0x0C`
+"receives FPGA acknowledgment and enables DSP active processing after transport
+start", while `UA_CLOCK_INTERNAL` (0) does not.
+
+The driver already wrote 0xC in a post-`trigger(START)` doorbell, but that fired
+AFTER `prepare_transport`, so the rate-change negotiation itself ran with the
+DSP not in active mode. Symptom: at 176.4 kHz and 192 kHz the rate-change ack
+either never arrived (timeout) or audio came out distorted because the DSP was
+in passthrough rather than processing the rate switch.
+
+Fix: `set_sample_rate` now translates `dev->clock_source == 0` (Internal) to
+firmware value `0xC` at the doorbell write. S/PDIF and other sources pass
+through unchanged. The post-`trigger(START)` 0xC write is preserved as a
+belt-and-braces measure (already idempotent).
+
+**Result on Apollo Solo over Thunderbolt 4:**
+
+| Rate      | Tier | Family | Before fix | After fix             |
+| --------- | ---- | ------ | ---------- | --------------------- |
+| 44.1 kHz  | 1x   | 44.1k  | clean      | clean                 |
+| 48 kHz    | 1x   | 48k    | clean      | clean                 |
+| 88.2 kHz  | 2x   | 44.1k  | clean      | clean                 |
+| 96 kHz    | 2x   | 48k    | clean      | clean (or near-clean) |
+| 176.4 kHz | 4x   | 44.1k  | distorted  | **clean**             |
+| 192 kHz   | 4x   | 48k    | distorted  | **still distorted**   |
+
+The 48 kHz family at 4x (192 kHz) remains broken: audible pitch is lower than
+the source tone with a buzzing overlay. The doorbell ack now arrives reliably
+(133 ms, was 2 s timeout), and the IRQ period / periodic timer values match the
+kext tables exactly. Best current guess: the 48k-family PLL on the Apollo Solo
+cannot lock at 4x. The 44.1k-family at 4x (176.4 kHz) works, which rules out a
+generic 4x-tier driver bug.
+
+**Diagnostic instrumentation added:**
+
+`set_sample_rate` now emits a `dev_info` line per rate change with the ack
+bitmask, the accumulated bits seen across the polling window (in case the IRQ
+thread races us), the latency in microseconds, and the firmware's
+`REG_NOTIF_RATE_INFO` / `REG_NOTIF_CLOCK_INFO` registers after the ack.
+`prepare_transport` emits a `dev_info` line with the rate-relevant programming
+(IRQ period, periodic timer, channel counts) and a `dev_warn` when
+`REG_POLL_STATUS` does not converge to `irq_period_frames` after 3 polls.
+
+`clock_info` reports the PREVIOUSLY-committed rate (not the new one), so it is
+useful only for verifying the firmware state machine, not as an indicator of the
+current rate.
+
 ### 2026-05-24: rate-switch + freeze fix, ASCII-only sources
 
 **Rate switching (the "no output for osu" bug):**
@@ -123,10 +178,8 @@ picks up the flag on the next tick (within 1 ms) and returns HRTIMER_NORESTART.
   hung the system.
 - Audio confirmed audible at 44.1 kHz, 48 kHz, 88.2 kHz, 96 kHz on MON L
   (channel 0).
-- 176.4 kHz and 192 kHz still distort. The periodic timer interval and IRQ
-  period values match the kext tables exactly, so the distortion is from a
-  different cause (probably the rate-change ack timing or PCIe completion delay
-  at the higher data rate).
+- 176.4 kHz and 192 kHz still distort at this point. The 0xC clock-source fix
+  (next entry, same date) fixed 176.4 kHz; 192 kHz remains broken.
 
 **Source style:**
 

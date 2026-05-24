@@ -1102,13 +1102,22 @@ static u8 uad2_rate_to_enum(unsigned int rate)
 
 static int uad2_set_sample_rate(struct uad2_dev *dev, unsigned int rate)
 {
-	u32 clock_val, reg_offset, notify_reg;
-	int waited_ms;
+	u32 clock_val, reg_offset, notify_reg, fw_clock_src;
+	u32 status = 0, seen_bits = 0;
+	s64 ack_latency_us = -1;
+	int waited_ms = 0;
+	ktime_t t_start;
 	u8 rate_enum;
-	u32 status;
 
 	rate_enum = uad2_rate_to_enum(rate);
-	clock_val = dev->clock_source | ((u32)rate_enum << 8);
+	/* Firmware requires source 0xC to enter DSP active-processing mode
+	 * for the internal clock; raw value 0 does NOT engage active DSP
+	 * (causes silent rate-change failure at 4x rates, mild distortion at
+	 * 2x).  Mirrors open-apollo/driver/ua_audio.c:2261 and the kext, both
+	 * of which write 0xC into the low byte for internal clock.  S/PDIF
+	 * and other sources pass through unchanged. */
+	fw_clock_src = (dev->clock_source == 0) ? 0xC : dev->clock_source;
+	clock_val = fw_clock_src | ((u32)rate_enum << 8);
 	reg_offset = uad2_fw_reg(dev, REG_SAMPLE_CLOCK);
 	notify_reg = uad2_fw_reg(dev, REG_FW_NOTIFY_STATUS);
 
@@ -1118,10 +1127,11 @@ static int uad2_set_sample_rate(struct uad2_dev *dev, unsigned int rate)
 	uad2_handle_notification(dev);
 	WRITE_ONCE(dev->notify_status, 0);
 
+	t_start = ktime_get();
 	uad2_write32(dev, reg_offset, clock_val);
 	uad2_write32(dev, REG_STREAM_ENABLE, 0x4);
 
-	for (waited_ms = 0; waited_ms < UAD2_RATE_POLL_TIMEOUT_MS;
+	for (; waited_ms < UAD2_RATE_POLL_TIMEOUT_MS;
 	     waited_ms += UAD2_RATE_POLL_INTERVAL_MS) {
 		/* uad2_handle_notification takes notify_lock, processes
 		 * any pending bits, then clears the register.  Calling
@@ -1132,26 +1142,43 @@ static int uad2_set_sample_rate(struct uad2_dev *dev, unsigned int rate)
 		status = READ_ONCE(dev->notify_status);
 		if (status == 0xFFFFFFFF)
 			return -ENODEV;
-		if (status & UAD2_RATE_ACK_BITS)
+		seen_bits |= status;
+		if (status & UAD2_RATE_ACK_BITS) {
+			ack_latency_us =
+				ktime_to_us(ktime_sub(ktime_get(), t_start));
 			break;
+		}
 		msleep(UAD2_RATE_POLL_INTERVAL_MS);
 	}
 
-	if (!(status & UAD2_RATE_ACK_BITS)) {
-		dev_warn(
-			&dev->pci->dev,
-			"Sample rate change ack missing after %d ms (rate=%u), continuing\n",
-			waited_ms, rate);
-	} else {
-		u32 dev_id = uad2_read32(dev, REG_DEVICE_ID);
+	{
+		u32 rate_info =
+			uad2_read32(dev, uad2_fw_reg(dev, REG_NOTIF_RATE_INFO));
+		u32 clock_info = uad2_read32(
+			dev, uad2_fw_reg(dev, REG_NOTIF_CLOCK_INFO));
 
-		if (dev_id != dev->expected_device_id)
-			dev_warn(&dev->pci->dev,
-				 "Post-clock device ID mismatch: 0x%08x\n",
-				 dev_id);
-		dev_dbg(&dev->pci->dev,
-			"rate ack 0x%08x after %d ms (rate=%u)\n", status,
-			waited_ms, rate);
+		if (!(seen_bits & UAD2_RATE_ACK_BITS)) {
+			dev_warn(
+				&dev->pci->dev,
+				"set_sample_rate %u Hz: ack TIMEOUT after %d ms (seen 0x%08x rate_info=0x%08x clock_info=0x%08x), continuing\n",
+				rate, waited_ms, seen_bits, rate_info,
+				clock_info);
+		} else {
+			u32 dev_id = uad2_read32(dev, REG_DEVICE_ID);
+
+			if (dev_id != dev->expected_device_id)
+				dev_warn(
+					&dev->pci->dev,
+					"Post-clock device ID mismatch: 0x%08x\n",
+					dev_id);
+			dev_info(
+				&dev->pci->dev,
+				"set_sample_rate %u Hz: ack 0x%08x (RATE=%d DMA=%d CONN=%d) in %lld us, seen 0x%08x rate_info=0x%08x clock_info=0x%08x\n",
+				rate, status, !!(status & NOTIFY_RATE_CHANGE),
+				!!(status & NOTIFY_DMA_READY),
+				!!(status & NOTIFY_CONNECT_ACK), ack_latency_us,
+				seen_bits, rate_info, clock_info);
+		}
 	}
 
 	/* Suppress the stale notify_status snapshot so the next caller
@@ -1944,15 +1971,29 @@ static int uad2_prepare_transport(struct uad2_dev *dev,
 	WRITE_ONCE(dev->transport_state, 1);
 
 	/* Poll until DMA is ready (kext does max 2 retries, 1ms sleeps) */
-	for (i = 0; i < 3; i++) {
-		u32 poll_val = uad2_read32(dev, REG_POLL_STATUS);
+	{
+		u32 poll_val = 0;
 
-		if (poll_val == irq_period_frames)
-			break;
-		usleep_range(1000, 2000);
+		for (i = 0; i < 3; i++) {
+			poll_val = uad2_read32(dev, REG_POLL_STATUS);
+			if (poll_val == irq_period_frames)
+				break;
+			usleep_range(1000, 2000);
+		}
+		if (poll_val != irq_period_frames)
+			dev_warn(
+				&dev->pci->dev,
+				"prepare_transport: POLL_STATUS=0x%08x != irq_period=%u (rate=%u) after 3 polls\n",
+				poll_val, irq_period_frames, dev->current_rate);
 	}
 
 	uad2_enable_vector(dev, INTR_SLOT_ENDBUF, true);
+
+	dev_info(
+		&dev->pci->dev,
+		"prepare_transport: rate=%u buf=%u irq_period=%u periodic=%u play=%u rec=%u\n",
+		dev->current_rate, buffer_frames, irq_period_frames,
+		dev->periodic_timer_interval, play_channels, rec_channels);
 
 	return 0;
 }
