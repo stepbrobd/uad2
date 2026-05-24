@@ -101,9 +101,30 @@ belt-and-braces measure (already idempotent).
 The 48 kHz family at 4x (192 kHz) remains broken: audible pitch is lower than
 the source tone with a buzzing overlay. The doorbell ack now arrives reliably
 (133 ms, was 2 s timeout), and the IRQ period / periodic timer values match the
-kext tables exactly. Best current guess: the 48k-family PLL on the Apollo Solo
-cannot lock at 4x. The 44.1k-family at 4x (176.4 kHz) works, which rules out a
+kext tables exactly. The 44.1k-family at 4x (176.4 kHz) works, which rules out a
 generic 4x-tier driver bug.
+
+Further investigation revealed a partial cause. With a longer poll window (>200
+ms after the doorbell), the firmware at 192 kHz fires not just bit 4 (DMA_READY)
+but also bits 5, 1, and 0 (CONNECT_ACK + RECORD_IO + PLAYBACK_IO). The latter
+two arrive with an updated IO descriptor that drops `play_channels` to 20 (from
+42). This matches open-apollo's `docs/sample-rates/page.md:150` note that DSP
+processing capacity is reduced at higher rates. At 176.4 kHz the firmware keeps
+42 channels; at 192 kHz it caps at 20. The driver does not currently
+re-negotiate ALSA hw_params channel count after a rate change, so driver and
+firmware disagree on layout at 192 kHz. Even after the channel update lands and
+`prepare_transport` runs with play=20, audio is still distorted, so channel
+mismatch is not the sole cause.
+
+Open items for a future session:
+
+- Find what other rate-conditional state the kext programs at 192 kHz that 176.4
+  kHz does not (none has surfaced from PrepareTransport, StartTransport, or
+  _setSampleClock disassembly so far).
+- Force the ALSA hw_params channel count to 20 at 192 kHz via a per-rate
+  constraint, so userspace sends matching-layout data, and re-test.
+- Capture a PCIe trace of macOS doing a successful 192 kHz playback to identify
+  any register writes we are missing.
 
 **Diagnostic instrumentation added:**
 

@@ -2759,7 +2759,9 @@ static int uad2_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
 		uad2_start_transport(dev);
 
 		/* Post-transport clock write: clock_source=0xC enables DSP
-		 * active processing.  Only fire on the first stream of the
+		 * active processing AND triggers firmware-side IO descriptor
+		 * resend (corrects the play=20 channel-count regression seen
+		 * on some reloads).  Only fire on the first stream of the
 		 * transport, not on piggyback opens.  first_stream is
 		 * captured under dev->lock so concurrent start/stop cannot
 		 * see both as the "first" or both as a piggyback.
