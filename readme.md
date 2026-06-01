@@ -1,5 +1,10 @@
 # UAD2: Linux Kernel Driver for Universal Audio Thunderbolt Interfaces
 
+Binary Cache:
+
+- Cache: <https://cache.ysun.co>
+- Key: `cache.ysun.co-1:WxPYwT5g3kt9XhUhHPpNLZKI9HIOsVVAuqSHpok8Qt4=`
+
 > [!WARNING]
 > **AI-Generated Code and Research**
 >
